@@ -1,10 +1,10 @@
 [project]
 name = "mcp-persist"
-version = "0.1.0"
+version = "0.1.1"
 description = "Production-grade persistence backends for the MCP Python SDK"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "Armaan Sandhu", github = "Ar-maan05" }]
+authors = [{ name = "Armaan Sandhu" }]
 keywords = ["mcp", "model-context-protocol", "redis", "eventstore", "sse", "resumability"]
 license = { text = "MIT" }
 classifiers = [
@@ -46,7 +46,6 @@ build-backend = "hatchling.build"
 packages = ["src/mcp_persist"]
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
 addopts = "--color=yes -p anyio"
 
 [tool.ruff]

@@ -16,10 +16,10 @@ import logging
 
 import fakeredis.aioredis as fakeredis
 import pytest
-
-from mcp_persist import RedisEventStore
 from mcp.server.streamable_http import EventId, EventMessage, StreamId
 from mcp.types import JSONRPCRequest
+
+from mcp_persist import RedisEventStore
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -221,9 +221,9 @@ async def test_replay_message_content_round_trips(store):
 
     assert len(events) == 1
     replayed = events[0].message
-    assert isinstance(replayed, JSONRPCRequest)
-    assert replayed.method == "resources/list"
-    assert replayed.id == "99"
+    assert isinstance(replayed.root, JSONRPCRequest)
+    assert replayed.root.method == "resources/list"
+    assert replayed.root.id == "99"
 
 
 @pytest.mark.anyio

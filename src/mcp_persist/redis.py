@@ -20,7 +20,7 @@ Quickstart:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from mcp.server.streamable_http import (
     EventCallback,
@@ -29,12 +29,12 @@ from mcp.server.streamable_http import (
     EventStore,
     StreamId,
 )
-from mcp.types import JSONRPCMessage, jsonrpc_message_adapter
-
-if TYPE_CHECKING:
-    pass
+from mcp.types import JSONRPCMessage
+from pydantic import TypeAdapter
 
 logger = logging.getLogger(__name__)
+
+jsonrpc_message_adapter = TypeAdapter(JSONRPCMessage)
 
 
 class RedisEventStore(EventStore):
@@ -99,11 +99,10 @@ class RedisEventStore(EventStore):
         if message is None:
             payload = ""
         else:
-            payload = jsonrpc_message_adapter.dump_json(
-                message,
+            payload = message.model_dump_json(
                 by_alias=True,
                 exclude_none=True,
-            ).decode("utf-8")
+            )
 
         await self._redis.hset(
             self._event_key(event_id),
@@ -164,6 +163,7 @@ class RedisEventStore(EventStore):
                 continue
 
             message = jsonrpc_message_adapter.validate_json(payload_str)
+
             await send_callback(EventMessage(message=message, event_id=eid))
 
         return stream_id
