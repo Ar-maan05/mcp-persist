@@ -130,9 +130,7 @@ class RedisEventStore(EventStore):
         send_callback: EventCallback,
     ) -> StreamId | None:
         """Replay all events on the same stream that occurred after last_event_id."""
-        stream_id_raw: bytes | None = await self._redis.hget(
-            self._event_key(last_event_id), "stream_id"
-        )
+        stream_id_raw: bytes | None = await self._redis.hget(self._event_key(last_event_id), "stream_id")
 
         if stream_id_raw is None:
             return None
@@ -149,9 +147,7 @@ class RedisEventStore(EventStore):
         for eid_bytes in raw_ids:
             eid: EventId = eid_bytes.decode("utf-8")
 
-            payload_raw: bytes | None = await self._redis.hget(
-                self._event_key(eid), "payload"
-            )
+            payload_raw: bytes | None = await self._redis.hget(self._event_key(eid), "payload")
 
             if payload_raw is None:
                 logger.debug("Event %s payload missing during replay (expired?)", eid)

@@ -42,6 +42,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(messa
 # In-memory application state
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Note:
     id: str

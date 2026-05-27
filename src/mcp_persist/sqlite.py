@@ -76,9 +76,7 @@ class SQLiteEventStore(EventStore):
         ttl: int | None = None,
     ) -> None:
         if not table_name.isidentifier():
-            raise ValueError(
-                f"table_name must be a valid SQL identifier, got {table_name!r}"
-            )
+            raise ValueError(f"table_name must be a valid SQL identifier, got {table_name!r}")
 
         self._conn = conn
         self._table = table_name
@@ -111,8 +109,7 @@ class SQLiteEventStore(EventStore):
             "created_at REAL NOT NULL)"
         )
         await self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS {self._table}_stream_idx "
-            f"ON {self._table} (stream_id, event_id)"
+            f"CREATE INDEX IF NOT EXISTS {self._table}_stream_idx ON {self._table} (stream_id, event_id)"
         )
         await self._conn.commit()
         self._initialized = True
@@ -134,8 +131,7 @@ class SQLiteEventStore(EventStore):
             payload = message.model_dump_json(by_alias=True, exclude_none=True)
 
         cursor = await self._conn.execute(
-            f"INSERT INTO {self._table} (stream_id, payload, created_at) "
-            "VALUES (?, ?, ?)",
+            f"INSERT INTO {self._table} (stream_id, payload, created_at) VALUES (?, ?, ?)",
             (stream_id, payload, time.time()),
         )
         await self._conn.commit()
@@ -175,9 +171,7 @@ class SQLiteEventStore(EventStore):
             )
         else:
             query = (
-                f"SELECT event_id, payload FROM {self._table} "
-                "WHERE stream_id = ? AND event_id > ? "
-                "ORDER BY event_id"
+                f"SELECT event_id, payload FROM {self._table} WHERE stream_id = ? AND event_id > ? ORDER BY event_id"
             )
             params = (stream_id, int(last_event_id))
 
@@ -190,9 +184,7 @@ class SQLiteEventStore(EventStore):
                 continue
 
             message = jsonrpc_message_adapter.validate_json(payload)
-            await send_callback(
-                EventMessage(message=message, event_id=str(event_id_int))
-            )
+            await send_callback(EventMessage(message=message, event_id=str(event_id_int)))
 
         return stream_id
 

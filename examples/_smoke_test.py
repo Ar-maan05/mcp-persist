@@ -1,4 +1,5 @@
 """Smoke-test for examples/sqlite_server.py — run after starting the server."""
+
 import asyncio
 import json
 
