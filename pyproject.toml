@@ -25,6 +25,13 @@ dependencies = [
 [project.optional-dependencies]
 redis = ["redis>=4.2.0"]
 sqlite = ["aiosqlite>=0.20.0"]
+
+[project.urls]
+Homepage = "https://github.com/Ar-maan05/mcp-persist"
+Repository = "https://github.com/Ar-maan05/mcp-persist"
+Issues = "https://github.com/Ar-maan05/mcp-persist/issues"
+
+[dependency-groups]
 dev = [
     "pytest>=8.3.4",
     "anyio>=4.9",
@@ -34,11 +41,6 @@ dev = [
     "pyright>=1.1.400",
     "ruff>=0.8.5",
 ]
-
-[project.urls]
-Homepage = "https://github.com/Ar-maan05/mcp-persist"
-Repository = "https://github.com/Ar-maan05/mcp-persist"
-Issues = "https://github.com/Ar-maan05/mcp-persist/issues"
 
 [build-system]
 requires = ["hatchling"]
