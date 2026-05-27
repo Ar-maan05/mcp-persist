@@ -1,6 +1,6 @@
 [project]
 name = "mcp-persist"
-version = "0.2.0"
+version = "0.3.0"
 description = "Production-grade persistence backends for the MCP Python SDK"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,6 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 redis = ["redis>=4.2.0"]
 sqlite = ["aiosqlite>=0.20.0"]
+postgres = ["asyncpg>=0.30.0"]
 
 [project.urls]
 Homepage = "https://github.com/Ar-maan05/mcp-persist"
@@ -37,6 +38,7 @@ dev = [
     "anyio>=4.9",
     "fakeredis>=2.26.0",
     "aiosqlite>=0.20.0",
+    "asyncpg>=0.30.0",
     "pytest-anyio",
     "pyright>=1.1.400",
     "ruff>=0.8.5",

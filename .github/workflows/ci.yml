@@ -31,6 +31,17 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +64,8 @@ jobs:
       - name: Type check (pyright)
         run: uv run pyright src/
 
-      - name: Tests (pytest, real Redis)
+      - name: Tests (pytest, real Redis + Postgres)
         run: uv run pytest tests/ -v
         env:
           MCP_TEST_REDIS_URL: redis://localhost:6379/0
+          MCP_TEST_POSTGRES_URL: postgresql://postgres@localhost:5432/postgres

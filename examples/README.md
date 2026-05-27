@@ -1,9 +1,9 @@
 # Examples
 
-Two minimal MCP servers showing how to wire `mcp-persist` backends into a
+Three minimal MCP servers showing how to wire `mcp-persist` backends into a
 real [`StreamableHTTPSessionManager`](https://github.com/modelcontextprotocol/python-sdk).
 
-Both expose the same note-taking API over MCP at `http://localhost:8000/mcp`.
+All expose the same note-taking API over MCP at `http://localhost:8000/mcp`.
 
 ## Prerequisites
 
@@ -13,6 +13,9 @@ pip install "mcp-persist[sqlite]" uvicorn starlette
 
 # Redis example
 pip install "mcp-persist[redis]" uvicorn starlette
+
+# Postgres example
+pip install "mcp-persist[postgres]" uvicorn starlette
 ```
 
 ## sqlite_server.py
@@ -36,6 +39,18 @@ Requires a running Redis instance (default: `redis://localhost:6379`).
 ```bash
 redis-server &
 python examples/redis_server.py
+```
+
+## postgres_server.py
+
+Durable resumability for deployments already running PostgreSQL, including
+multi-node / team setups. Events are persisted via an `asyncpg` connection pool.
+
+Requires a reachable PostgreSQL instance. Set `DATABASE_URL` to override the
+default (`postgresql://postgres@localhost:5432/postgres`).
+
+```bash
+python examples/postgres_server.py
 ```
 
 ## Trying it out

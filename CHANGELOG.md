@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-27
+
 ### Added
+- `PostgresEventStore` — PostgreSQL-backed `EventStore` (via `asyncpg`) for
+  durable SSE resumability on deployments already running Postgres, including
+  multi-node / team setups. Install with the `postgres` extra.
+- Example MCP server `examples/postgres_server.py`.
 - `py.typed` marker so downstream type checkers use the bundled type hints (PEP 561).
 
 ### Removed
@@ -37,7 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release with `RedisEventStore` — Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Ar-maan05/mcp-persist/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Ar-maan05/mcp-persist/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Ar-maan05/mcp-persist/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Ar-maan05/mcp-persist/releases/tag/v0.1.0

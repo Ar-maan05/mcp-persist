@@ -12,6 +12,7 @@ The MCP SDK ships an `EventStore` interface but only an in-memory reference impl
 |---|---|---|
 | `SQLiteEventStore` | `sqlite` | Single-process SSE resumability across restarts, with no external service |
 | `RedisEventStore` | `redis` | Multi-process / multi-worker SSE resumability |
+| `PostgresEventStore` | `postgres` | Durable resumability for deployments already running Postgres, including multi-node / team setups |
 
 ## Installation
 
@@ -22,8 +23,11 @@ pip install "mcp-persist[sqlite]"
 # Redis backend
 pip install "mcp-persist[redis]"
 
-# Both
-pip install "mcp-persist[sqlite,redis]"
+# Postgres backend
+pip install "mcp-persist[postgres]"
+
+# Multiple backends
+pip install "mcp-persist[sqlite,redis,postgres]"
 ```
 
 ## Quickstart
@@ -54,6 +58,23 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 redis_client = aioredis.from_url("redis://localhost:6379")
 store = RedisEventStore(redis_client, ttl=3600)  # 1 hour TTL
+
+session_manager = StreamableHTTPSessionManager(
+    app=mcp_server,
+    event_store=store,
+)
+```
+
+### Postgres
+
+```python
+import asyncpg
+from mcp_persist import PostgresEventStore
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+pool = await asyncpg.create_pool("postgresql://localhost/mydb")
+store = PostgresEventStore(pool, ttl=3600)  # 1 hour TTL
+await store.initialize()
 
 session_manager = StreamableHTTPSessionManager(
     app=mcp_server,
@@ -153,6 +174,58 @@ store_a = RedisEventStore(redis_client, key_prefix="server-a:")
 store_b = RedisEventStore(redis_client, key_prefix="server-b:")
 ```
 
+## PostgresEventStore
+
+Stores MCP SSE events in PostgreSQL so servers can resume interrupted streams
+across restarts and redeploys. It takes an `asyncpg` connection pool, so
+concurrent request handlers share connections cleanly — a good fit for
+deployments that already run Postgres and want durability without adding Redis.
+
+> For ephemeral multi-worker fan-out, `RedisEventStore` is lighter; for a pure
+> single-process server with no external service, use `SQLiteEventStore`.
+
+### How it works
+
+One row per event:
+
+```
+{table}.event_id    — BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, monotonic IDs (never reused)
+{table}.stream_id   — TEXT, the stream the event belongs to
+{table}.payload     — TEXT, serialized JSONRPCMessage ("" for priming events)
+{table}.created_at  — DOUBLE PRECISION, unix timestamp used for TTL expiry
+```
+
+- **Monotonic IDs** via an `IDENTITY` column — strictly increasing, never reused, same guarantee as Redis `INCR`
+- **Indexed replay** — `WHERE stream_id = $1 AND event_id > $2` over a `(stream_id, event_id)` index
+- **Pooled & concurrent** — accepts an `asyncpg.Pool`, so many handlers can store/replay without contending on one connection
+- **TTL support** — expired events are skipped on replay and removed by `purge_expired()`
+- **Multi-tenant isolation** via configurable `table_name`
+- **Priming event handling** — sentinel empty-string payloads are stored but never replayed
+
+### Configuration
+
+```python
+PostgresEventStore(
+    pool,                     # an asyncpg.Pool
+    table_name="mcp_events",  # isolate multiple servers in one database
+    ttl=3600,                 # seconds; None = never expire (not recommended)
+)
+```
+
+**TTL note:** PostgreSQL has no automatic row expiry. Events past `ttl` are
+skipped on replay, but to reclaim space call `await store.purge_expired()`
+periodically (e.g. from a background task or `pg_cron`). It returns the number
+of rows deleted.
+
+### Multi-tenant deployments
+
+If multiple MCP servers share a database, use different table names:
+
+```python
+store_a = PostgresEventStore(pool, table_name="server_a")
+store_b = PostgresEventStore(pool, table_name="server_b")
+```
+
 ## Examples
 
 The [`examples/`](examples/) directory contains minimal, runnable MCP servers
@@ -163,6 +236,7 @@ that wire each backend into a real
 |---|---|---|
 | [`sqlite_server.py`](examples/sqlite_server.py) | `SQLiteEventStore` | `python examples/sqlite_server.py` |
 | [`redis_server.py`](examples/redis_server.py) | `RedisEventStore` | `python examples/redis_server.py` |
+| [`postgres_server.py`](examples/postgres_server.py) | `PostgresEventStore` | `python examples/postgres_server.py` |
 
 Each example is a self-contained note-taking MCP server (tools, resources) that
 you can connect to with any MCP client at `http://localhost:8000/mcp`.
@@ -175,11 +249,23 @@ client snippet.
 ```bash
 git clone https://github.com/Ar-maan05/mcp-persist
 cd mcp-persist
-pip install -e ".[redis,sqlite,dev]"
-pytest tests/
+uv sync --all-extras --dev
+uv run pytest tests/
 ```
 
-Tests use [fakeredis](https://github.com/cunla/fakeredis-py) and in-memory SQLite (`aiosqlite`) — no external servers required.
+The Redis tests use [fakeredis](https://github.com/cunla/fakeredis-py) and the
+SQLite tests use in-memory `aiosqlite`, so the default run needs no external
+servers. The Postgres tests require a real server and are skipped unless
+`MCP_TEST_POSTGRES_URL` is set; to run them and the Redis suite against real
+backends:
+
+```bash
+MCP_TEST_REDIS_URL=redis://localhost:6379/0 \
+MCP_TEST_POSTGRES_URL=postgresql://postgres@localhost:5432/postgres \
+uv run pytest tests/
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for more.
 
 ## License
 
