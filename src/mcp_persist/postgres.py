@@ -197,6 +197,8 @@ class PostgresEventStore(EventStore):
         No-op returning ``0`` when ``ttl`` is ``None``. PostgreSQL has no
         automatic row expiry, so schedule this (e.g. from a periodic background
         task or ``pg_cron``) to keep the table from growing without bound.
+        (``pg_cron`` is a PostgreSQL extension that runs scheduled jobs inside
+        the database itself, so cleanup can run without an external scheduler.)
         """
         if self._ttl is None:
             return 0
