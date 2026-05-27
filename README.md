@@ -8,15 +8,42 @@ The MCP SDK ships an `EventStore` interface but only an in-memory reference impl
 
 | Backend | Extra | Use case |
 |---|---|---|
+| `SQLiteEventStore` | `sqlite` | Single-process SSE resumability across restarts, with no external service |
 | `RedisEventStore` | `redis` | Multi-process / multi-worker SSE resumability |
 
 ## Installation
 
 ```bash
+# SQLite backend (no external service needed)
+pip install "mcp-persist[sqlite]"
+
+# Redis backend
 pip install "mcp-persist[redis]"
+
+# Both
+pip install "mcp-persist[sqlite,redis]"
 ```
 
 ## Quickstart
+
+### SQLite
+
+```python
+import aiosqlite
+from mcp_persist import SQLiteEventStore
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+conn = await aiosqlite.connect("events.db")
+store = SQLiteEventStore(conn, ttl=3600)  # 1 hour TTL
+await store.initialize()
+
+session_manager = StreamableHTTPSessionManager(
+    app=mcp_server,
+    event_store=store,
+)
+```
+
+### Redis
 
 ```python
 import redis.asyncio as aioredis
@@ -30,6 +57,57 @@ session_manager = StreamableHTTPSessionManager(
     app=mcp_server,
     event_store=store,
 )
+```
+
+## SQLiteEventStore
+
+Stores MCP SSE events in a SQLite database so a single-process server can resume
+interrupted streams across restarts and redeploys — without running Redis or any
+other external service. Ideal for single-node deployments, local development, and
+edge/embedded hosts.
+
+> For load-balanced or multi-worker deployments, use `RedisEventStore` instead —
+> SQLite is single-writer and not designed for shared multi-process access.
+
+### How it works
+
+One row per event:
+
+```
+{table}.event_id    — INTEGER PRIMARY KEY AUTOINCREMENT, monotonic event IDs (never reused)
+{table}.stream_id   — TEXT, the stream the event belongs to
+{table}.payload     — TEXT, serialized JSONRPCMessage ("" for priming events)
+{table}.created_at  — REAL, unix timestamp used for TTL expiry
+```
+
+- **Monotonic IDs** via `AUTOINCREMENT` — strictly increasing, never reused, same guarantee as Redis `INCR`
+- **Indexed replay** — `WHERE stream_id = ? AND event_id > ?` over a `(stream_id, event_id)` index
+- **Durable across restarts** — WAL journaling; events survive process exit
+- **TTL support** — expired events are skipped on replay and removed by `purge_expired()`
+- **Multi-tenant isolation** via configurable `table_name`
+- **Priming event handling** — sentinel empty-string payloads are stored but never replayed
+
+### Configuration
+
+```python
+SQLiteEventStore(
+    conn,                   # an open aiosqlite.Connection
+    table_name="mcp_events",  # isolate multiple servers in one database file
+    ttl=3600,               # seconds; None = never expire (not recommended)
+)
+```
+
+**TTL note:** SQLite has no automatic key expiry. Events past `ttl` are skipped on
+replay, but to reclaim disk space call `await store.purge_expired()` periodically
+(e.g. from a background task). It returns the number of rows deleted.
+
+### Multi-tenant deployments
+
+If multiple MCP servers share a database file, use different table names:
+
+```python
+store_a = SQLiteEventStore(conn, table_name="server_a")
+store_b = SQLiteEventStore(conn, table_name="server_b")
 ```
 
 ## RedisEventStore
@@ -73,16 +151,33 @@ store_a = RedisEventStore(redis_client, key_prefix="server-a:")
 store_b = RedisEventStore(redis_client, key_prefix="server-b:")
 ```
 
+## Examples
+
+The [`examples/`](examples/) directory contains minimal, runnable MCP servers
+that wire each backend into a real
+[`StreamableHTTPSessionManager`](https://github.com/modelcontextprotocol/python-sdk):
+
+| File | Backend | Run |
+|---|---|---|
+| [`sqlite_server.py`](examples/sqlite_server.py) | `SQLiteEventStore` | `python examples/sqlite_server.py` |
+| [`redis_server.py`](examples/redis_server.py) | `RedisEventStore` | `python examples/redis_server.py` |
+
+Each example is a self-contained note-taking MCP server (tools, resources) that
+you can connect to with any MCP client at `http://localhost:8000/mcp`.
+
+See [`examples/README.md`](examples/README.md) for prerequisites, setup, and a
+client snippet.
+
 ## Development
 
 ```bash
 git clone https://github.com/Ar-maan05/mcp-persist
 cd mcp-persist
-pip install -e ".[redis,dev]"
+pip install -e ".[redis,sqlite,dev]"
 pytest tests/
 ```
 
-Tests use [fakeredis](https://github.com/cunla/fakeredis-py) — no external Redis server required.
+Tests use [fakeredis](https://github.com/cunla/fakeredis-py) and in-memory SQLite (`aiosqlite`) — no external servers required.
 
 ## License
 
