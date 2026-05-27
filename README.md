@@ -1,5 +1,7 @@
 # mcp-persist
 
+[![CI](https://github.com/Ar-maan05/mcp-persist/actions/workflows/ci.yml/badge.svg)](https://github.com/Ar-maan05/mcp-persist/actions/workflows/ci.yml)
+
 Production-grade persistence backends for the [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk).
 
 The MCP SDK ships an `EventStore` interface but only an in-memory reference implementation. `mcp-persist` provides backends for real deployments where you need durability across process restarts and multi-worker environments.
