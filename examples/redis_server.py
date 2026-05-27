@@ -33,9 +33,10 @@ import redis.asyncio as aioredis
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp_persist import RedisEventStore
 from starlette.applications import Starlette
 from starlette.routing import Mount
+
+from mcp_persist import RedisEventStore
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 
