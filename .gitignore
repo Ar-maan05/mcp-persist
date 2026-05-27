@@ -20,3 +20,6 @@ venv/
 *.db
 *.db-shm
 *.db-wal
+
+# uv lockfile
+uv.lock
