@@ -5,7 +5,12 @@
 # pyright: reportUnknownMemberType=false
 """Tests for RedisEventStore.
 
-Uses fakeredis — no external Redis server required.
+By default these run against fakeredis — no external Redis server required.
+Set MCP_TEST_REDIS_URL (e.g. redis://localhost:6379/0) to run the entire suite
+against a real Redis instead; the target database is flushed around every test,
+so point it at a throwaway database. CI runs both: fakeredis for the unit pass
+and a real Redis service container via MCP_TEST_REDIS_URL.
+
 All tests are async (anyio/asyncio backend).
 """
 
@@ -13,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 import fakeredis.aioredis as fakeredis
 import pytest
@@ -25,13 +31,45 @@ from mcp_persist import RedisEventStore
 
 SAMPLE_MSG = JSONRPCRequest(jsonrpc="2.0", id="1", method="tools/list")
 
+REAL_REDIS_URL = os.environ.get("MCP_TEST_REDIS_URL")
+
 
 @pytest.fixture
 async def redis_client():
-    client = fakeredis.FakeRedis()
+    if REAL_REDIS_URL:
+        import redis.asyncio as real_redis
+
+        # decode_responses defaults to False -> bytes, matching the assertions
+        # in this suite (e.g. hget(...) == b"...").
+        client = real_redis.from_url(REAL_REDIS_URL)
+
+        # Guard against pointing at real data: this suite FLUSHDBs around every
+        # test, so refuse to run unless the target database is already empty.
+        # Checked before any flush, so a non-empty DB is left untouched.
+        existing = await client.dbsize()
+        if existing:
+            try:
+                await client.aclose()
+            except AttributeError:
+                await client.close()
+            raise RuntimeError(
+                f"MCP_TEST_REDIS_URL points at a database holding {existing} key(s). "
+                "This suite calls FLUSHDB around every test; refusing to wipe a "
+                "non-empty database. Point it at an empty, throwaway DB."
+            )
+
+        # Flush before AND after each test: counter assertions (id == "1") and
+        # key-listing assertions require an empty database, and the suite runs
+        # serially so a shared real Redis is safe to wipe between tests.
+        await client.flushdb()
+    else:
+        client = fakeredis.FakeRedis()
+
     try:
         yield client
     finally:
+        if REAL_REDIS_URL:
+            await client.flushdb()
         try:
             await client.aclose()
         except AttributeError:
