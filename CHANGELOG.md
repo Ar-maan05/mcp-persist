@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Clarified the `PostgresEventStore.purge_expired` docstring with a one-line
+  explanation of `pg_cron`.
+
 ## [0.3.0] - 2026-05-27
 
 ### Added
