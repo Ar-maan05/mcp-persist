@@ -14,6 +14,28 @@ The MCP SDK ships an `EventStore` interface but only an in-memory reference impl
 | `RedisEventStore` | `redis` | Multi-process / multi-worker SSE resumability |
 | `PostgresEventStore` | `postgres` | Durable resumability for deployments already running Postgres, including multi-node / team setups |
 
+## Choosing a backend
+
+Start from how you deploy:
+
+| If your deployment… | Use |
+|---|---|
+| Runs as a single process and you want zero extra infrastructure | `SQLiteEventStore` |
+| Runs multiple workers / replicas behind a load balancer | `RedisEventStore` |
+| Already runs PostgreSQL, or needs durable storage at team / multi-node scale | `PostgresEventStore` |
+
+How they compare:
+
+| | SQLite | Redis | Postgres |
+|---|---|---|---|
+| External service | None | Redis | PostgreSQL |
+| Multi-process / multi-worker | No (single writer) | Yes | Yes |
+| Durable across restarts | Yes (on disk) | Depends on Redis persistence config | Yes |
+| Automatic expiry | No — call `purge_expired()` | Yes (native key TTL) | No — call `purge_expired()` |
+| Best fit | Single node, edge, local dev | Load-balanced / ephemeral fan-out | Teams already running Postgres |
+
+See [Benchmarks](#benchmarks) for latency and throughput characteristics.
+
 ## Installation
 
 ```bash
@@ -243,6 +265,39 @@ you can connect to with any MCP client at `http://localhost:8000/mcp`.
 
 See [`examples/README.md`](examples/README.md) for prerequisites, setup, and a
 client snippet.
+
+## Benchmarks
+
+[`benchmarks/benchmark.py`](benchmarks/benchmark.py) measures `store_event`
+latency (sequential), `store_event` throughput (concurrent), and
+`replay_events_after` latency across all three backends. SQLite runs against an
+on-disk file (its realistic durable mode), and Redis/Postgres run over the
+network. Run it yourself:
+
+```bash
+uv run python benchmarks/benchmark.py --events 2000 --concurrency 50
+```
+
+> **These numbers are indicative, not authoritative.** Absolute latency and
+> throughput depend heavily on hardware, disk, network, and server tuning. The
+> table below was measured locally with Redis and Postgres in localhost
+> containers — run the script in *your* environment for numbers that matter.
+
+| Backend | store p50 | store throughput | replay / event |
+|---|---|---|---|
+| SQLite | ~60 µs | ~18,000 ev/s | ~6 µs |
+| Redis | ~435 µs | ~3,400 ev/s | ~87 µs |
+| Postgres | ~750 µs | ~6,200 ev/s | ~7 µs |
+
+What the shape of these results reflects (and should hold across environments):
+
+- **SQLite has the lowest latency** — it's in-process with no network hop, which
+  is exactly why it's the right call for single-node deployments.
+- **Redis and Postgres pay a network round-trip per store**, so per-call latency
+  is higher; Postgres's pooled connections give it more concurrent throughput.
+- **Replay**: SQLite and Postgres fetch a stream's events in one indexed query,
+  while the Redis backend issues one lookup per event — fine for typical resume
+  sizes, but worth knowing if you replay very long streams.
 
 ## Development
 

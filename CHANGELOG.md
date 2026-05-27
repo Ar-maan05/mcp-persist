@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `benchmarks/benchmark.py` comparing `store_event` latency/throughput and
+  `replay_events_after` latency across all three backends.
+- "Choosing a backend" section in the README with a decision guide and
+  comparison table, plus a benchmarks summary.
+
 ### Changed
 - Clarified the `PostgresEventStore.purge_expired` docstring with a one-line
   explanation of `pg_cron`.
