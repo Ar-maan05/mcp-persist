@@ -161,12 +161,12 @@ async def run_backend(name: str, factory, events: int, concurrency: int) -> dict
 
             seq = await bench_store_sequential(store, events)
             tput = await bench_store_throughput(store, events, concurrency)
-            
+
             # Benchmark replay at multiple scales
             replay_100 = await bench_replay(store, 100)
             replay_1000 = await bench_replay(store, 1000)
             replay_10000 = await bench_replay(store, 10000)
-            
+
             return {
                 **seq,
                 "throughput_eps": tput,
@@ -185,10 +185,7 @@ def print_table(results: dict[str, dict[str, Any]]) -> None:
         return
 
     # Table 1: Storage Performance
-    header1 = (
-        f"{'Backend':<10} {'store p50':>12} {'store p95':>12} "
-        f"{'store mean':>12} {'throughput':>15}"
-    )
+    header1 = f"{'Backend':<10} {'store p50':>12} {'store p95':>12} {'store mean':>12} {'throughput':>15}"
     print("\nStorage Performance:")
     print("-" * len(header1))
     print(header1)
@@ -202,9 +199,7 @@ def print_table(results: dict[str, dict[str, Any]]) -> None:
     print("-" * len(header1))
 
     # Table 2: Replay Latency
-    header2 = (
-        f"{'Backend':<10} {'Replay 100':>15} {'Replay 1,000':>15} {'Replay 10,000':>15}"
-    )
+    header2 = f"{'Backend':<10} {'Replay 100':>15} {'Replay 1,000':>15} {'Replay 10,000':>15}"
     print("\nReplay Performance (Total Latency):")
     print("-" * len(header2))
     print(header2)
