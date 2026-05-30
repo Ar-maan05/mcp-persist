@@ -375,3 +375,80 @@ async def test_with_ttl_no_warning_emitted(redis_client, caplog):
         RedisEventStore(redis_client, ttl=3600)
 
     assert not any("ttl" in record.message.lower() for record in caplog.records)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# decode_responses support
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_replay_works_with_decode_responses_true():
+    # A client created with decode_responses=True returns str, not bytes. The
+    # store must handle both — previously replay crashed on str.decode().
+    if REAL_REDIS_URL:
+        import redis.asyncio as real_redis
+
+        client = real_redis.from_url(REAL_REDIS_URL, decode_responses=True)
+    else:
+        client = fakeredis.FakeRedis(decode_responses=True)
+
+    try:
+        store = RedisEventStore(client, key_prefix="decode-test:", ttl=60)
+        anchor = await store.store_event("stream-A", SAMPLE_MSG)
+        id2 = await store.store_event("stream-A", SAMPLE_MSG)
+
+        events, stream_id = await collect_events(store, anchor)
+
+        assert stream_id == "stream-A"
+        assert [e.event_id for e in events] == [id2]
+    finally:
+        keys = await client.keys("decode-test:*")
+        if keys:
+            await client.delete(*keys)
+        try:
+            await client.aclose()
+        except AttributeError:
+            await client.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sorted-set memory bounds (lazy prune + max_stream_length)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_replay_prunes_stale_zset_members(store, redis_client):
+    # An event whose payload hash has expired but whose id still lingers in the
+    # stream index must be dropped from the index on replay, so the sorted set
+    # can't grow without bound on a long-lived stream.
+    anchor = await store.store_event("stream-A", SAMPLE_MSG)
+    id2 = await store.store_event("stream-A", SAMPLE_MSG)
+    id3 = await store.store_event("stream-A", SAMPLE_MSG)
+
+    await redis_client.delete(f"test:event:{id2}")
+    before = [m.decode() for m in await redis_client.zrange("test:stream:stream-A", 0, -1)]
+    assert id2 in before
+
+    events, _ = await collect_events(store, anchor)
+    assert [e.event_id for e in events] == [id3]
+
+    after = [m.decode() for m in await redis_client.zrange("test:stream:stream-A", 0, -1)]
+    assert id2 not in after
+    assert id3 in after
+
+
+@pytest.mark.anyio
+async def test_max_stream_length_caps_sorted_set(redis_client, recwarn):
+    store = RedisEventStore(redis_client, key_prefix="cap:", ttl=None, max_stream_length=5)
+
+    ids = [await store.store_event("s", SAMPLE_MSG) for _ in range(10)]
+
+    members = [m.decode() for m in await redis_client.zrange("cap:stream:s", 0, -1)]
+    # Only the newest 5 ids are retained, in ascending (event-id) order.
+    assert members == ids[-5:]
+
+
+def test_max_stream_length_must_be_positive():
+    with pytest.raises(ValueError):
+        RedisEventStore(object(), max_stream_length=0)

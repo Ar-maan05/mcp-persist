@@ -339,3 +339,29 @@ def test_with_ttl_no_warning_emitted(caplog):
         SQLiteEventStore(object(), ttl=3600)
 
     assert not any("ttl" in record.message.lower() for record in caplog.records)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Schema qualification & Timeout tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_schema_qualified_table_name(conn):
+    store = SQLiteEventStore(conn, table_name="main.schema_events", ttl=None)
+    await store.initialize()
+    event_id = await store.store_event("stream-A", SAMPLE_MSG)
+    assert event_id == "1"
+
+    events, stream_id = await collect_events(store, event_id)
+    assert stream_id == "stream-A"
+    assert events == []
+
+
+@pytest.mark.anyio
+async def test_sqlite_timeout_applied(conn):
+    store = SQLiteEventStore(conn, table_name="timeout_events", timeout=5.0)
+    await store.initialize()
+    async with conn.execute("PRAGMA busy_timeout") as cursor:
+        row = await cursor.fetchone()
+    assert row[0] == 5000

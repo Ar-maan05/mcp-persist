@@ -48,6 +48,23 @@ logger = logging.getLogger(__name__)
 
 jsonrpc_message_adapter = TypeAdapter(JSONRPCMessage)
 
+# Rows pulled per round-trip when replaying a backlog, so a client resuming from
+# a very old Last-Event-ID can't materialize the whole stream in memory at once.
+_REPLAY_BATCH_SIZE = 500
+
+# SQLSTATEs Postgres can raise when concurrent workers run the same
+# ``CREATE ... IF NOT EXISTS`` at once: ``IF NOT EXISTS`` is not fully atomic
+# against the system catalogs, so a racing creator can surface a duplicate or
+# unique-violation error even though the object now exists. Treated as success.
+_DUPLICATE_DDL_SQLSTATES = frozenset(
+    {
+        "42P07",  # duplicate_table
+        "42P06",  # duplicate_schema
+        "42710",  # duplicate_object (e.g. index)
+        "23505",  # unique_violation (pg_class / pg_type catalog race)
+    }
+)
+
 
 class PostgresEventStore(EventStore):
     """EventStore backed by PostgreSQL for durable, scalable SSE resumability.
@@ -66,15 +83,20 @@ class PostgresEventStore(EventStore):
     Args:
         pool:       An ``asyncpg.Pool`` (or any object exposing the same
                     ``execute``/``fetch``/``fetchrow``/``fetchval`` coroutines).
-        table_name: Table name. Use different names when multiple MCP servers
-                    share one database. Must be a valid SQL identifier.
-                    Default: ``"mcp_events"``.
+        table_name: Table name, optionally schema-qualified (``"schema.table"``).
+                    Use different names when multiple MCP servers share one
+                    database. Each dot-separated part must be a valid SQL
+                    identifier. Default: ``"mcp_events"``.
         ttl:        Seconds after which events are considered expired and are
                     skipped on replay (and removed by :meth:`purge_expired`).
                     ``None`` means events never expire — discouraged in
                     production. PostgreSQL has no automatic row expiry, so call
                     :meth:`purge_expired` periodically (e.g. from a background
                     task or ``pg_cron``) to reclaim space.
+        timeout:    Optional per-query timeout in seconds, passed through to
+                    asyncpg. ``None`` (the default) waits indefinitely. Set it
+                    so a query can't hang a request handler forever under lock
+                    contention or database overload.
     """
 
     def __init__(
@@ -83,13 +105,21 @@ class PostgresEventStore(EventStore):
         *,
         table_name: str = "mcp_events",
         ttl: int | None = None,
+        timeout: float | None = None,
     ) -> None:
-        if not table_name.isidentifier():
-            raise ValueError(f"table_name must be a valid SQL identifier, got {table_name!r}")
+        parts = table_name.split(".")
+        if len(parts) > 2 or not all(part.isidentifier() for part in parts):
+            raise ValueError(f"table_name must be a valid SQL identifier or 'schema.table', got {table_name!r}")
 
         self._pool = pool
         self._table = table_name
+        # Index names are created in the table's schema, so they are bare
+        # identifiers derived from the unqualified table name.
+        bare = parts[-1]
+        self._stream_index = f"{bare}_stream_idx"
+        self._created_index = f"{bare}_created_idx"
         self._ttl = ttl
+        self._timeout = timeout
         self._initialized = False
         self._init_lock = asyncio.Lock()
 
@@ -104,28 +134,47 @@ class PostgresEventStore(EventStore):
 
     # Schema
 
+    async def _execute_ddl(self, statement: str) -> None:
+        """Run a DDL statement, tolerating concurrent-creation races.
+
+        The in-process ``_init_lock`` serializes DDL within one event loop, but
+        multiple workers or pods can still run ``initialize()`` against the same
+        database at the same instant. ``IF NOT EXISTS`` narrows but does not
+        close the catalog race, so a duplicate/unique-violation SQLSTATE here
+        means a peer won the race and the object now exists — treat it as done.
+        """
+        try:
+            await self._pool.execute(statement, timeout=self._timeout)
+        except Exception as exc:  # noqa: BLE001 - re-raised unless it is a known DDL race
+            if getattr(exc, "sqlstate", None) in _DUPLICATE_DDL_SQLSTATES:
+                logger.debug("Tolerating concurrent DDL race on %s: %s", self._table, exc)
+                return
+            raise
+
     async def initialize(self) -> None:
-        """Create the events table and index if they do not exist.
+        """Create the events table and indexes if they do not exist.
 
         Called automatically on first use; safe to call explicitly and
-        repeatedly (e.g. at startup). An internal lock serializes the DDL so
-        concurrent first ``store_event`` calls on a pool can't both run
-        ``CREATE TABLE IF NOT EXISTS`` — concurrent ``CREATE`` can raise a
-        duplicate-key error on Postgres system catalogs.
+        repeatedly (e.g. at startup), and safe to run concurrently from multiple
+        workers or pods — concurrent-creation races on the catalogs are
+        tolerated. Creates a ``(stream_id, event_id)`` index for replay range
+        scans and a ``created_at`` index so :meth:`purge_expired` can delete by
+        age without a full table scan.
         """
         async with self._init_lock:
             if self._initialized:
                 return
-            await self._pool.execute(
+            await self._execute_ddl(
                 f"CREATE TABLE IF NOT EXISTS {self._table} ("
                 "event_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
                 "stream_id TEXT NOT NULL, "
                 "payload TEXT NOT NULL, "
                 "created_at DOUBLE PRECISION NOT NULL)"
             )
-            await self._pool.execute(
-                f"CREATE INDEX IF NOT EXISTS {self._table}_stream_idx ON {self._table} (stream_id, event_id)"
+            await self._execute_ddl(
+                f"CREATE INDEX IF NOT EXISTS {self._stream_index} ON {self._table} (stream_id, event_id)"
             )
+            await self._execute_ddl(f"CREATE INDEX IF NOT EXISTS {self._created_index} ON {self._table} (created_at)")
             self._initialized = True
 
     # EventStore interface
@@ -149,6 +198,7 @@ class PostgresEventStore(EventStore):
             stream_id,
             payload,
             time.time(),
+            timeout=self._timeout,
         )
 
         return str(event_id)
@@ -172,6 +222,7 @@ class PostgresEventStore(EventStore):
         row = await self._pool.fetchrow(
             f"SELECT stream_id FROM {self._table} WHERE event_id = $1",
             anchor_id,
+            timeout=self._timeout,
         )
 
         if row is None:
@@ -179,30 +230,52 @@ class PostgresEventStore(EventStore):
 
         stream_id: StreamId = row["stream_id"]
 
-        if self._ttl is not None:
-            rows = await self._pool.fetch(
-                f"SELECT event_id, payload FROM {self._table} "
-                "WHERE stream_id = $1 AND event_id > $2 AND created_at >= $3 "
-                "ORDER BY event_id",
-                stream_id,
-                anchor_id,
-                time.time() - self._ttl,
-            )
-        else:
-            rows = await self._pool.fetch(
-                f"SELECT event_id, payload FROM {self._table} WHERE stream_id = $1 AND event_id > $2 ORDER BY event_id",
-                stream_id,
-                anchor_id,
-            )
+        # Fetch and replay in bounded batches keyed on event_id rather than
+        # pulling the whole backlog into memory at once. A client resuming from
+        # a long-idle Last-Event-ID could otherwise materialize hundreds of
+        # thousands of rows in one fetch() and OOM the worker.
+        min_created = time.time() - self._ttl if self._ttl is not None else None
+        cursor_id = anchor_id
 
-        for record in rows:
-            payload = record["payload"]
-            # Priming events (empty payload) are stored but never replayed.
-            if not payload:
-                continue
+        while True:
+            if min_created is not None:
+                rows = await self._pool.fetch(
+                    f"SELECT event_id, payload FROM {self._table} "
+                    "WHERE stream_id = $1 AND event_id > $2 AND created_at >= $3 "
+                    "ORDER BY event_id LIMIT $4",
+                    stream_id,
+                    cursor_id,
+                    min_created,
+                    _REPLAY_BATCH_SIZE,
+                    timeout=self._timeout,
+                )
+            else:
+                rows = await self._pool.fetch(
+                    f"SELECT event_id, payload FROM {self._table} "
+                    "WHERE stream_id = $1 AND event_id > $2 ORDER BY event_id LIMIT $3",
+                    stream_id,
+                    cursor_id,
+                    _REPLAY_BATCH_SIZE,
+                    timeout=self._timeout,
+                )
 
-            message = jsonrpc_message_adapter.validate_json(payload)
-            await send_callback(EventMessage(message=message, event_id=str(record["event_id"])))
+            if not rows:
+                break
+
+            for record in rows:
+                # Advance the cursor even past skipped priming events so the
+                # next batch can't re-fetch them (no infinite loop).
+                cursor_id = record["event_id"]
+                payload = record["payload"]
+                # Priming events (empty payload) are stored but never replayed.
+                if not payload:
+                    continue
+
+                message = jsonrpc_message_adapter.validate_json(payload)
+                await send_callback(EventMessage(message=message, event_id=str(record["event_id"])))
+
+            if len(rows) < _REPLAY_BATCH_SIZE:
+                break
 
         return stream_id
 
@@ -224,8 +297,11 @@ class PostgresEventStore(EventStore):
             await self.initialize()
 
         # asyncpg returns a command tag like "DELETE 5"; the count is the last token.
+        # The created_at index added in initialize() keeps this an index scan
+        # instead of a full table scan.
         result = await self._pool.execute(
             f"DELETE FROM {self._table} WHERE created_at < $1",
             time.time() - self._ttl,
+            timeout=self._timeout,
         )
         return int(result.split()[-1])

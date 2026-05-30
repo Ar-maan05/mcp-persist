@@ -364,3 +364,54 @@ def test_with_ttl_no_warning_emitted(caplog):
         PostgresEventStore(object(), ttl=3600)
 
     assert not any("ttl" in record.message.lower() for record in caplog.records)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Schema qualification, Timeout, and Pagination tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_schema_qualified_table_name(pg_pool):
+    # public is the default schema in Postgres
+    table_name = "public.schema_events"
+    await pg_pool.execute(f"DROP TABLE IF EXISTS {table_name}")
+    try:
+        store = PostgresEventStore(pg_pool, table_name=table_name, ttl=None)
+        await store.initialize()
+        event_id = await store.store_event("stream-A", SAMPLE_MSG)
+        assert event_id == "1"
+
+        events, stream_id = await collect_events(store, event_id)
+        assert stream_id == "stream-A"
+        assert events == []
+    finally:
+        await pg_pool.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+
+@pytest.mark.anyio
+async def test_postgres_timeout_applied(pg_pool, clean_table):
+    store = PostgresEventStore(pg_pool, table_name=TABLE, timeout=5.0)
+    await store.initialize()
+    # Storing an event should succeed and use the timeout
+    event_id = await store.store_event("stream-A", SAMPLE_MSG)
+    assert event_id == "1"
+
+
+@pytest.mark.anyio
+async def test_replay_pagination_batches(pg_pool, clean_table):
+    from mcp_persist import postgres
+
+    orig_batch_size = postgres._REPLAY_BATCH_SIZE
+    postgres._REPLAY_BATCH_SIZE = 2
+    try:
+        store = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None)
+        await store.initialize()
+        anchor = await store.store_event("stream-A", SAMPLE_MSG)
+        ids = [await store.store_event("stream-A", SAMPLE_MSG) for _ in range(5)]
+
+        events, stream_id = await collect_events(store, anchor)
+        assert stream_id == "stream-A"
+        assert [e.event_id for e in events] == ids
+    finally:
+        postgres._REPLAY_BATCH_SIZE = orig_batch_size

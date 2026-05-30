@@ -27,6 +27,7 @@ survive restarts or redeploys without running an external service.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from typing import Any
 
@@ -59,15 +60,25 @@ class SQLiteEventStore(EventStore):
     indexed range scan (``WHERE stream_id = ? AND event_id > ?``).
 
     Args:
-        conn:       An open ``aiosqlite.Connection``.
-        table_name: Table name. Use different names when multiple MCP servers
-                    share one database file. Must be a valid SQL identifier.
+        conn:       An open ``aiosqlite.Connection`` **dedicated to this store**.
+                    The store calls ``commit()`` on it, which flushes the whole
+                    connection's transaction; sharing it with other code that
+                    keeps an open transaction would commit that code's pending
+                    writes too. Give the store its own connection.
+        table_name: Table name, optionally schema-qualified (``"schema.table"``)
+                    to target an attached database. Use different names when
+                    multiple MCP servers share one database file. Each
+                    dot-separated part must be a valid SQL identifier.
                     Default: ``"mcp_events"``.
         ttl:        Seconds after which events are considered expired and are
                     skipped on replay (and removed by :meth:`purge_expired`).
                     ``None`` means events never expire — discouraged in
                     production. SQLite has no automatic expiry, so call
                     :meth:`purge_expired` periodically to reclaim space.
+        timeout:    Optional busy timeout in seconds. When set, SQLite waits up
+                    to this long for a lock before raising instead of failing
+                    immediately (applied via ``PRAGMA busy_timeout``). ``None``
+                    leaves SQLite's default in place.
     """
 
     def __init__(
@@ -76,13 +87,24 @@ class SQLiteEventStore(EventStore):
         *,
         table_name: str = "mcp_events",
         ttl: int | None = None,
+        timeout: float | None = None,
     ) -> None:
-        if not table_name.isidentifier():
-            raise ValueError(f"table_name must be a valid SQL identifier, got {table_name!r}")
+        parts = table_name.split(".")
+        if len(parts) > 2 or not all(part.isidentifier() for part in parts):
+            raise ValueError(f"table_name must be a valid SQL identifier or 'schema.table', got {table_name!r}")
 
         self._conn = conn
         self._table = table_name
+        # In SQLite a schema-qualified table lives in an attached database, and
+        # its index name must carry the same schema while the ON clause names
+        # the bare table. With no schema both collapse to the plain name.
+        bare = parts[-1]
+        schema_prefix = f"{parts[0]}." if len(parts) == 2 else ""
+        self._index_target = bare
+        self._stream_index = f"{schema_prefix}{bare}_stream_idx"
+        self._created_index = f"{schema_prefix}{bare}_created_idx"
         self._ttl = ttl
+        self._timeout = timeout
         self._initialized = False
 
         if ttl is None:
@@ -97,23 +119,43 @@ class SQLiteEventStore(EventStore):
     # Schema
 
     async def initialize(self) -> None:
-        """Create the events table and index if they do not exist.
+        """Create the events table and indexes if they do not exist.
 
         Called automatically on first use; safe to call explicitly and
-        repeatedly (e.g. at startup).
+        repeatedly (e.g. at startup). Creates a ``(stream_id, event_id)`` index
+        for replay range scans and a ``created_at`` index so
+        :meth:`purge_expired` deletes by age without a full table scan.
         """
+        if self._initialized:
+            return
+
         await self._conn.execute("PRAGMA journal_mode=WAL")
-        await self._conn.execute(
-            f"CREATE TABLE IF NOT EXISTS {self._table} ("
-            "event_id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "stream_id TEXT NOT NULL, "
-            "payload TEXT NOT NULL, "
-            "created_at REAL NOT NULL)"
-        )
-        await self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS {self._table}_stream_idx ON {self._table} (stream_id, event_id)"
-        )
-        await self._conn.commit()
+        if self._timeout is not None:
+            await self._conn.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
+
+        try:
+            await self._conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {self._table} ("
+                "event_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "stream_id TEXT NOT NULL, "
+                "payload TEXT NOT NULL, "
+                "created_at REAL NOT NULL)"
+            )
+            await self._conn.execute(
+                f"CREATE INDEX IF NOT EXISTS {self._stream_index} ON {self._index_target} (stream_id, event_id)"
+            )
+            await self._conn.execute(
+                f"CREATE INDEX IF NOT EXISTS {self._created_index} ON {self._index_target} (created_at)"
+            )
+            await self._conn.commit()
+        except sqlite3.OperationalError as exc:
+            # IF NOT EXISTS handles the normal case; another connection winning a
+            # concurrent create can still surface "already exists". The object
+            # exists now, so treat it as done rather than crashing startup.
+            if "already exists" not in str(exc).lower():
+                raise
+            logger.debug("Tolerating concurrent DDL race on %s: %s", self._table, exc)
+
         self._initialized = True
 
     # EventStore interface
@@ -132,13 +174,12 @@ class SQLiteEventStore(EventStore):
         else:
             payload = message.model_dump_json(by_alias=True, exclude_none=True)
 
-        cursor = await self._conn.execute(
+        async with self._conn.execute(
             f"INSERT INTO {self._table} (stream_id, payload, created_at) VALUES (?, ?, ?)",
             (stream_id, payload, time.time()),
-        )
-        await self._conn.commit()
-
-        return str(cursor.lastrowid)
+        ) as cursor:
+            await self._conn.commit()
+            return str(cursor.lastrowid)
 
     async def replay_events_after(
         self,
@@ -184,16 +225,17 @@ class SQLiteEventStore(EventStore):
             )
             params = (stream_id, anchor_id)
 
+        # Stream rows one at a time rather than fetchall()-ing the whole backlog
+        # into memory: a client resuming from a long-idle Last-Event-ID could
+        # otherwise pull hundreds of thousands of rows into RAM at once.
         async with self._conn.execute(query, params) as cursor:
-            rows = await cursor.fetchall()
+            async for event_id_int, payload in cursor:
+                # Priming events (empty payload) are stored but never replayed.
+                if not payload:
+                    continue
 
-        for event_id_int, payload in rows:
-            # Priming events (empty payload) are stored but never replayed.
-            if not payload:
-                continue
-
-            message = jsonrpc_message_adapter.validate_json(payload)
-            await send_callback(EventMessage(message=message, event_id=str(event_id_int)))
+                message = jsonrpc_message_adapter.validate_json(payload)
+                await send_callback(EventMessage(message=message, event_id=str(event_id_int)))
 
         return stream_id
 
@@ -212,9 +254,9 @@ class SQLiteEventStore(EventStore):
         if not self._initialized:
             await self.initialize()
 
-        cursor = await self._conn.execute(
+        async with self._conn.execute(
             f"DELETE FROM {self._table} WHERE created_at < ?",
             (time.time() - self._ttl,),
-        )
-        await self._conn.commit()
-        return cursor.rowcount
+        ) as cursor:
+            await self._conn.commit()
+            return cursor.rowcount

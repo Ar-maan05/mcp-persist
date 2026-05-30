@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-05-30
+
+### Added
+- **RedisEventStore**:
+  - `max_stream_length` constructor parameter to trim and bound the size of the stream's sorted set, preventing unbounded memory leak on active streams.
+  - Normalization of Redis replies allowing full support for Redis clients configured with `decode_responses=True`.
+- **PostgresEventStore & SQLiteEventStore**:
+  - Index on `created_at` created during schema initialization to avoid sequential scans / table scans during `purge_expired()`.
+  - Schema-qualified table name support (e.g. `schema.table` / `public.mcp_events`).
+  - `timeout` constructor parameter for database busy/lock timeouts.
+  - Streaming and batching during replay to avoid Out-Of-Memory (OOM) failures under massive event backlogs.
+
+### Fixed
+- **RedisEventStore**:
+  - Pipeline switched to `transaction=False` to prevent `CROSSSLOT` execution failures on Redis Cluster environments.
+  - Replay performance optimized by batching payload fetches into a single pipelined execute call rather than a sequential network loop.
+  - Added lazy pruning of stale event IDs from the stream's sorted set during replay.
+- **PostgresEventStore & SQLiteEventStore**:
+  - Wrapped DDL creation queries in exception handlers that safely tolerate concurrent catalog registration races when multiple workers or replicas initialize at the same instant.
+
 ## [1.0.2] - 2026-05-30
 
 ### Fixed
@@ -120,7 +140,8 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore` — Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.2...HEAD
+[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.3...HEAD
+[1.0.3]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/Ar-maan05/mcp-persist/compare/v0.3.0...v1.0.0
