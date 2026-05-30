@@ -32,7 +32,7 @@ from mcp.server.streamable_http import (
     StreamId,
 )
 from mcp.types import JSONRPCMessage
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -227,7 +227,18 @@ class RedisEventStore(EventStore):
             if not payload_str:
                 continue
 
-            message = jsonrpc_message_adapter.validate_json(payload_str)
+            try:
+                message = jsonrpc_message_adapter.validate_json(payload_str)
+            except ValidationError:
+                # A single corrupt/unparseable payload must not abort the whole
+                # replay: a reconnecting client would otherwise lose every event
+                # on the stream, not just the bad one. Skip it and keep going.
+                logger.warning(
+                    "Skipping event %s on stream %s during replay: payload failed JSONRPC validation",
+                    eid,
+                    stream_id,
+                )
+                continue
 
             await send_callback(EventMessage(message=message, event_id=eid))
 

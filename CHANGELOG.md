@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-05-30
+
+### Fixed
+- **RedisEventStore, SQLiteEventStore & PostgresEventStore**:
+  - `replay_events_after` no longer aborts the entire stream when it encounters a single event with a corrupt or unparseable payload. The offending event is now logged at `WARNING` and skipped, so a reconnecting client still receives every other event on the stream instead of losing the whole replay to one malformed row.
+
+### Added
+- **Tests**:
+  - Regression tests for all three backends asserting that a corrupt payload injected mid-stream is skipped during replay while the events stored before and after it are still delivered.
+
 ## [1.1.4] - 2026-05-30
 
 ### Fixed
@@ -16,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Documentation**:
   - Code snippet in `docs/production.md` demonstrating python logging configuration details for all `mcp_persist.*` backends.
+
+## [1.1.3] - 2026-05-30
 
 ### Changed
 - **Tests**:

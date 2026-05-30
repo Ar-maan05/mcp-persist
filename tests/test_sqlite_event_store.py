@@ -224,6 +224,30 @@ async def test_replay_skips_priming_events(store):
 
 
 @pytest.mark.anyio
+async def test_replay_skips_corrupt_payload_without_aborting_stream(store, conn, caplog):
+    # A single corrupt payload must not poison the whole stream: events both
+    # before and after the bad one must still reach the client on reconnect.
+    anchor = await store.store_event("stream-A", SAMPLE_MSG)
+    good_before = await store.store_event("stream-A", SAMPLE_MSG)
+    bad = await store.store_event("stream-A", SAMPLE_MSG)
+    good_after = await store.store_event("stream-A", SAMPLE_MSG)
+
+    # Corrupt the middle event's payload directly, bypassing store_event().
+    await conn.execute(
+        f"UPDATE {TABLE} SET payload = ? WHERE event_id = ?",
+        ("{not valid json", int(bad)),
+    )
+    await conn.commit()
+
+    with caplog.at_level(logging.WARNING):
+        events, stream_id = await collect_events(store, anchor)
+
+    assert [e.event_id for e in events] == [good_before, good_after]
+    assert stream_id == "stream-A"
+    assert "failed JSONRPC validation" in caplog.text
+
+
+@pytest.mark.anyio
 async def test_replay_events_are_in_ascending_order(store):
     anchor = await store.store_event("stream-A", SAMPLE_MSG)
     id2 = await store.store_event("stream-A", SAMPLE_MSG)

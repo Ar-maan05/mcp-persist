@@ -43,7 +43,7 @@ from mcp.server.streamable_http import (
     StreamId,
 )
 from mcp.types import JSONRPCMessage
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +148,10 @@ class PostgresEventStore(EventStore):
         means a peer won the race and the object now exists — treat it as done.
         """
         try:
-            await self._pool.execute(statement, timeout=self._timeout)
+            # Table/index creation can be slower than standard queries; use a generous 30s timeout
+            # unless the user has configured an even larger custom timeout.
+            timeout = max(30.0, self._timeout) if self._timeout is not None else 30.0
+            await self._pool.execute(statement, timeout=timeout)
         except Exception as exc:  # noqa: BLE001 - re-raised unless it is a known DDL race
             if getattr(exc, "sqlstate", None) in _DUPLICATE_DDL_SQLSTATES:
                 logger.debug("Tolerating concurrent DDL race on %s: %s", self._table, exc)
@@ -275,7 +278,18 @@ class PostgresEventStore(EventStore):
                 if not payload:
                     continue
 
-                message = jsonrpc_message_adapter.validate_json(payload)
+                try:
+                    message = jsonrpc_message_adapter.validate_json(payload)
+                except ValidationError:
+                    # A single corrupt/unparseable payload must not abort the whole
+                    # replay: a reconnecting client would otherwise lose every event
+                    # on the stream, not just the bad one. Skip it and keep going.
+                    logger.warning(
+                        "Skipping event %s on stream %s during replay: payload failed JSONRPC validation",
+                        record["event_id"],
+                        stream_id,
+                    )
+                    continue
                 await send_callback(EventMessage(message=message, event_id=str(record["event_id"])))
 
             if len(rows) < _REPLAY_BATCH_SIZE:

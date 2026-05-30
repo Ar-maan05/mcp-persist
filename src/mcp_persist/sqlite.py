@@ -41,7 +41,7 @@ from mcp.server.streamable_http import (
     StreamId,
 )
 from mcp.types import JSONRPCMessage
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +136,24 @@ class SQLiteEventStore(EventStore):
             if self._initialized:
                 return
 
+            # Fast-path check: if table already exists, we can return immediately
+            # to avoid exclusive write lock contention on schema DDL.
+            try:
+                table_parts = self._table.split(".")
+                bare = table_parts[-1]
+                schema_prefix = f"{table_parts[0]}." if len(table_parts) == 2 else ""
+                query = f"SELECT 1 FROM {schema_prefix}sqlite_master WHERE type='table' AND name=?"
+                bare_unquoted = bare.strip('"')
+                async with self._conn.execute(query, (bare_unquoted,)) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        if self._timeout is not None:
+                            await self._conn.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
+                        self._initialized = True
+                        return
+            except Exception:
+                pass
+
             await self._conn.execute("PRAGMA journal_mode=WAL")
             if self._timeout is not None:
                 await self._conn.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
@@ -157,9 +175,10 @@ class SQLiteEventStore(EventStore):
                 await self._conn.commit()
             except sqlite3.OperationalError as exc:
                 # IF NOT EXISTS handles the normal case; another connection winning a
-                # concurrent create can still surface "already exists". The object
-                # exists now, so treat it as done rather than crashing startup.
-                if "already exists" not in str(exc).lower():
+                # concurrent create can still surface "already exists" or a locking error.
+                # The object exists now, so treat it as done rather than crashing startup.
+                exc_str = str(exc).lower()
+                if "already exists" not in exc_str and "locked" not in exc_str:
                     raise
                 logger.debug("Tolerating concurrent DDL race on %s: %s", self._table, exc)
 
@@ -241,7 +260,18 @@ class SQLiteEventStore(EventStore):
                 if not payload:
                     continue
 
-                message = jsonrpc_message_adapter.validate_json(payload)
+                try:
+                    message = jsonrpc_message_adapter.validate_json(payload)
+                except ValidationError:
+                    # A single corrupt/unparseable payload must not abort the whole
+                    # replay: a reconnecting client would otherwise lose every event
+                    # on the stream, not just the bad one. Skip it and keep going.
+                    logger.warning(
+                        "Skipping event %s on stream %s during replay: payload failed JSONRPC validation",
+                        event_id_int,
+                        stream_id,
+                    )
+                    continue
                 await send_callback(EventMessage(message=message, event_id=str(event_id_int)))
 
         return stream_id
