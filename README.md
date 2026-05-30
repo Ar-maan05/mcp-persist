@@ -116,6 +116,8 @@ edge/embedded hosts.
 
 > For load-balanced or multi-worker deployments, use `RedisEventStore` instead —
 > SQLite is single-writer and not designed for shared multi-process access.
+> Multiple processes writing the same database file contend on SQLite's file
+> lock and will surface `SQLITE_BUSY` / "database is locked" errors.
 
 ### How it works
 
@@ -167,14 +169,15 @@ Stores MCP SSE events in Redis so clients can resume interrupted streams — eve
 Redis data layout:
 
 ```
-{prefix}counter                 — atomic INCR source for monotonic event IDs
+{prefix}counter                 — atomic INCR source for monotonic event IDs (never expires)
 {prefix}event:{event_id}        — HASH: stream_id + serialized payload
 {prefix}stream:{stream_id}      — ZSET: event IDs sorted by score for O(log N) range queries
 ```
 
-- **Atomic monotonic IDs** via Redis `INCR` — collision-free across concurrent workers
-- **O(log N) replay** via sorted set `ZRANGEBYSCORE`
-- **TTL support** — automatic key expiry to prevent unbounded memory growth
+- **Atomic monotonic IDs** via Redis `INCR` — collision-free across concurrent workers. The counter is never given a TTL (even when `ttl` is set), so IDs stay monotonic across idle periods; only the event and stream keys expire.
+- **Replay is O(log N + M)** — one `ZRANGEBYSCORE` range-scans the stream's sorted set, then each of the M matched events is fetched with its own `HGET`. That's one network round-trip per replayed event: fine for typical resume sizes, worth knowing for very long streams.
+- **TTL support** — automatic expiry of event/stream keys to prevent unbounded memory growth
+- **Atomic writes** — each event's hash, sorted-set entry, and TTLs are written in a single transactional pipeline, so a mid-write crash can't orphan a hash or leave a key without its expiry
 - **Multi-tenant isolation** via configurable `key_prefix`
 - **Priming event handling** — sentinel empty-string payloads are stored but never replayed to clients
 
@@ -294,10 +297,14 @@ uv run python benchmarks/benchmark.py --events 2000 --concurrency 50
 
 What the shape of these results reflects (and should hold across environments):
 
-- **SQLite has the lowest latency** — it's in-process with no network hop, which
-  is exactly why it's the right call for single-node deployments.
+- **SQLite has the lowest latency _and_ the highest throughput** — it runs
+  in-process with no network hop, so every `store_event` skips a round-trip
+  entirely. The catch is that it's single-writer: that throughput doesn't scale
+  across processes, which is why multi-worker deployments still reach for Redis
+  or Postgres despite the lower single-node numbers.
 - **Redis and Postgres pay a network round-trip per store**, so per-call latency
-  is higher; Postgres's pooled connections give it more concurrent throughput.
+  is higher; Postgres's pooled connections let it run more of those round-trips
+  concurrently, giving it higher throughput than Redis here.
 - **Replay**: SQLite and Postgres fetch a stream's events in one indexed query,
   while the Redis backend issues one lookup per event — fine for typical resume
   sizes, but worth knowing if you replay very long streams.

@@ -4,13 +4,14 @@ about: Report incorrect or unexpected behavior in a backend
 labels: bug
 ---
 
-**Backend:** <!-- RedisEventStore / SQLiteEventStore -->
+**Backend:** <!-- RedisEventStore / SQLiteEventStore / PostgresEventStore -->
 
 **Versions:**
 - mcp-persist:
 - mcp:
 - Python:
 - Redis server (if applicable):
+- PostgreSQL server (if applicable):
 
 **What happened**
 <!-- The behavior you observed, including any traceback. -->

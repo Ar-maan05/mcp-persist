@@ -27,6 +27,7 @@ ephemeral multi-worker fan-out, ``RedisEventStore`` is the better fit.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -88,6 +89,7 @@ class PostgresEventStore(EventStore):
         self._table = table_name
         self._ttl = ttl
         self._initialized = False
+        self._init_lock = asyncio.Lock()
 
         if ttl is None:
             logger.warning(
@@ -104,19 +106,25 @@ class PostgresEventStore(EventStore):
         """Create the events table and index if they do not exist.
 
         Called automatically on first use; safe to call explicitly and
-        repeatedly (e.g. at startup).
+        repeatedly (e.g. at startup). An internal lock serializes the DDL so
+        concurrent first ``store_event`` calls on a pool can't both run
+        ``CREATE TABLE IF NOT EXISTS`` — concurrent ``CREATE`` can raise a
+        duplicate-key error on Postgres system catalogs.
         """
-        await self._pool.execute(
-            f"CREATE TABLE IF NOT EXISTS {self._table} ("
-            "event_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
-            "stream_id TEXT NOT NULL, "
-            "payload TEXT NOT NULL, "
-            "created_at DOUBLE PRECISION NOT NULL)"
-        )
-        await self._pool.execute(
-            f"CREATE INDEX IF NOT EXISTS {self._table}_stream_idx ON {self._table} (stream_id, event_id)"
-        )
-        self._initialized = True
+        async with self._init_lock:
+            if self._initialized:
+                return
+            await self._pool.execute(
+                f"CREATE TABLE IF NOT EXISTS {self._table} ("
+                "event_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
+                "stream_id TEXT NOT NULL, "
+                "payload TEXT NOT NULL, "
+                "created_at DOUBLE PRECISION NOT NULL)"
+            )
+            await self._pool.execute(
+                f"CREATE INDEX IF NOT EXISTS {self._table}_stream_idx ON {self._table} (stream_id, event_id)"
+            )
+            self._initialized = True
 
     # EventStore interface
 

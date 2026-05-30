@@ -41,7 +41,7 @@ class RedisEventStore(EventStore):
     """EventStore backed by Redis for production multi-process deployments.
 
     Redis data layout:
-        {prefix}counter                — STRING, atomic INCR source for EventIds
+        {prefix}counter                — STRING, atomic INCR source for EventIds (never expired)
         {prefix}event:{event_id}       — HASH, fields: stream_id + payload
         {prefix}stream:{stream_id}     — ZSET, members: event_ids, scores: int(event_id)
 
@@ -104,23 +104,29 @@ class RedisEventStore(EventStore):
                 exclude_none=True,
             )
 
-        await self._redis.hset(
-            self._event_key(event_id),
-            mapping={
-                "stream_id": stream_id,
-                "payload": payload,
-            },
-        )
-
-        await self._redis.zadd(
-            self._stream_key(stream_id),
-            {event_id: event_id_int},
-        )
-
-        if self._ttl is not None:
-            await self._redis.expire(self._event_key(event_id), self._ttl)
-            await self._redis.expire(self._stream_key(stream_id), self._ttl)
-            await self._redis.expire(self._counter_key(), self._ttl)
+        # Write the event hash, its sorted-set entry, and their TTLs atomically
+        # in a single round-trip, so a mid-write crash can't leave an orphaned
+        # hash or a key without its expiry. The counter (incremented above) is
+        # deliberately never expired: tying its lifetime to ttl would restart
+        # EventIds from 1 after an idle gap longer than ttl, breaking the
+        # monotonic-ID guarantee — the same reason SQLite/Postgres keep their
+        # AUTOINCREMENT/IDENTITY sequence for the life of the table.
+        async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.hset(
+                self._event_key(event_id),
+                mapping={
+                    "stream_id": stream_id,
+                    "payload": payload,
+                },
+            )
+            pipe.zadd(
+                self._stream_key(stream_id),
+                {event_id: event_id_int},
+            )
+            if self._ttl is not None:
+                pipe.expire(self._event_key(event_id), self._ttl)
+                pipe.expire(self._stream_key(stream_id), self._ttl)
+            await pipe.execute()
 
         return event_id
 

@@ -296,11 +296,15 @@ async def test_stream_key_has_ttl_when_configured(store_with_ttl, redis_client):
 
 
 @pytest.mark.anyio
-async def test_counter_key_has_ttl_when_configured(store_with_ttl, redis_client):
+async def test_counter_key_never_expires_even_with_ttl(store_with_ttl, redis_client):
+    # The counter is the monotonic-ID source and must outlive the events it
+    # numbers. If it expired alongside them, the next event ID would restart
+    # from 1 after an idle gap longer than ttl, breaking monotonicity — so it is
+    # never given a TTL, even when one is configured for events.
     await store_with_ttl.store_event("stream-A", SAMPLE_MSG)
 
     ttl = await redis_client.ttl("test:counter")
-    assert 0 < ttl <= 60
+    assert ttl == -1  # -1 = key exists with no expiry set
 
 
 @pytest.mark.anyio

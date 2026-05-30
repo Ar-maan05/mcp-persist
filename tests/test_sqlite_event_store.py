@@ -123,6 +123,11 @@ async def test_store_event_autoinitializes_without_explicit_initialize(conn, rec
 
 @pytest.mark.anyio
 async def test_concurrent_store_event_produces_unique_ids(store):
+    # NOTE: this passes because aiosqlite funnels every statement through a
+    # single background thread on one connection, so these "concurrent" stores
+    # are actually serialized. It does NOT show that SQLite is safe for
+    # concurrent writes from multiple connections or processes — it is not.
+    # Use RedisEventStore or PostgresEventStore for genuine multi-writer setups.
     tasks = [asyncio.create_task(store.store_event("stream-X", SAMPLE_MSG)) for _ in range(50)]
     ids = await asyncio.gather(*tasks)
 

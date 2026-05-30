@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-05-30
+
+### Fixed
+- `RedisEventStore` no longer sets a TTL on the counter key. Previously the
+  counter expired along with events, so after an idle period longer than `ttl`
+  the next event ID restarted from `1`, breaking the monotonic-ID guarantee. The
+  counter now persists for the life of the Redis instance, matching the
+  `AUTOINCREMENT` / `IDENTITY` sequences of the SQLite and Postgres backends.
+- `PostgresEventStore.initialize` is now guarded by a lock and short-circuits
+  once initialized, so concurrent first `store_event` calls on a pool can no
+  longer race on `CREATE TABLE IF NOT EXISTS` (which can raise a duplicate-key
+  error on Postgres system catalogs).
+
+### Added
+- `mcp_persist.__version__`, resolved from installed package metadata.
+
+### Changed
+- `RedisEventStore.store_event` now writes the event hash, its sorted-set entry,
+  and their TTLs in a single transactional pipeline instead of separate
+  round-trips. This makes the per-event write atomic — a mid-write crash can no
+  longer orphan an event hash or leave a key without its expiry — and removes
+  round-trips from the hot path.
+- README: explained SQLite's throughput advantage (no network hop) and its
+  single-writer caveat; surfaced the Redis per-event replay cost (`O(log N + M)`,
+  one round-trip per replayed event) in the `RedisEventStore` "How it works"
+  section; spelled out the consequence of multi-process SQLite access
+  (`SQLITE_BUSY` / "database is locked").
+- Documentation: added `PostgresEventStore` to the `CONTRIBUTING.md` intro, the
+  bug-report issue template, and the pull-request checklist.
+
+### Tests
+- Corrected the Redis counter-TTL test to assert the counter has no expiry
+  (was asserting the buggy behavior), clarified that the SQLite concurrent-ID
+  test passes only because aiosqlite serializes writes through one connection,
+  and added a package-level test covering `__version__` and the public exports.
+
 ## [1.0.0] - 2026-05-27
 
 First stable release. The three backends (`RedisEventStore`, `SQLiteEventStore`,
@@ -59,7 +95,8 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore` — Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/Ar-maan05/mcp-persist/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/Ar-maan05/mcp-persist/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Ar-maan05/mcp-persist/compare/v0.1.1...v0.2.0

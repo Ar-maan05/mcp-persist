@@ -15,8 +15,15 @@ Usage:
     from mcp_persist import RedisEventStore, SQLiteEventStore, PostgresEventStore
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
 from mcp_persist.postgres import PostgresEventStore
 from mcp_persist.redis import RedisEventStore
 from mcp_persist.sqlite import SQLiteEventStore
 
-__all__ = ["PostgresEventStore", "RedisEventStore", "SQLiteEventStore"]
+try:
+    __version__ = version("mcp-persist")
+except PackageNotFoundError:  # pragma: no cover - running from a source tree without install
+    __version__ = "0.0.0+unknown"
+
+__all__ = ["PostgresEventStore", "RedisEventStore", "SQLiteEventStore", "__version__"]

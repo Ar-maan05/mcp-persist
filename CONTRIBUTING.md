@@ -1,13 +1,13 @@
 # Contributing to mcp-persist
 
 Thanks for your interest in improving `mcp-persist`. This project provides
-persistence backends (`RedisEventStore`, `SQLiteEventStore`) for the MCP Python
-SDK's `EventStore` interface.
+persistence backends (`RedisEventStore`, `SQLiteEventStore`, `PostgresEventStore`)
+for the MCP Python SDK's `EventStore` interface.
 
 ## Development setup
 
 The project uses [uv](https://docs.astral.sh/uv/). One command installs the
-package with both backend extras and all dev tooling:
+package with all backend extras and all dev tooling:
 
 ```bash
 uv sync --all-extras --dev
