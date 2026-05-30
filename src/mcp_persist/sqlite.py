@@ -26,7 +26,9 @@ survive restarts or redeploys without running an external service.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 import sqlite3
 import time
 from typing import Any
@@ -44,6 +46,8 @@ from pydantic import TypeAdapter
 logger = logging.getLogger(__name__)
 
 jsonrpc_message_adapter = TypeAdapter(JSONRPCMessage)
+
+IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
 class SQLiteEventStore(EventStore):
@@ -90,22 +94,24 @@ class SQLiteEventStore(EventStore):
         timeout: float | None = None,
     ) -> None:
         parts = table_name.split(".")
-        if len(parts) > 2 or not all(part.isidentifier() for part in parts):
+        if len(parts) > 2 or not all(part and IDENTIFIER_RE.match(part) for part in parts):
             raise ValueError(f"table_name must be a valid SQL identifier or 'schema.table', got {table_name!r}")
 
         self._conn = conn
-        self._table = table_name
+        quoted_parts = [f'"{part}"' for part in parts]
+        self._table = ".".join(quoted_parts)
         # In SQLite a schema-qualified table lives in an attached database, and
         # its index name must carry the same schema while the ON clause names
         # the bare table. With no schema both collapse to the plain name.
         bare = parts[-1]
-        schema_prefix = f"{parts[0]}." if len(parts) == 2 else ""
-        self._index_target = bare
-        self._stream_index = f"{schema_prefix}{bare}_stream_idx"
-        self._created_index = f"{schema_prefix}{bare}_created_idx"
+        schema_prefix = f'"{parts[0]}".' if len(parts) == 2 else ""
+        self._index_target = f'"{bare}"'
+        self._stream_index = f'{schema_prefix}"{bare}_stream_idx"'
+        self._created_index = f'{schema_prefix}"{bare}_created_idx"'
         self._ttl = ttl
         self._timeout = timeout
         self._initialized = False
+        self._init_lock = asyncio.Lock()
 
         if ttl is None:
             logger.warning(
@@ -126,37 +132,38 @@ class SQLiteEventStore(EventStore):
         for replay range scans and a ``created_at`` index so
         :meth:`purge_expired` deletes by age without a full table scan.
         """
-        if self._initialized:
-            return
+        async with self._init_lock:
+            if self._initialized:
+                return
 
-        await self._conn.execute("PRAGMA journal_mode=WAL")
-        if self._timeout is not None:
-            await self._conn.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
+            await self._conn.execute("PRAGMA journal_mode=WAL")
+            if self._timeout is not None:
+                await self._conn.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
 
-        try:
-            await self._conn.execute(
-                f"CREATE TABLE IF NOT EXISTS {self._table} ("
-                "event_id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                "stream_id TEXT NOT NULL, "
-                "payload TEXT NOT NULL, "
-                "created_at REAL NOT NULL)"
-            )
-            await self._conn.execute(
-                f"CREATE INDEX IF NOT EXISTS {self._stream_index} ON {self._index_target} (stream_id, event_id)"
-            )
-            await self._conn.execute(
-                f"CREATE INDEX IF NOT EXISTS {self._created_index} ON {self._index_target} (created_at)"
-            )
-            await self._conn.commit()
-        except sqlite3.OperationalError as exc:
-            # IF NOT EXISTS handles the normal case; another connection winning a
-            # concurrent create can still surface "already exists". The object
-            # exists now, so treat it as done rather than crashing startup.
-            if "already exists" not in str(exc).lower():
-                raise
-            logger.debug("Tolerating concurrent DDL race on %s: %s", self._table, exc)
+            try:
+                await self._conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {self._table} ("
+                    "event_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "stream_id TEXT NOT NULL, "
+                    "payload TEXT NOT NULL, "
+                    "created_at REAL NOT NULL)"
+                )
+                await self._conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS {self._stream_index} ON {self._index_target} (stream_id, event_id)"
+                )
+                await self._conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS {self._created_index} ON {self._index_target} (created_at)"
+                )
+                await self._conn.commit()
+            except sqlite3.OperationalError as exc:
+                # IF NOT EXISTS handles the normal case; another connection winning a
+                # concurrent create can still surface "already exists". The object
+                # exists now, so treat it as done rather than crashing startup.
+                if "already exists" not in str(exc).lower():
+                    raise
+                logger.debug("Tolerating concurrent DDL race on %s: %s", self._table, exc)
 
-        self._initialized = True
+            self._initialized = True
 
     # EventStore interface
 

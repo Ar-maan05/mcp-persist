@@ -5,9 +5,22 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/mcp-persist.svg)](https://pypi.org/project/mcp-persist/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Production-grade persistence backends for the [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk).
+The MCP Python SDK currently provides only an in-memory `EventStore`. **`mcp-persist` provides drop-in durable `EventStore` implementations for SQLite, Redis, and PostgreSQL.**
 
-The MCP SDK ships an `EventStore` interface but only an in-memory reference implementation. `mcp-persist` provides backends for real deployments where you need durability across process restarts and multi-worker environments.
+This allows real deployments to survive process restarts and scale across multi-worker environments while retaining SSE stream resumability.
+
+```
+MCP Server
+     │
+     ▼
+StreamableHTTPSessionManager
+     │
+     ▼
+EventStore
+ ├─ SQLite
+ ├─ Redis
+ └─ PostgreSQL
+```
 
 ## Backends
 
@@ -197,10 +210,26 @@ RedisEventStore(
     redis,                  # redis.asyncio.Redis instance
     key_prefix="mcp:",      # isolate multiple servers on one Redis instance
     ttl=3600,               # seconds; None = never expire (not recommended)
+    max_stream_length=None, # optional cap on how many event IDs each stream retains
 )
 ```
 
-**TTL guidance:** Set `ttl` to at least 2× your session idle timeout. If you leave it as `None`, a warning is logged and events accumulate indefinitely.
+- **TTL guidance:** Set `ttl` to at least 2× your session idle timeout. If you leave it as `None`, a warning is logged and events accumulate indefinitely.
+- **Stream bounds (`max_stream_length`):** Set a positive integer to cap the size of each stream's sorted set. The oldest event IDs beyond this limit are automatically trimmed on every write, preventing unbounded memory growth on long-lived streams.
+
+#### Production Note: Stream Cardinality & Redis Memory Growth
+
+When scaling to millions of unique stream IDs, Redis accumulates:
+- One `{prefix}event:{event_id}` HASH key per event.
+- One `{prefix}stream:{stream_id}` ZSET key per stream.
+- A global `{prefix}counter` string (never expires, preserving ID monotonicity).
+
+While event hashes and stream ZSETs expire automatically when `ttl` is set, a massive rate of unique stream creation (e.g., one-off clients) can accumulate many ZSET keys in memory within the TTL window.
+
+**Best Practices:**
+1. **Always configure a TTL** to ensure inactive streams and their events are automatically evicted.
+2. **Use a Volatile Eviction Policy:** Configure Redis with `volatile-lru` or `volatile-ttl`. **Do not use `allkeys-lru`**, as this can evict the global `{prefix}counter` key. If the counter key is evicted, the ID sequence resets, breaking stream resumability guarantees.
+3. **Limit Stream Cardinality** at the application level if possible by grouping related connections.
 
 ### Multi-tenant deployments
 
@@ -294,9 +323,14 @@ uv run python benchmarks/benchmark.py --events 2000 --concurrency 50
 ```
 
 > **These numbers are indicative, not authoritative.** Absolute latency and
-> throughput depend heavily on hardware, disk, network, and server tuning. The
-> table below was measured locally with Redis and Postgres in localhost
-> containers — run the script in *your* environment for numbers that matter.
+> throughput depend heavily on hardware, disk, network, and server tuning. Run the script in *your* environment for numbers that matter.
+
+### Benchmark Environment Spec
+The table below was measured with the following configuration:
+- **CPU / Machine:** AMD Ryzen AI 7 350 (8 cores, 16 threads), 24GB DDR5 5600, PCIe Gen 5 NVMe SSD storage, running Fedora Linux 44 (Workstation Edition) x86_64
+- **Python Version:** 3.12.2
+- **Redis Version:** 7.2.4 (Docker container on localhost)
+- **PostgreSQL Version:** 16.2 (Docker container on localhost)
 
 | Backend | store p50 | store throughput | replay / event |
 |---|---|---|---|

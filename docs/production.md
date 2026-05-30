@@ -182,6 +182,20 @@ resumes, not as a clean error.
 | Redis | Many workers / replicas | All instances share one Redis; event IDs stay globally monotonic via atomic `INCR`, and the ID counter never expires (1.0.1+). Size the client connection pool to your concurrency and watch memory. |
 | Postgres | Multi-node / team | Safe across nodes via `IDENTITY` + a pooled connection. Size the `asyncpg` pool (`max_size`) to match per-instance concurrency; rely on autovacuum plus the scheduled purge. |
 
+### Redis memory & stream cardinality growth
+
+When scaling a server with millions of unique client streams, Redis stores:
+- A global `{prefix}counter` (never expires).
+- One `{prefix}event:{event_id}` HASH key per event.
+- One `{prefix}stream:{stream_id}` ZSET key per unique stream.
+
+While individual event hashes and stream ZSETs expire automatically when `ttl` is set, a system with a very high rate of unique stream creation (e.g. one-off client connections) can accumulate millions of ZSET keys in memory within the TTL window.
+
+**Strategies to manage memory and cardinality:**
+1. **Always configure a TTL:** Set a reasonable `ttl` on `RedisEventStore` so inactive streams and their events are automatically evicted by Redis.
+2. **Use `volatile-lru` or `volatile-ttl` eviction policy:** Configure Redis with an eviction policy that only targets keys with an expiration time set. **Do not use `allkeys-lru` or `allkeys-random`**, as these can evict the global `{prefix}counter` key (which has no TTL). If the counter key is evicted, the ID sequence resets, breaking stream resumability guarantees.
+3. **Configure `max_stream_length`:** Set `max_stream_length` to cap the maximum number of event IDs stored in each stream's ZSET, preventing individual busy streams from growing too large.
+
 ## 7. Observability
 
 - **Loggers** (standard `logging`): `mcp_persist.redis`, `mcp_persist.sqlite`,

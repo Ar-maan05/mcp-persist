@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-05-30
+
+### Added
+- **PostgresEventStore & SQLiteEventStore**:
+  - Double-quoted table and index names to allow hyphens and other valid non-standard SQL identifiers (e.g. `mcp-events`).
+  - Validation pattern `^[a-zA-Z0-9_-]+$` replacing the Python-specific `isidentifier()` restriction.
+- **SQLiteEventStore**:
+  - In-process `self._init_lock` to serialize concurrent database first-time setup operations, consistent with the Postgres backend.
+- **Tests**:
+  - Stress tests in all backends that concurrently write to a stream and replay events from it, validating ordering and correctness under load.
+- **Documentation**:
+  - Simplified ASCII architecture diagram and earlier core purpose explanation in `README.md`.
+  - Detailed production guide for Redis memory scaling under high stream cardinality (millions of unique stream IDs) and recommended eviction policies.
+  - Documented system and software specs for the published benchmarks.
+
 ## [1.0.3] - 2026-05-30
 
 ### Added
@@ -140,7 +155,8 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore` — Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.4...HEAD
+[1.0.4]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.0...v1.0.1

@@ -155,6 +155,52 @@ async def test_concurrent_store_event_produces_unique_ids(store):
     assert all(id_.isdigit() for id_ in ids)
 
 
+@pytest.mark.anyio
+async def test_replay_while_writing_stress(store):
+    # Establish a starting anchor
+    start_id = await store.store_event("stress-stream", SAMPLE_MSG)
+
+    num_events = 100
+    write_done = asyncio.Event()
+
+    async def writer():
+        for i in range(num_events):
+            msg = JSONRPCRequest(jsonrpc="2.0", id=f"stress-{i}", method="stress")
+            await store.store_event("stress-stream", msg)
+            await asyncio.sleep(0.001)
+        write_done.set()
+
+    replayed_ids: list[str] = []
+
+    async def reader():
+        current_anchor = start_id
+        while True:
+            captured: list[EventMessage] = []
+
+            async def cb(event: EventMessage) -> None:
+                captured.append(event)
+
+            await store.replay_events_after(current_anchor, cb)
+            if captured:
+                for ev in captured:
+                    if ev.event_id is not None:
+                        replayed_ids.append(ev.event_id)
+                last_id = captured[-1].event_id
+                if last_id is not None:
+                    current_anchor = last_id
+
+            if write_done.is_set() and len(replayed_ids) >= num_events:
+                break
+            await asyncio.sleep(0.002)
+
+    await asyncio.gather(writer(), reader())
+
+    assert len(replayed_ids) == num_events
+    # Check that IDs are unique and monotonically increasing
+    assert len(set(replayed_ids)) == num_events
+    assert replayed_ids == sorted(replayed_ids, key=int)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # replay_events_after tests
 # ─────────────────────────────────────────────────────────────────────────────
@@ -345,6 +391,23 @@ async def test_table_name_isolates_two_stores(pg_pool, recwarn):
 def test_invalid_table_name_raises():
     with pytest.raises(ValueError):
         PostgresEventStore(object(), table_name="bad; DROP TABLE x")
+
+
+@pytest.mark.anyio
+async def test_table_name_with_hyphens(pg_pool):
+    table_name = "mcp-events-table"
+    await pg_pool.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+    try:
+        store = PostgresEventStore(pg_pool, table_name=table_name, ttl=None)
+        await store.initialize()
+        event_id = await store.store_event("stream-A", SAMPLE_MSG)
+        assert event_id == "1"
+
+        events, stream_id = await collect_events(store, event_id)
+        assert stream_id == "stream-A"
+        assert events == []
+    finally:
+        await pg_pool.execute(f'DROP TABLE IF EXISTS "{table_name}"')
 
 
 # ─────────────────────────────────────────────────────────────────────────────

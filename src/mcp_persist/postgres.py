@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 
@@ -47,6 +48,8 @@ from pydantic import TypeAdapter
 logger = logging.getLogger(__name__)
 
 jsonrpc_message_adapter = TypeAdapter(JSONRPCMessage)
+
+IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 # Rows pulled per round-trip when replaying a backlog, so a client resuming from
 # a very old Last-Event-ID can't materialize the whole stream in memory at once.
@@ -108,16 +111,17 @@ class PostgresEventStore(EventStore):
         timeout: float | None = None,
     ) -> None:
         parts = table_name.split(".")
-        if len(parts) > 2 or not all(part.isidentifier() for part in parts):
+        if len(parts) > 2 or not all(part and IDENTIFIER_RE.match(part) for part in parts):
             raise ValueError(f"table_name must be a valid SQL identifier or 'schema.table', got {table_name!r}")
 
         self._pool = pool
-        self._table = table_name
+        quoted_parts = [f'"{part}"' for part in parts]
+        self._table = ".".join(quoted_parts)
         # Index names are created in the table's schema, so they are bare
         # identifiers derived from the unqualified table name.
         bare = parts[-1]
-        self._stream_index = f"{bare}_stream_idx"
-        self._created_index = f"{bare}_created_idx"
+        self._stream_index = f'"{bare}_stream_idx"'
+        self._created_index = f'"{bare}_created_idx"'
         self._ttl = ttl
         self._timeout = timeout
         self._initialized = False
