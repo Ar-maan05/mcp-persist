@@ -29,6 +29,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 from mcp.types import JSONRPCRequest
 
@@ -151,7 +152,7 @@ BACKENDS = {
 }
 
 
-async def run_backend(name: str, factory, events: int, concurrency: int) -> dict[str, float] | None:
+async def run_backend(name: str, factory, events: int, concurrency: int) -> dict[str, Any] | None:
     try:
         async with factory() as store:
             # Warm up so connection/pool/cache costs don't skew the first sample.
@@ -160,30 +161,60 @@ async def run_backend(name: str, factory, events: int, concurrency: int) -> dict
 
             seq = await bench_store_sequential(store, events)
             tput = await bench_store_throughput(store, events, concurrency)
-            replay = await bench_replay(store, events)
-            return {**seq, "throughput_eps": tput, **replay}
+            
+            # Benchmark replay at multiple scales
+            replay_100 = await bench_replay(store, 100)
+            replay_1000 = await bench_replay(store, 1000)
+            replay_10000 = await bench_replay(store, 10000)
+            
+            return {
+                **seq,
+                "throughput_eps": tput,
+                "replay_100_ms": replay_100["total_ms"],
+                "replay_1000_ms": replay_1000["total_ms"],
+                "replay_10000_ms": replay_10000["total_ms"],
+            }
     except Exception as exc:  # unreachable backend, missing driver, etc.
         print(f"  {name}: skipped ({type(exc).__name__}: {exc})")
         return None
 
 
-def print_table(results: dict[str, dict[str, float]]) -> None:
+def print_table(results: dict[str, dict[str, Any]]) -> None:
     if not results:
         print("\nNo backends were reachable.")
         return
 
-    header = (
+    # Table 1: Storage Performance
+    header1 = (
         f"{'Backend':<10} {'store p50':>12} {'store p95':>12} "
-        f"{'store mean':>12} {'throughput':>15} {'replay/event':>14}"
+        f"{'store mean':>12} {'throughput':>15}"
     )
-    print("\n" + header)
-    print("-" * len(header))
+    print("\nStorage Performance:")
+    print("-" * len(header1))
+    print(header1)
+    print("-" * len(header1))
     for name, r in results.items():
         print(
             f"{name:<10} "
             f"{r['p50_us']:>9.1f} us {r['p95_us']:>9.1f} us {r['mean_us']:>9.1f} us "
-            f"{r['throughput_eps']:>10,.0f} ev/s {r['per_event_us']:>10.2f} us"
+            f"{r['throughput_eps']:>10,.0f} ev/s"
         )
+    print("-" * len(header1))
+
+    # Table 2: Replay Latency
+    header2 = (
+        f"{'Backend':<10} {'Replay 100':>15} {'Replay 1,000':>15} {'Replay 10,000':>15}"
+    )
+    print("\nReplay Performance (Total Latency):")
+    print("-" * len(header2))
+    print(header2)
+    print("-" * len(header2))
+    for name, r in results.items():
+        print(
+            f"{name:<10} "
+            f"{r['replay_100_ms']:>12.2f} ms {r['replay_1000_ms']:>12.2f} ms {r['replay_10000_ms']:>12.2f} ms"
+        )
+    print("-" * len(header2))
 
 
 async def main() -> None:
@@ -193,7 +224,7 @@ async def main() -> None:
     args = parser.parse_args()
 
     print(f"Benchmarking {args.events} events, concurrency {args.concurrency}")
-    results: dict[str, dict[str, float]] = {}
+    results: dict[str, dict[str, Any]] = {}
     for name, factory in BACKENDS.items():
         result = await run_backend(name, factory, args.events, args.concurrency)
         if result is not None:

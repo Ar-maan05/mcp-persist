@@ -348,9 +348,27 @@ What the shape of these results reflects (and should hold across environments):
 - **Redis and Postgres pay a network round-trip per store**, so per-call latency
   is higher; Postgres's pooled connections let it run more of those round-trips
   concurrently, giving it higher throughput than Redis here.
-- **Replay**: SQLite and Postgres fetch a stream's events in one indexed query,
-  while the Redis backend issues one lookup per event — fine for typical resume
-  sizes, but worth knowing if you replay very long streams.
+- **Replay**: SQLite and Postgres fetch a stream's events in one indexed query, while the Redis backend issues a `zrangebyscore` followed by a single pipelined execution to fetch payloads concurrently — keeping the entire replay latency bounded to exactly two network round-trips.
+
+## Architecture & Guarantees
+
+This section outlines the consistency, ordering, and concurrency guarantees of `mcp-persist` backends.
+
+### 1. Event Ordering
+- **Per-Stream vs Global:** All backends guarantee that event IDs are monotonically increasing, representing a sequential log of events. However, because client-side replay request handling relies on range scans queryable by stream ID, ordering guarantees are **per-stream**.
+- **Preserved Order:** Outbound events written to a specific stream via `store_event` are guaranteed to be replayed in the exact order they were written.
+
+### 2. Concurrency & Write Semantics
+- **Concurrent Writes:**
+  - **Redis:** `store_event` increments a global atomic counter via `INCR` to get the next sequential ID, and then pipelined commands write the event hash and add it to the stream's sorted set. Multiple workers can write concurrently without any locking, and the IDs are guaranteed to be unique and monotonically increasing.
+  - **SQLite:** SQLite is single-writer and serializes all writes. `aiosqlite` uses an in-process thread pool to queue commands on a single connection. Concurrent writes from multiple processes are not supported and will raise `SQLITE_BUSY` errors.
+  - **PostgreSQL:** Uses a native `BIGINT GENERATED ALWAYS AS IDENTITY` column which handles concurrent sequence increments safely across database sessions.
+- **Duplicate Event IDs:** Duplicate event IDs are structurally impossible. All backends rely on atomic database counters (`AUTOINCREMENT` for SQLite, `IDENTITY` for Postgres, and `INCR` for Redis) which generate strictly unique and non-overlapping sequence numbers.
+
+### 3. Consistency & Durability
+- **SQLite:** Configured with WAL (`Write-Ahead Logging`) journaling. Writes are flushed to disk on commit, ensuring durability across process restarts.
+- **Postgres:** Fully ACID compliant. Events are durable once the transaction commits.
+- **Redis:** Relies on Redis persistence configuration (RDB/AOF). If Redis is deployed as a cache (with no persistence) or with lazy AOF flushing, a Redis crash could roll back the database state, potentially repeating or dropping IDs. For strong durability, configure Redis with AOF (`appendfsync everysec` or `always`).
 
 ## Deploying to production
 

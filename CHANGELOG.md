@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-05-30
+
+### Added
+- **Benchmarks**:
+  - Separate benchmarks measuring replay latency at multiple scales (100, 1,000, and 10,000 events) comparing SQLite, Redis, and Postgres.
+- **Documentation**:
+  - Dedicated "Architecture & Guarantees" section in the README explaining event ordering, concurrency/write semantics, and consistency/durability levels of each store.
+  - Updated Redis replay comparison notes to reflect pipeline optimizations.
+
 ## [1.0.4] - 2026-05-30
 
 ### Added
@@ -155,7 +164,8 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore` — Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.4...HEAD
+[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.4...v1.1.0
 [1.0.4]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.1...v1.0.2
