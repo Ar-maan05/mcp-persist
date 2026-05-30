@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-05-30
+
+### Added
+- **Documentation**:
+  - Code snippet in `docs/production.md` demonstrating python logging configuration details for all `mcp_persist.*` backends.
+
+### Changed
+- **Tests**:
+  - Parameterized example server integration test to run SQLite, Redis, and Postgres servers and check them with the client smoke test.
+  - Automatically skip Redis and Postgres examples smoke tests locally when backend services are not running, while running them fully in CI.
+
 ## [1.1.2] - 2026-05-30
 
 ### Added
@@ -181,7 +192,8 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore` — Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.3...HEAD
+[1.1.3]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.4...v1.1.0

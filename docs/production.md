@@ -202,6 +202,18 @@ While individual event hashes and stream ZSETs expire automatically when `ttl` i
   - `mcp_persist.redis`
   - `mcp_persist.sqlite`
   - `mcp_persist.postgres`
+
+  You can configure individual backends or configure the parent `mcp_persist` namespace:
+  ```python
+  import logging
+
+  # Set log levels for all backends at once via parent namespace
+  logging.getLogger("mcp_persist").setLevel(logging.WARNING)
+
+  # Or configure specific backends individually
+  logging.getLogger("mcp_persist.redis").setLevel(logging.INFO)
+  logging.getLogger("mcp_persist.sqlite").setLevel(logging.DEBUG)
+  ```
 - **Construction warning alerts:** A `WARNING` log emitted at construction (e.g. `SQLiteEventStore created with ttl=None`) means events will accumulate indefinitely. Set up alert rules to detect this warning in production, as it signals a deploy-time misconfiguration.
 - **Tolerated Catalog Race events:** At `DEBUG` level, the engines log tolerated catalog creation races (e.g. `Tolerating concurrent DDL race on...`) which are helpful to ignore/diagnose during scale-outs.
 - **What to monitor & alert on:**
