@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Documentation**:
+  - "Redis connection pool sizing" section in `docs/production.md` explaining that `redis.asyncio` defaults to `max_connections=100` and raises `MaxConnectionsError` when the pool is exhausted (unlike `asyncpg`, which queues), with `max_connections` / `BlockingConnectionPool` remedies for high SSE fan-out.
+
 ## [1.2.0] - 2026-05-30
 
 ### Fixed

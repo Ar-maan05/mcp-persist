@@ -179,8 +179,46 @@ resumes, not as a clean error.
 | Backend | Topology | Notes |
 |---|---|---|
 | SQLite | **Single process only** | One writer. Multiple processes on the same file contend on the file lock and raise `SQLITE_BUSY` / "database is locked". Ideal for single-node / edge. |
-| Redis | Many workers / replicas | All instances share one Redis; event IDs stay globally monotonic via atomic `INCR`, and the ID counter never expires (1.0.1+). Size the client connection pool to your concurrency and watch memory. |
+| Redis | Many workers / replicas | All instances share one Redis; event IDs stay globally monotonic via atomic `INCR`, and the ID counter never expires (1.0.1+). [Size the client connection pool](#redis-connection-pool-sizing) to your concurrency and watch memory. |
 | Postgres | Multi-node / team | Safe across nodes via `IDENTITY` + a pooled connection. Size the `asyncpg` pool (`max_size`) to match per-instance concurrency; rely on autovacuum plus the scheduled purge. |
+
+### Redis connection pool sizing
+
+`RedisEventStore` issues **two round-trips per `store_event`** (an atomic `INCR`
+for the ID, then a pipeline for the event hash and stream index), and the SDK
+calls `store_event` for every outbound message. Under high SSE fan-out — many
+concurrent streams — those connections are drawn from the pool of the
+`redis.asyncio` client **you** construct and pass in.
+
+That pool matters because of a difference from `asyncpg`: `redis.asyncio.from_url(...)`
+defaults to **`max_connections=100`** and, once the pool is exhausted, **raises**
+a `MaxConnectionsError` (a `ConnectionError`, `"Too many connections"`) instead of
+waiting. `asyncpg`, by contrast, *queues* callers until a connection frees up. So a
+burst of concurrent writes that merely slows down on Postgres can fail outright on
+Redis with the default pool.
+
+Size the pool to your peak concurrency when you build the client:
+
+```python
+import redis.asyncio as aioredis
+
+redis_client = aioredis.from_url(REDIS_URL, max_connections=512)
+store = RedisEventStore(redis_client, ttl=3600)
+```
+
+Or use a `BlockingConnectionPool`, which waits for a free connection (like
+`asyncpg`) rather than raising:
+
+```python
+from redis.asyncio import BlockingConnectionPool, Redis
+
+pool = BlockingConnectionPool.from_url(REDIS_URL, max_connections=128, timeout=5)
+redis_client = Redis(connection_pool=pool)
+```
+
+A `MaxConnectionsError` surfacing through the SDK's `Error in message router`
+log (see [§4](#4-high-availability--failure-modes)) is the signal that the pool is
+undersized for your load.
 
 ### Redis memory & stream cardinality growth
 
