@@ -112,9 +112,29 @@ async def test_server_smoke(backend: str):
         except subprocess.TimeoutExpired:
             proc.kill()
 
-        # Clean up database file
+        # Clean up database file / table / keys
         if backend == "sqlite" and db_path.exists():
             try:
                 db_path.unlink()
+            except Exception:
+                pass
+        elif backend == "redis":
+            try:
+                import redis.asyncio as real_redis
+
+                redis_url = os.environ.get("MCP_TEST_REDIS_URL", "redis://127.0.0.1:6379")
+                client = real_redis.from_url(redis_url)
+                await client.flushdb()
+                await client.aclose()
+            except Exception:
+                pass
+        elif backend == "postgres":
+            try:
+                import asyncpg
+
+                pg_url = os.environ.get("MCP_TEST_POSTGRES_URL", "postgresql://postgres@localhost:5432/postgres")
+                conn = await asyncpg.connect(pg_url)
+                await conn.execute("DROP TABLE IF EXISTS mcp_events")
+                await conn.close()
             except Exception:
                 pass
