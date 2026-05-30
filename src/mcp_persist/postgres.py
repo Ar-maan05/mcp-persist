@@ -51,9 +51,10 @@ jsonrpc_message_adapter = TypeAdapter(JSONRPCMessage)
 
 IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
-# Rows pulled per round-trip when replaying a backlog, so a client resuming from
-# a very old Last-Event-ID can't materialize the whole stream in memory at once.
-_REPLAY_BATCH_SIZE = 500
+# Default rows pulled per round-trip when replaying a backlog, so a client
+# resuming from a very old Last-Event-ID can't materialize the whole stream in
+# memory at once. Overridable per store via the ``replay_batch_size`` kwarg.
+_DEFAULT_REPLAY_BATCH_SIZE = 500
 
 # SQLSTATEs Postgres can raise when concurrent workers run the same
 # ``CREATE ... IF NOT EXISTS`` at once: ``IF NOT EXISTS`` is not fully atomic
@@ -100,6 +101,13 @@ class PostgresEventStore(EventStore):
                     asyncpg. ``None`` (the default) waits indefinitely. Set it
                     so a query can't hang a request handler forever under lock
                     contention or database overload.
+        replay_batch_size:
+                    Rows fetched per round-trip when replaying a backlog
+                    (default ``500``). Bounds replay memory so a client resuming
+                    from a very old Last-Event-ID can't pull the whole stream
+                    into memory at once. Lower it if your payloads are unusually
+                    large; raise it to trade memory for fewer round-trips. Must
+                    be a positive integer.
     """
 
     def __init__(
@@ -109,10 +117,13 @@ class PostgresEventStore(EventStore):
         table_name: str = "mcp_events",
         ttl: int | None = None,
         timeout: float | None = None,
+        replay_batch_size: int = _DEFAULT_REPLAY_BATCH_SIZE,
     ) -> None:
         parts = table_name.split(".")
         if len(parts) > 2 or not all(part and IDENTIFIER_RE.match(part) for part in parts):
             raise ValueError(f"table_name must be a valid SQL identifier or 'schema.table', got {table_name!r}")
+        if replay_batch_size < 1:
+            raise ValueError(f"replay_batch_size must be a positive integer, got {replay_batch_size!r}")
 
         self._pool = pool
         quoted_parts = [f'"{part}"' for part in parts]
@@ -124,6 +135,7 @@ class PostgresEventStore(EventStore):
         self._created_index = f'"{bare}_created_idx"'
         self._ttl = ttl
         self._timeout = timeout
+        self._replay_batch_size = replay_batch_size
         self._initialized = False
         self._init_lock = asyncio.Lock()
 
@@ -253,7 +265,7 @@ class PostgresEventStore(EventStore):
                     stream_id,
                     cursor_id,
                     min_created,
-                    _REPLAY_BATCH_SIZE,
+                    self._replay_batch_size,
                     timeout=self._timeout,
                 )
             else:
@@ -262,7 +274,7 @@ class PostgresEventStore(EventStore):
                     "WHERE stream_id = $1 AND event_id > $2 ORDER BY event_id LIMIT $3",
                     stream_id,
                     cursor_id,
-                    _REPLAY_BATCH_SIZE,
+                    self._replay_batch_size,
                     timeout=self._timeout,
                 )
 
@@ -292,7 +304,7 @@ class PostgresEventStore(EventStore):
                     continue
                 await send_callback(EventMessage(message=message, event_id=str(record["event_id"])))
 
-            if len(rows) < _REPLAY_BATCH_SIZE:
+            if len(rows) < self._replay_batch_size:
                 break
 
         return stream_id

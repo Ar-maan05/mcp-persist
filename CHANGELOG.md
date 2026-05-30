@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-05-30
+
 ### Added
+- **PostgresEventStore**:
+  - `replay_batch_size` constructor parameter (default 500) to tune how many rows are fetched per round-trip during replay — useful for deployments with unusually large payloads, and previously only adjustable by monkey-patching a private module constant.
 - **Documentation**:
   - "Redis connection pool sizing" section in `docs/production.md` explaining that `redis.asyncio` defaults to `max_connections=100` and raises `MaxConnectionsError` when the pool is exhausted (unlike `asyncpg`, which queues), with `max_connections` / `BlockingConnectionPool` remedies for high SSE fan-out.
 
@@ -212,7 +216,8 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore` — Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/Ar-maan05/mcp-persist/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.4...v1.2.0
 [1.1.4]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.3...v1.1.4
 [1.1.3]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.2...v1.1.3

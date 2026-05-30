@@ -487,18 +487,19 @@ async def test_postgres_timeout_applied(pg_pool, clean_table):
 
 @pytest.mark.anyio
 async def test_replay_pagination_batches(pg_pool, clean_table):
-    from mcp_persist import postgres
+    # replay_batch_size=2 with more events than that forces multiple round-trips,
+    # exercising the pagination loop — via the public kwarg, no monkey-patching.
+    store = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None, replay_batch_size=2)
+    await store.initialize()
+    anchor = await store.store_event("stream-A", SAMPLE_MSG)
+    ids = [await store.store_event("stream-A", SAMPLE_MSG) for _ in range(5)]
 
-    orig_batch_size = postgres._REPLAY_BATCH_SIZE
-    postgres._REPLAY_BATCH_SIZE = 2
-    try:
-        store = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None)
-        await store.initialize()
-        anchor = await store.store_event("stream-A", SAMPLE_MSG)
-        ids = [await store.store_event("stream-A", SAMPLE_MSG) for _ in range(5)]
+    events, stream_id = await collect_events(store, anchor)
+    assert stream_id == "stream-A"
+    assert [e.event_id for e in events] == ids
 
-        events, stream_id = await collect_events(store, anchor)
-        assert stream_id == "stream-A"
-        assert [e.event_id for e in events] == ids
-    finally:
-        postgres._REPLAY_BATCH_SIZE = orig_batch_size
+
+@pytest.mark.anyio
+async def test_replay_batch_size_must_be_positive(pg_pool, clean_table):
+    with pytest.raises(ValueError, match="replay_batch_size"):
+        PostgresEventStore(pg_pool, table_name=TABLE, replay_batch_size=0)

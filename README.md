@@ -275,6 +275,7 @@ PostgresEventStore(
     pool,                     # an asyncpg.Pool
     table_name="mcp_events",  # isolate multiple servers in one database
     ttl=3600,                 # seconds; None = never expire (not recommended)
+    replay_batch_size=500,    # rows fetched per round-trip on replay; lower for very large payloads
 )
 ```
 
