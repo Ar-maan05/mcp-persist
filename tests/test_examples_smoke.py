@@ -52,9 +52,7 @@ async def test_server_smoke(backend: str):
     # Build environment dict with DATABASE_URL for Postgres
     env = os.environ.copy()
     if backend == "postgres":
-        env["DATABASE_URL"] = os.environ.get(
-            "MCP_TEST_POSTGRES_URL", "postgresql://postgres@localhost:5432/postgres"
-        )
+        env["DATABASE_URL"] = os.environ.get("MCP_TEST_POSTGRES_URL", "postgresql://postgres@localhost:5432/postgres")
 
     # Start the server in a subprocess
     proc = subprocess.Popen(
