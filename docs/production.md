@@ -198,14 +198,16 @@ While individual event hashes and stream ZSETs expire automatically when `ttl` i
 
 ## 7. Observability
 
-- **Loggers** (standard `logging`): `mcp_persist.redis`, `mcp_persist.sqlite`,
-  `mcp_persist.postgres`. Set levels per your stack.
-- A **`WARNING` at construction** means `ttl=None` — events will accumulate
-  indefinitely. Treat it as a deploy-time misconfiguration.
-- **What to monitor:** backend availability and latency; Redis `used_memory` and
-  `evicted_keys`; SQLite/Postgres table row count and on-disk size; the count
-  returned by `purge_expired()`; and the SDK's `Error in message router` /
-  `Error in replay sender` log lines.
+- **Explicitly configure loggers:** The library logs warnings, errors, and informational updates using standard Python `logging`. Explicitly configure levels and handlers for the following loggers to capture key operational events:
+  - `mcp_persist.redis`
+  - `mcp_persist.sqlite`
+  - `mcp_persist.postgres`
+- **Construction warning alerts:** A `WARNING` log emitted at construction (e.g. `SQLiteEventStore created with ttl=None`) means events will accumulate indefinitely. Set up alert rules to detect this warning in production, as it signals a deploy-time misconfiguration.
+- **Tolerated Catalog Race events:** At `DEBUG` level, the engines log tolerated catalog creation races (e.g. `Tolerating concurrent DDL race on...`) which are helpful to ignore/diagnose during scale-outs.
+- **What to monitor & alert on:**
+  - **SDK Request Handler Failures:** Monitor and alert on logger outputs containing `Error in message router` or `Error in replay sender`. These are raised by the MCP SDK when the persistence store operations fail (e.g. connection timeout, locked DB).
+  - **Purge loop results:** Monitor the return count of `store.purge_expired()`. A count consistently at 0 while your database sizes grow indicates the loop has stalled or is not running.
+  - **Database health metrics:** Backend CPU usage, query latency, active connection pool counts, and Redis memory statistics (e.g., `used_memory` and key evictions).
 
 ## Production checklist
 

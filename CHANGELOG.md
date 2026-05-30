@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-05-30
+
+### Added
+- **Tests**:
+  - Integration smoke test that executes the full example SQLite server and verifies it against the client smoke test.
+
+### Changed
+- **Documentation**:
+  - Reorganized benchmark results in the README into two clean tables showing storage performance and multi-scale replay performance separately.
+  - Expanded production guide for explicit log configuration and SDK error monitoring of the `mcp_persist.*` loggers.
+
 ## [1.1.1] - 2026-05-30
 
 ### Fixed
@@ -170,7 +181,8 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore` — Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.4...v1.1.0
 [1.0.4]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.3...v1.0.4

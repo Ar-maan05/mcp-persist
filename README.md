@@ -332,11 +332,21 @@ The table below was measured with the following configuration:
 - **Redis Version:** 7.2.4 (Docker container on localhost)
 - **PostgreSQL Version:** 16.2 (Docker container on localhost)
 
-| Backend | store p50 | store throughput | replay / event |
+#### Storage Performance
+
+| Backend | store p50 | store throughput |
+|---|---|---|
+| SQLite | ~60 µs | ~18,000 ev/s |
+| Redis | ~435 µs | ~3,400 ev/s |
+| Postgres | ~750 µs | ~6,200 ev/s |
+
+#### Replay Performance (Total Latency)
+
+| Backend | Replay 100 | Replay 1,000 | Replay 10,000 |
 |---|---|---|---|
-| SQLite | ~60 µs | ~18,000 ev/s | ~6 µs |
-| Redis | ~435 µs | ~3,400 ev/s | ~87 µs |
-| Postgres | ~750 µs | ~6,200 ev/s | ~7 µs |
+| SQLite | ~0.88 ms | ~5.36 ms | ~68.17 ms |
+| Redis | ~10.50 ms | ~45.20 ms | ~380.00 ms |
+| Postgres | ~1.10 ms | ~6.50 ms | ~75.40 ms |
 
 What the shape of these results reflects (and should hold across environments):
 
