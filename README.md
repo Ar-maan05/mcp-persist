@@ -61,15 +61,18 @@ pip install "mcp-persist[sqlite,redis,postgres]"
 
 ```python
 import aiosqlite
-from mcp_persist import SQLiteEventStore
+from mcp.server.fastmcp import FastMCP
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp_persist import SQLiteEventStore
+
+mcp = FastMCP(name="MyServer")
 
 conn = await aiosqlite.connect("events.db")
 store = SQLiteEventStore(conn, ttl=3600)  # 1 hour TTL
 await store.initialize()
 
 session_manager = StreamableHTTPSessionManager(
-    app=mcp_server,
+    app=mcp._mcp_server,  # the low-level Server that FastMCP wraps
     event_store=store,
 )
 ```
@@ -78,14 +81,17 @@ session_manager = StreamableHTTPSessionManager(
 
 ```python
 import redis.asyncio as aioredis
-from mcp_persist import RedisEventStore
+from mcp.server.fastmcp import FastMCP
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp_persist import RedisEventStore
+
+mcp = FastMCP(name="MyServer")
 
 redis_client = aioredis.from_url("redis://localhost:6379")
 store = RedisEventStore(redis_client, ttl=3600)  # 1 hour TTL
 
 session_manager = StreamableHTTPSessionManager(
-    app=mcp_server,
+    app=mcp._mcp_server,  # the low-level Server that FastMCP wraps
     event_store=store,
 )
 ```
@@ -94,15 +100,18 @@ session_manager = StreamableHTTPSessionManager(
 
 ```python
 import asyncpg
-from mcp_persist import PostgresEventStore
+from mcp.server.fastmcp import FastMCP
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp_persist import PostgresEventStore
+
+mcp = FastMCP(name="MyServer")
 
 pool = await asyncpg.create_pool("postgresql://localhost/mydb")
 store = PostgresEventStore(pool, ttl=3600)  # 1 hour TTL
 await store.initialize()
 
 session_manager = StreamableHTTPSessionManager(
-    app=mcp_server,
+    app=mcp._mcp_server,  # the low-level Server that FastMCP wraps
     event_store=store,
 )
 ```
@@ -308,6 +317,14 @@ What the shape of these results reflects (and should hold across environments):
 - **Replay**: SQLite and Postgres fetch a stream's events in one indexed query,
   while the Redis backend issues one lookup per event — fine for typical resume
   sizes, but worth knowing if you replay very long streams.
+
+## Deploying to production
+
+Once a backend is wired in, see the **[production guide](docs/production.md)** for
+operating it: scheduling `purge_expired()` so storage doesn't grow without bound,
+treating the store as a critical dependency (failure modes), pre-creating schema
+under restricted database permissions, TLS and credential handling, connection
+and pool sizing across workers, and a deployment checklist.
 
 ## Development
 

@@ -5,14 +5,16 @@ Requires the redis extra:
 
 Quickstart:
     import redis.asyncio as aioredis
-    from mcp_persist import RedisEventStore
+    from mcp.server.fastmcp import FastMCP
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from mcp_persist import RedisEventStore
 
+    mcp = FastMCP(name="MyServer")
     redis_client = aioredis.from_url("redis://localhost:6379")
     store = RedisEventStore(redis_client, ttl=3600)
 
     session_manager = StreamableHTTPSessionManager(
-        app=mcp_server,
+        app=mcp._mcp_server,  # the low-level Server that FastMCP wraps
         event_store=store,
     )
 """
@@ -136,6 +138,13 @@ class RedisEventStore(EventStore):
         send_callback: EventCallback,
     ) -> StreamId | None:
         """Replay all events on the same stream that occurred after last_event_id."""
+        # Last-Event-ID is a client-controlled header; a non-numeric value can't
+        # match any stored event, so return None instead of raising on int().
+        try:
+            last_int = int(last_event_id)
+        except (TypeError, ValueError):
+            return None
+
         stream_id_raw: bytes | None = await self._redis.hget(self._event_key(last_event_id), "stream_id")
 
         if stream_id_raw is None:
@@ -143,7 +152,6 @@ class RedisEventStore(EventStore):
 
         stream_id: StreamId = stream_id_raw.decode("utf-8")
 
-        last_int = int(last_event_id)
         raw_ids: list[bytes] = await self._redis.zrangebyscore(
             self._stream_key(stream_id),
             min=last_int + 1,

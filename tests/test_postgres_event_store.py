@@ -168,6 +168,15 @@ async def test_replay_unknown_id_returns_none(store):
 
 
 @pytest.mark.anyio
+async def test_replay_non_numeric_event_id_returns_none(store):
+    # Last-Event-ID is a client-controlled header; a non-numeric value must be
+    # handled gracefully (return None, no ValueError/traceback).
+    events, stream_id = await collect_events(store, "not-a-number")
+    assert stream_id is None
+    assert events == []
+
+
+@pytest.mark.anyio
 async def test_replay_returns_correct_stream_id(store):
     anchor = await store.store_event("my-stream", SAMPLE_MSG)
 

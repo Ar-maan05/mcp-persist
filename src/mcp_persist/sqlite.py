@@ -5,15 +5,17 @@ Requires the sqlite extra:
 
 Quickstart:
     import aiosqlite
-    from mcp_persist import SQLiteEventStore
+    from mcp.server.fastmcp import FastMCP
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from mcp_persist import SQLiteEventStore
 
+    mcp = FastMCP(name="MyServer")
     conn = await aiosqlite.connect("mcp_events.db")
     store = SQLiteEventStore(conn, ttl=3600)
     await store.initialize()
 
     session_manager = StreamableHTTPSessionManager(
-        app=mcp_server,
+        app=mcp._mcp_server,  # the low-level Server that FastMCP wraps
         event_store=store,
     )
 
@@ -147,9 +149,16 @@ class SQLiteEventStore(EventStore):
         if not self._initialized:
             await self.initialize()
 
+        # Last-Event-ID is a client-controlled header; a non-numeric value can't
+        # match any stored event, so return None instead of raising on int().
+        try:
+            anchor_id = int(last_event_id)
+        except (TypeError, ValueError):
+            return None
+
         async with self._conn.execute(
             f"SELECT stream_id FROM {self._table} WHERE event_id = ?",
-            (int(last_event_id),),
+            (anchor_id,),
         ) as cursor:
             row = await cursor.fetchone()
 
@@ -166,14 +175,14 @@ class SQLiteEventStore(EventStore):
             )
             params: tuple[Any, ...] = (
                 stream_id,
-                int(last_event_id),
+                anchor_id,
                 time.time() - self._ttl,
             )
         else:
             query = (
                 f"SELECT event_id, payload FROM {self._table} WHERE stream_id = ? AND event_id > ? ORDER BY event_id"
             )
-            params = (stream_id, int(last_event_id))
+            params = (stream_id, anchor_id)
 
         async with self._conn.execute(query, params) as cursor:
             rows = await cursor.fetchall()

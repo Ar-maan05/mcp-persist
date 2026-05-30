@@ -5,15 +5,17 @@ Requires the postgres extra:
 
 Quickstart:
     import asyncpg
-    from mcp_persist import PostgresEventStore
+    from mcp.server.fastmcp import FastMCP
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from mcp_persist import PostgresEventStore
 
+    mcp = FastMCP(name="MyServer")
     pool = await asyncpg.create_pool("postgresql://localhost/mydb")
     store = PostgresEventStore(pool, ttl=3600)
     await store.initialize()
 
     session_manager = StreamableHTTPSessionManager(
-        app=mcp_server,
+        app=mcp._mcp_server,  # the low-level Server that FastMCP wraps
         event_store=store,
     )
 
@@ -160,9 +162,16 @@ class PostgresEventStore(EventStore):
         if not self._initialized:
             await self.initialize()
 
+        # Last-Event-ID is a client-controlled header; a non-numeric value can't
+        # match any stored event, so return None instead of raising on int().
+        try:
+            anchor_id = int(last_event_id)
+        except (TypeError, ValueError):
+            return None
+
         row = await self._pool.fetchrow(
             f"SELECT stream_id FROM {self._table} WHERE event_id = $1",
-            int(last_event_id),
+            anchor_id,
         )
 
         if row is None:
@@ -176,14 +185,14 @@ class PostgresEventStore(EventStore):
                 "WHERE stream_id = $1 AND event_id > $2 AND created_at >= $3 "
                 "ORDER BY event_id",
                 stream_id,
-                int(last_event_id),
+                anchor_id,
                 time.time() - self._ttl,
             )
         else:
             rows = await self._pool.fetch(
                 f"SELECT event_id, payload FROM {self._table} WHERE stream_id = $1 AND event_id > $2 ORDER BY event_id",
                 stream_id,
-                int(last_event_id),
+                anchor_id,
             )
 
         for record in rows:

@@ -8,7 +8,7 @@ No external services required — persistence lives in a local .db file.
 
 Install extras:
     pip install "mcp-persist[sqlite]"
-    pip install uvicorn starlette aiosqlite
+    pip install uvicorn starlette
 
 Run:
     python examples/sqlite_server.py

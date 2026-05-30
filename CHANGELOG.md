@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-05-30
+
+### Fixed
+- `replay_events_after` now returns `None` for a non-numeric `Last-Event-ID`
+  instead of raising `ValueError`. The SDK passes this client-controlled header
+  through unvalidated; previously SQLite and Postgres raised on `int()` (logging
+  a traceback and aborting the replay) while Redis tolerated it. All three
+  backends now handle it uniformly.
+- Corrected the README and module-docstring quickstarts: they passed
+  `app=mcp_server` (undefined, and the wrong type) — `StreamableHTTPSessionManager`
+  needs the low-level server, so they now show `app=mcp._mcp_server` from a
+  `FastMCP` instance, matching the runnable examples.
+
+### Added
+- `docs/production.md` — a production deployment guide (scheduling
+  `purge_expired()`, failure modes, schema and permissions, security, scaling,
+  observability), linked from the README.
+
+### Changed
+- Removed the redundant `aiosqlite` line from the SQLite example's install
+  instructions (the `[sqlite]` extra already provides it).
+
+### Tests
+- Added a non-numeric `Last-Event-ID` replay test to all three backend suites.
+
 ## [1.0.1] - 2026-05-30
 
 ### Fixed
@@ -95,7 +120,8 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore` — Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/Ar-maan05/mcp-persist/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/Ar-maan05/mcp-persist/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/Ar-maan05/mcp-persist/compare/v0.2.0...v0.3.0
