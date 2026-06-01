@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-06-01
+
+### Changed
+- **RedisEventStore**: now logs a warning at construction when `max_stream_length` is set together with `ttl=None`. Trimming the stream index to `max_stream_length` drops old event IDs but does not delete their payload hashes, so without a `ttl` those payloads never expire and accumulate in Redis indefinitely. Pair `max_stream_length` with a `ttl` so trimmed payloads expire on their own.
+
+### Added
+- **Push-based streaming**:
+  - `subscribe(stream_id)` async generator on all three backends — yields `(event_id, message)` for events as they are written, instead of polling `replay_events_after`. Backed by Redis pub/sub, Postgres `LISTEN`/`NOTIFY`, and an SQLite polling fallback (`poll_interval`, default 0.5s). Opt in with the new `enable_streaming=True` constructor flag; with the default `False` there is no extra per-write round-trip and `subscribe()` raises, so existing behavior is unchanged. Delivery is **best-effort and forward-only (at-most-once)**: only events written after the subscription registers are delivered, the notification publish is best-effort (a failure is logged, never failing the write), and `replay_events_after` remains the durable catch-up path. Subscriptions are cancellable and release their connection on teardown. See the new "Real-time streaming with `subscribe()`" and "Subscribers and connection pools" sections in `docs/production.md` (each Postgres subscriber holds a pool connection for its lifetime — size the pool accordingly).
+- **Cross-backend migration**:
+  - `migrate(source, dest)` — copies every event from one store to another, preserving per-stream ordering and payloads. Supports `stream_id=` scoping to a single stream, an `on_progress` callback, and a configurable `batch_size`. Streams are migrated independently and returned in a `MigrationResult` (`streams_migrated`, `events_migrated`, `failed_streams`); a stream that errors is logged and skipped rather than aborting the run. Priming (empty-payload) events are copied faithfully. Note: event IDs and `created_at` timestamps are **not** preserved (the destination issues fresh IDs and timestamps), so client `Last-Event-ID` resumability tokens are invalidated by a migration — see the new "Migrating between backends" section in `docs/production.md`. `migrate` and `MigrationResult` are exported from `mcp_persist`.
+  - `list_streams()` on all three backends — yields each distinct stored stream ID; backs whole-database migration.
+- **Metrics / observability**:
+  - `MetricsCollector` protocol with optional `metrics=` hooks on all three stores. Implement `on_store_event(stream_id, event_id, duration_ms)`, `on_replay(stream_id, events_replayed, duration_ms)`, and `on_error(operation, error)` to emit timing and count data to Prometheus, Datadog, logs, or anything else. When no collector is supplied the store uses a `NoOpMetricsCollector` and takes a fast path with no measurable overhead. Hook calls are isolated — a collector that raises is logged and ignored, never turning a successful store or replay into a failure. Ships with `LoggingMetricsCollector` (one `DEBUG` line per operation) built in. `MetricsCollector`, `NoOpMetricsCollector`, and `LoggingMetricsCollector` are exported from `mcp_persist`.
+- **RedisEventStore, SQLiteEventStore & PostgresEventStore**:
+  - `create()` classmethod — an async context manager that owns the connection lifecycle, so callers no longer have to construct and tear down the underlying client/connection/pool themselves:
+    ```python
+    async with RedisEventStore.create("redis://localhost:6379", ttl=3600) as store:
+        await store.store_event(...)
+    ```
+    `RedisEventStore.create(url, ...)` opens the client via `redis.asyncio.from_url`; `SQLiteEventStore.create(path, ...)` opens an `aiosqlite` connection and calls `initialize()`; `PostgresEventStore.create(dsn, ...)` opens an `asyncpg` pool and calls `initialize()`. The connection is always closed on exit, including when `initialize()` or the body raises. Store options (`ttl`, `key_prefix`/`table_name`, etc.) are keyword arguments; any extra keyword arguments are forwarded to the underlying driver (`from_url` / `connect` / `create_pool`). The driver is imported lazily inside `create()`, so importing `mcp_persist` still works without the optional backend installed.
+
 ## [1.2.1] - 2026-05-30
 
 ### Added
@@ -216,7 +237,8 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore` — Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/Ar-maan05/mcp-persist/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.4...v1.2.0
 [1.1.4]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.3...v1.1.4

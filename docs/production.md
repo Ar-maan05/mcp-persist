@@ -220,6 +220,28 @@ A `MaxConnectionsError` surfacing through the SDK's `Error in message router`
 log (see [§4](#4-high-availability--failure-modes)) is the signal that the pool is
 undersized for your load.
 
+### Subscribers and connection pools (`subscribe()`)
+
+If you use the real-time [`subscribe()`](#9-real-time-streaming-with-subscribe)
+API, budget pool capacity for it on **both** backends — each active subscriber
+holds a connection for the lifetime of the subscription:
+
+- **Redis**: `subscribe()` uses `client.pubsub()`, which draws a dedicated
+  connection from the same pool as `store_event`/`replay_events_after`. With *N*
+  concurrent subscribers you need *N* connections beyond your write/replay
+  traffic; size `max_connections` (or use a `BlockingConnectionPool`) accordingly,
+  exactly as above.
+- **Postgres**: asyncpg requires a dedicated connection for `LISTEN`, so each
+  subscriber calls `pool.acquire()` and holds it until the subscription ends.
+  Size `max_size` for **peak concurrent subscribers + normal store/replay
+  concurrency**. If the pool is exhausted, `store_event`/`replay_events_after`
+  (and new subscriptions) block waiting for a free connection. A deployment with
+  many long-lived subscribers should run a pool large enough for all of them, or
+  use a separate pool/store instance dedicated to subscriptions.
+
+SQLite's `subscribe()` polls the table on the store's existing connection and
+opens no new connections, so this does not apply to it.
+
 ### Redis memory & stream cardinality growth
 
 When scaling a server with millions of unique client streams, Redis stores:
@@ -252,12 +274,106 @@ While individual event hashes and stream ZSETs expire automatically when `ttl` i
   logging.getLogger("mcp_persist.redis").setLevel(logging.INFO)
   logging.getLogger("mcp_persist.sqlite").setLevel(logging.DEBUG)
   ```
+- **Metrics hooks:** For timing and throughput data rather than logs, pass a `MetricsCollector` to any store via `metrics=`. Its `on_store_event(stream_id, event_id, duration_ms)`, `on_replay(stream_id, events_replayed, duration_ms)`, and `on_error(operation, error)` hooks let you feed per-operation latency and counts into Prometheus, Datadog, etc. The default (no collector) takes a zero-overhead fast path. A misbehaving collector that raises is logged and ignored — it can never fail a store or replay. `LoggingMetricsCollector` ships built in for a quick `DEBUG`-level view; see [`metrics.py`](../src/mcp_persist/metrics.py).
 - **Construction warning alerts:** A `WARNING` log emitted at construction (e.g. `SQLiteEventStore created with ttl=None`) means events will accumulate indefinitely. Set up alert rules to detect this warning in production, as it signals a deploy-time misconfiguration.
 - **Tolerated Catalog Race events:** At `DEBUG` level, the engines log tolerated catalog creation races (e.g. `Tolerating concurrent DDL race on...`) which are helpful to ignore/diagnose during scale-outs.
 - **What to monitor & alert on:**
   - **SDK Request Handler Failures:** Monitor and alert on logger outputs containing `Error in message router` or `Error in replay sender`. These are raised by the MCP SDK when the persistence store operations fail (e.g. connection timeout, locked DB).
   - **Purge loop results:** Monitor the return count of `store.purge_expired()`. A count consistently at 0 while your database sizes grow indicates the loop has stalled or is not running.
   - **Database health metrics:** Backend CPU usage, query latency, active connection pool counts, and Redis memory statistics (e.g., `used_memory` and key evictions).
+
+## 8. Migrating between backends
+
+`migrate(source, dest)` copies events from one store to another — e.g. SQLite →
+Postgres as a single node grows into a cluster, or Redis → Postgres for
+durability. It streams events oldest-first and re-stores them on the
+destination, preserving per-stream ordering. `list_streams()` (available on every
+backend) enumerates the streams; pass `stream_id=` to scope to a single one.
+
+```python
+from mcp_persist import migrate
+
+result = await migrate(
+    sqlite_store,
+    postgres_store,
+    on_progress=lambda sid, n: log.info("migrating %s: %d events", sid, n),
+)
+log.info(
+    "migrated %d events across %d streams; failed: %s",
+    result.events_migrated,
+    result.streams_migrated,
+    result.failed_streams,
+)
+```
+
+Each stream is migrated independently: a stream that errors is logged, recorded
+in `result.failed_streams`, and skipped so the rest of the run still completes
+(a failed stream may have been partially copied).
+
+**Read these caveats before migrating a production deployment:**
+
+- **Event IDs are not preserved.** The destination issues its own fresh,
+  monotonic IDs via `store_event`. Ordering and payloads are preserved; the
+  numeric IDs are not.
+- **Timestamps are reset.** Re-stored events get a `created_at` of "now", so any
+  `ttl` expiry clock restarts on the destination. Run `purge_expired()` on the
+  source first if you don't want already-stale events carried over.
+- **Resumability tokens are invalidated.** Because IDs change, a client holding a
+  `Last-Event-ID` issued by the source store cannot resume against the
+  destination after cutover. **Migrate during a maintenance window and
+  drain/reconnect clients afterwards.**
+- **Not consistent under concurrent writes.** `migrate` is a point-in-time copy;
+  events written to the source while it runs may or may not be picked up. Treat
+  the source as read-only (stop writes) for a complete, consistent copy.
+
+## 9. Real-time streaming with `subscribe()`
+
+`subscribe(stream_id)` is an async generator that yields `(event_id, message)`
+as events are written, instead of polling `replay_events_after`:
+
+```python
+store = RedisEventStore(client, ttl=3600, enable_streaming=True)
+
+async for event_id, message in store.subscribe("stream-abc"):
+    handle(message)
+```
+
+It must be opted into with `enable_streaming=True`. On Redis and Postgres that
+flag also makes `store_event` publish a lightweight notification after each
+non-priming write (`PUBLISH` / `pg_notify`); with the default `False` there is
+no extra round-trip and `subscribe()` raises. SQLite has no native push, so its
+`subscribe()` polls the table every `poll_interval` seconds (default `0.5`) and
+the flag only gates the method.
+
+**It is a best-effort, forward-only feed — not a durability mechanism:**
+
+- Only events written **after** the subscription registers are delivered. Use
+  `replay_events_after` to catch up on history.
+- Redis pub/sub and Postgres `NOTIFY` are **at-most-once**: anything emitted
+  while no subscriber is connected, or during a reconnect, is dropped. The
+  notification publish is best-effort and a failure is logged without failing
+  the write. **`replay_events_after` remains the durable, gap-free path** — a
+  robust consumer pairs `subscribe()` for low latency with a periodic replay (or
+  a replay on reconnect) for completeness.
+- **A dropped connection may not be surfaced as an error.** This is most acute
+  on **Postgres**: the subscriber waits on a local notification queue, so if the
+  connection dies — e.g. the server restarts — no further notifications arrive
+  and the `async for` simply goes quiet rather than raising. (Redis pub/sub
+  reads from the socket and usually *raises* on a broken link, ending the
+  generator, but a half-open connection can still stall.) Do not treat silence
+  as liveness: keep an application-level heartbeat / ping on the session to
+  detect a stalled subscription and reconnect, and lean on `replay_events_after`
+  after any reconnect to close the gap.
+- Priming events and payloads that fail JSONRPC validation are skipped.
+
+SQLite's `subscribe()` polls the store's single connection, so it competes with
+writes for SQLite's one writer: a low `poll_interval` and/or many concurrent
+subscribers will measurably cut write throughput. Keep subscriber counts low and
+`poll_interval` at or above the default on SQLite, or use Redis/Postgres for
+high-volume streaming.
+
+For the connection-pool impact of running many subscribers, see
+[Subscribers and connection pools](#subscribers-and-connection-pools-subscribe).
 
 ## Production checklist
 
@@ -272,3 +388,6 @@ While individual event hashes and stream ZSETs expire automatically when `ttl` i
       on shutdown
 - [ ] Backend matches your topology (SQLite = single process; Redis/Postgres =
       multi-worker)
+- [ ] If migrating backends with `migrate()`: run during a maintenance window
+      with the source read-only; clients drained/reconnected afterwards (event
+      IDs and resumability tokens change)

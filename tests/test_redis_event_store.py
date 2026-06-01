@@ -443,6 +443,22 @@ async def test_with_ttl_no_warning_emitted(redis_client, caplog):
     assert not any("ttl" in record.message.lower() for record in caplog.records)
 
 
+@pytest.mark.anyio
+async def test_max_stream_length_without_ttl_warns_about_payload_accumulation(redis_client, caplog):
+    with caplog.at_level(logging.WARNING, logger="mcp_persist.redis"):
+        RedisEventStore(redis_client, ttl=None, max_stream_length=10)
+
+    assert any("max_stream_length" in record.message for record in caplog.records)
+
+
+@pytest.mark.anyio
+async def test_max_stream_length_with_ttl_does_not_warn_about_accumulation(redis_client, caplog):
+    with caplog.at_level(logging.WARNING, logger="mcp_persist.redis"):
+        RedisEventStore(redis_client, ttl=3600, max_stream_length=10)
+
+    assert not any("max_stream_length" in record.message for record in caplog.records)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # decode_responses support
 # ─────────────────────────────────────────────────────────────────────────────

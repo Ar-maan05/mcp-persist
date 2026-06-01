@@ -31,7 +31,9 @@ import logging
 import re
 import sqlite3
 import time
-from typing import Any
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any
 
 from mcp.server.streamable_http import (
     EventCallback,
@@ -42,6 +44,11 @@ from mcp.server.streamable_http import (
 )
 from mcp.types import JSONRPCMessage
 from pydantic import TypeAdapter, ValidationError
+
+from mcp_persist.metrics import NoOpMetricsCollector, safe_call
+
+if TYPE_CHECKING:
+    from mcp_persist.metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +90,16 @@ class SQLiteEventStore(EventStore):
                     to this long for a lock before raising instead of failing
                     immediately (applied via ``PRAGMA busy_timeout``). ``None``
                     leaves SQLite's default in place.
+        metrics:    Optional :class:`~mcp_persist.metrics.MetricsCollector` for
+                    timing/count hooks on ``store_event`` and
+                    ``replay_events_after``. ``None`` (the default) installs a
+                    no-op collector and the store takes a fast path with no
+                    measurable overhead.
+        enable_streaming:
+                    Gates :meth:`subscribe`, which must be opted into. ``False``
+                    (the default) makes :meth:`subscribe` raise. Unlike Redis and
+                    Postgres, SQLite has no native push, so ``subscribe`` polls
+                    the table and ``store_event`` is unaffected by this flag.
     """
 
     def __init__(
@@ -92,6 +109,8 @@ class SQLiteEventStore(EventStore):
         table_name: str = "mcp_events",
         ttl: int | None = None,
         timeout: float | None = None,
+        metrics: MetricsCollector | None = None,
+        enable_streaming: bool = False,
     ) -> None:
         parts = table_name.split(".")
         if len(parts) > 2 or not all(part and IDENTIFIER_RE.match(part) for part in parts):
@@ -110,6 +129,8 @@ class SQLiteEventStore(EventStore):
         self._created_index = f'{schema_prefix}"{bare}_created_idx"'
         self._ttl = ttl
         self._timeout = timeout
+        self._metrics: MetricsCollector = metrics if metrics is not None else NoOpMetricsCollector()
+        self._enable_streaming = enable_streaming
         self._initialized = False
         self._init_lock = asyncio.Lock()
 
@@ -121,6 +142,49 @@ class SQLiteEventStore(EventStore):
                 "(recommended: at least 2x your session_idle_timeout) and call "
                 "purge_expired() periodically."
             )
+
+    # Convenience constructor
+
+    @classmethod
+    @asynccontextmanager
+    async def create(
+        cls,
+        path: str,
+        *,
+        table_name: str = "mcp_events",
+        ttl: int | None = None,
+        timeout: float | None = None,
+        **connect_kwargs: Any,
+    ) -> AsyncIterator[SQLiteEventStore]:
+        """Open an SQLite connection, initialize, yield a store, and close on exit.
+
+        A convenience async context manager that owns the connection lifecycle so
+        callers don't have to open, initialize, and close an ``aiosqlite``
+        connection themselves::
+
+            async with SQLiteEventStore.create("events.db", ttl=3600) as store:
+                await store.store_event(...)
+
+        ``path`` and any extra ``connect_kwargs`` are passed to
+        ``aiosqlite.connect``; ``table_name``, ``ttl``, and ``timeout`` configure
+        the store and behave exactly as in :meth:`__init__`. :meth:`initialize`
+        is called before the store is yielded. The connection is always closed on
+        exit, including when ``initialize`` or the body raises. Pass ``":memory:"``
+        for an ephemeral database (note: it is gone once the context exits).
+
+        Requires the ``sqlite`` extra (``pip install "mcp-persist[sqlite]"``); the
+        import happens here, not at module import time, so the package loads
+        without ``aiosqlite`` installed.
+        """
+        import aiosqlite
+
+        conn = await aiosqlite.connect(path, **connect_kwargs)
+        store = cls(conn, table_name=table_name, ttl=ttl, timeout=timeout)
+        try:
+            await store.initialize()
+            yield store
+        finally:
+            await conn.close()
 
     # Schema
 
@@ -192,6 +256,22 @@ class SQLiteEventStore(EventStore):
         message: JSONRPCMessage | None,
     ) -> EventId:
         """Store an event and return its unique, monotonically increasing ID."""
+        if type(self._metrics) is NoOpMetricsCollector:
+            return await self._store_event_impl(stream_id, message)
+        start = time.monotonic()
+        try:
+            event_id = await self._store_event_impl(stream_id, message)
+        except Exception as exc:
+            safe_call(self._metrics.on_error, "store_event", exc)
+            raise
+        safe_call(self._metrics.on_store_event, stream_id, event_id, (time.monotonic() - start) * 1000.0)
+        return event_id
+
+    async def _store_event_impl(
+        self,
+        stream_id: StreamId,
+        message: JSONRPCMessage | None,
+    ) -> EventId:
         if not self._initialized:
             await self.initialize()
 
@@ -213,6 +293,29 @@ class SQLiteEventStore(EventStore):
         send_callback: EventCallback,
     ) -> StreamId | None:
         """Replay all events on the same stream that occurred after last_event_id."""
+        if type(self._metrics) is NoOpMetricsCollector:
+            return await self._replay_events_after_impl(last_event_id, send_callback)
+        start = time.monotonic()
+        count = 0
+
+        async def counting_callback(event: EventMessage) -> None:
+            nonlocal count
+            count += 1
+            await send_callback(event)
+
+        try:
+            stream_id = await self._replay_events_after_impl(last_event_id, counting_callback)
+        except Exception as exc:
+            safe_call(self._metrics.on_error, "replay_events_after", exc)
+            raise
+        safe_call(self._metrics.on_replay, stream_id, count, (time.monotonic() - start) * 1000.0)
+        return stream_id
+
+    async def _replay_events_after_impl(
+        self,
+        last_event_id: EventId,
+        send_callback: EventCallback,
+    ) -> StreamId | None:
         if not self._initialized:
             await self.initialize()
 
@@ -297,3 +400,123 @@ class SQLiteEventStore(EventStore):
         ) as cursor:
             await self._conn.commit()
             return cursor.rowcount
+
+    # Migration support
+
+    async def list_streams(self) -> AsyncIterator[StreamId]:
+        """Yield each distinct stream ID currently stored, in arbitrary order.
+
+        Backs :func:`mcp_persist.migrate` for whole-database migrations.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        async with self._conn.execute(f"SELECT DISTINCT stream_id FROM {self._table}") as cursor:
+            async for (stream_id,) in cursor:
+                yield stream_id
+
+    async def _iter_stream_events(self, stream_id: StreamId) -> AsyncIterator[tuple[EventId, JSONRPCMessage | None]]:
+        """Yield ``(event_id, message)`` for every stored event on a stream, oldest first.
+
+        Unlike :meth:`replay_events_after`, this enumerates the whole stream from
+        the beginning (no anchor) and includes priming events (yielded as a
+        ``None`` message), so :func:`mcp_persist.migrate` can copy a stream
+        faithfully. Rows are not filtered by ``ttl`` — every stored row is
+        yielded; run :meth:`purge_expired` first to drop stale events. A payload
+        that fails JSONRPC validation is logged and skipped.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        async with self._conn.execute(
+            f"SELECT event_id, payload FROM {self._table} WHERE stream_id = ? ORDER BY event_id",
+            (stream_id,),
+        ) as cursor:
+            async for event_id_int, payload in cursor:
+                event_id = str(event_id_int)
+                if not payload:
+                    # Priming event: stored with an empty payload, copied as None.
+                    yield event_id, None
+                    continue
+
+                try:
+                    message = jsonrpc_message_adapter.validate_json(payload)
+                except ValidationError:
+                    logger.warning(
+                        "Skipping event %s on stream %s during migration: payload failed JSONRPC validation",
+                        event_id,
+                        stream_id,
+                    )
+                    continue
+
+                yield event_id, message
+
+    # Push-based streaming
+
+    async def subscribe(
+        self,
+        stream_id: StreamId,
+        *,
+        poll_interval: float = 0.5,
+    ) -> AsyncIterator[tuple[EventId, JSONRPCMessage]]:
+        """Yield ``(event_id, message)`` for events on a stream in real time.
+
+        Requires ``enable_streaming=True``. SQLite has no native push, so this is
+        a polling loop: it records the newest event ID at subscribe time and then
+        every ``poll_interval`` seconds queries for events newer than the last
+        one seen::
+
+            async for event_id, message in store.subscribe("stream-abc"):
+                ...
+
+        **Forward-only.** Only events written *after* the subscription starts are
+        delivered (use :meth:`replay_events_after` to catch up on history).
+        Latency is bounded by ``poll_interval`` (default 0.5s); lower it for
+        snappier delivery at the cost of more queries. Priming events and payloads
+        that fail JSONRPC validation are skipped. The generator is cancellable:
+        breaking out of the ``async for`` (or cancelling the task) stops polling.
+        """
+        if not self._enable_streaming:
+            raise RuntimeError("subscribe() requires the store to be constructed with enable_streaming=True")
+
+        if poll_interval <= 0:
+            raise ValueError(f"poll_interval must be a positive number of seconds, got {poll_interval!r}")
+
+        if not self._initialized:
+            await self.initialize()
+
+        # Seed from the current newest event so the subscription is forward-only,
+        # even on an empty stream (where MAX returns NULL -> start from 0).
+        async with self._conn.execute(
+            f"SELECT MAX(event_id) FROM {self._table} WHERE stream_id = ?",
+            (stream_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        last_seen = row[0] if row is not None and row[0] is not None else 0
+
+        while True:
+            async with self._conn.execute(
+                f"SELECT event_id, payload FROM {self._table} WHERE stream_id = ? AND event_id > ? ORDER BY event_id",
+                (stream_id, last_seen),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+            for event_id_int, payload in rows:
+                last_seen = event_id_int
+                if not payload:
+                    # Priming event; not delivered to subscribers.
+                    continue
+
+                try:
+                    message = jsonrpc_message_adapter.validate_json(payload)
+                except ValidationError:
+                    logger.warning(
+                        "Skipping event %s on stream %s during subscribe: payload failed JSONRPC validation",
+                        event_id_int,
+                        stream_id,
+                    )
+                    continue
+
+                yield str(event_id_int), message
+
+            await asyncio.sleep(poll_interval)

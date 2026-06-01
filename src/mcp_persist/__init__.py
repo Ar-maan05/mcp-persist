@@ -17,6 +17,12 @@ Usage:
 
 from importlib.metadata import PackageNotFoundError, version
 
+from mcp_persist.metrics import (
+    LoggingMetricsCollector,
+    MetricsCollector,
+    NoOpMetricsCollector,
+)
+from mcp_persist.migration import MigrationResult, migrate
 from mcp_persist.postgres import PostgresEventStore
 from mcp_persist.redis import RedisEventStore
 from mcp_persist.sqlite import SQLiteEventStore
@@ -26,4 +32,14 @@ try:
 except PackageNotFoundError:  # pragma: no cover - running from a source tree without install
     __version__ = "0.0.0+unknown"
 
-__all__ = ["PostgresEventStore", "RedisEventStore", "SQLiteEventStore", "__version__"]
+__all__ = [
+    "LoggingMetricsCollector",
+    "MetricsCollector",
+    "MigrationResult",
+    "NoOpMetricsCollector",
+    "PostgresEventStore",
+    "RedisEventStore",
+    "SQLiteEventStore",
+    "__version__",
+    "migrate",
+]

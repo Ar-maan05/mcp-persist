@@ -503,3 +503,169 @@ async def test_replay_pagination_batches(pg_pool, clean_table):
 async def test_replay_batch_size_must_be_positive(pg_pool, clean_table):
     with pytest.raises(ValueError, match="replay_batch_size"):
         PostgresEventStore(pg_pool, table_name=TABLE, replay_batch_size=0)
+
+
+# ── Metrics hooks (parity with test_metrics.py) ───────────────────────────────
+
+
+class _RecordingCollector:
+    def __init__(self) -> None:
+        self.store_calls: list[tuple] = []
+        self.replay_calls: list[tuple] = []
+        self.errors: list[tuple] = []
+
+    def on_store_event(self, stream_id, event_id, duration_ms) -> None:
+        self.store_calls.append((stream_id, event_id, duration_ms))
+
+    def on_replay(self, stream_id, events_replayed, duration_ms) -> None:
+        self.replay_calls.append((stream_id, events_replayed, duration_ms))
+
+    def on_error(self, operation, error) -> None:
+        self.errors.append((operation, error))
+
+
+@pytest.mark.anyio
+async def test_metrics_fire_on_store_and_replay(pg_pool, clean_table):
+    collector = _RecordingCollector()
+    store = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None, metrics=collector)
+    await store.initialize()
+
+    anchor = await store.store_event("stream-A", None)
+    event_id = await store.store_event("stream-A", SAMPLE_MSG)
+
+    events, stream_id = await collect_events(store, anchor)
+    assert stream_id == "stream-A"
+    assert [e.event_id for e in events] == [event_id]
+
+    assert len(collector.store_calls) == 2
+    assert collector.store_calls[1][0] == "stream-A"
+    assert collector.store_calls[1][1] == event_id
+    assert isinstance(collector.store_calls[1][2], float)
+    assert len(collector.replay_calls) == 1
+    assert collector.replay_calls[0] == ("stream-A", 1, collector.replay_calls[0][2])
+    assert collector.errors == []
+
+
+@pytest.mark.anyio
+async def test_metrics_on_error_fires_and_reraises(pg_pool, clean_table, monkeypatch):
+    collector = _RecordingCollector()
+    store = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None, metrics=collector)
+    await store.initialize()
+
+    async def boom(stream_id, message):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(store, "_store_event_impl", boom)
+
+    with pytest.raises(RuntimeError, match="db down"):
+        await store.store_event("stream-A", SAMPLE_MSG)
+
+    assert [op for op, _ in collector.errors] == ["store_event"]
+    assert collector.store_calls == []
+
+
+# ── Push-based streaming (parity with test_streaming.py) ──────────────────────
+
+
+def _stream_msg(i: int) -> JSONRPCRequest:
+    return JSONRPCRequest(jsonrpc="2.0", id=str(i), method="tools/call", params={"n": i})
+
+
+@pytest.mark.anyio
+async def test_subscribe_delivers_new_events(pg_pool, clean_table):
+    store = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None, enable_streaming=True)
+    await store.initialize()
+
+    received: list = []
+
+    async def run():
+        async for event_id, message in store.subscribe("stream-A"):
+            received.append(message.root.id)
+            if len(received) >= 2:
+                break
+
+    task = asyncio.create_task(run())
+    await asyncio.sleep(0.3)  # let LISTEN register
+
+    await store.store_event("stream-A", _stream_msg(1))
+    await store.store_event("stream-A", _stream_msg(2))
+
+    await asyncio.wait_for(task, timeout=5)
+    assert received == ["1", "2"]
+
+
+@pytest.mark.anyio
+async def test_subscribe_is_forward_only(pg_pool, clean_table):
+    store = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None, enable_streaming=True)
+    await store.initialize()
+
+    await store.store_event("stream-A", _stream_msg(0))  # before subscribe
+
+    received: list = []
+
+    async def run():
+        async for event_id, message in store.subscribe("stream-A"):
+            received.append(message.root.id)
+            break
+
+    task = asyncio.create_task(run())
+    await asyncio.sleep(0.3)
+
+    await store.store_event("stream-A", _stream_msg(1))
+
+    await asyncio.wait_for(task, timeout=5)
+    assert received == ["1"]
+
+
+@pytest.mark.anyio
+async def test_subscribe_cancellation_releases_connection(pg_pool, clean_table):
+    store = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None, enable_streaming=True)
+    await store.initialize()
+
+    async def run():
+        async for _event_id, _message in store.subscribe("stream-A"):
+            pass
+
+    task = asyncio.create_task(run())
+    await asyncio.sleep(0.3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The released connection is reusable — a normal store still works.
+    event_id = await store.store_event("stream-A", _stream_msg(1))
+    assert isinstance(event_id, str)
+
+
+@pytest.mark.anyio
+async def test_subscribe_requires_enable_streaming(pg_pool, clean_table):
+    store = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None)  # flag defaults False
+    await store.initialize()
+    with pytest.raises(RuntimeError, match="enable_streaming"):
+        async for _ in store.subscribe("stream-A"):
+            break
+
+
+@pytest.mark.anyio
+async def test_long_stream_id_notify_channel_within_limit(pg_pool, clean_table):
+    # A stream_id long enough to push "mcp_events_<id>" past 63 bytes must still
+    # produce a valid (hashed) channel that round-trips through NOTIFY/LISTEN.
+    store = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None, enable_streaming=True)
+    await store.initialize()
+
+    long_stream = "s" * 200
+    channel = store._notify_channel(long_stream)  # pyright: ignore[reportPrivateUsage]
+    assert len(channel.encode("utf-8")) <= 63
+
+    received: list = []
+
+    async def run():
+        async for _event_id, message in store.subscribe(long_stream):
+            received.append(message.root.id)
+            break
+
+    task = asyncio.create_task(run())
+    await asyncio.sleep(0.3)
+    await store.store_event(long_stream, _stream_msg(7))
+    await asyncio.wait_for(task, timeout=5)
+    assert received == ["7"]

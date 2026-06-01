@@ -293,6 +293,100 @@ store_a = PostgresEventStore(pool, table_name="server_a")
 store_b = PostgresEventStore(pool, table_name="server_b")
 ```
 
+## Connection lifecycle: `create()`
+
+Each store also accepts a connection it owns directly, opened and closed for you.
+`SQLiteEventStore.create()`, `RedisEventStore.create()`, and
+`PostgresEventStore.create()` are async context managers that take a connection
+string, build the underlying driver client (and call `initialize()` where
+needed), yield a ready store, and close the connection on exit — including when
+the body raises:
+
+```python
+from mcp_persist import SQLiteEventStore, RedisEventStore, PostgresEventStore
+
+async with SQLiteEventStore.create("events.db", ttl=3600) as store:
+    await store.store_event(...)
+
+async with RedisEventStore.create("redis://localhost:6379", ttl=3600) as store:
+    ...
+
+async with PostgresEventStore.create("postgresql://localhost/mydb", ttl=3600) as store:
+    ...
+```
+
+Extra keyword arguments are forwarded to the driver (`aiosqlite.connect`,
+`redis.asyncio.from_url`, `asyncpg.create_pool`). To share one client/pool across
+stores or manage its lifecycle yourself, construct the store directly as shown in
+[Quickstart](#quickstart).
+
+## Real-time streaming: `subscribe()`
+
+Beyond SSE resumability, each store can push new events to an in-process consumer
+as they are written. Pass `enable_streaming=True`, then iterate `subscribe()`:
+
+```python
+store = RedisEventStore(redis_client, ttl=3600, enable_streaming=True)
+
+async for event_id, message in store.subscribe("stream-id"):
+    handle(message)
+```
+
+- **Forward-only:** a subscriber receives only events written *after* it
+  subscribes (use `replay_events_after` for backfill). Priming events are skipped.
+- **Per backend:** Redis uses pub/sub and Postgres uses `LISTEN`/`NOTIFY`, so
+  delivery is push-based; SQLite has no native notification and falls back to
+  polling (`subscribe(stream_id, poll_interval=0.5)`).
+- **Connection cost:** Redis and Postgres subscribers each hold a dedicated
+  connection for their lifetime — size your pool for the expected number of
+  concurrent subscribers. See [docs/production.md](docs/production.md) for sizing.
+
+## Cross-backend migration: `migrate()`
+
+Copy events from one store to another — e.g. SQLite → Postgres as a single-node
+deployment grows, or Redis → Postgres for durability:
+
+```python
+from mcp_persist import migrate
+
+result = await migrate(sqlite_store, postgres_store)
+print(result.events_migrated, result.failed_streams)
+```
+
+It streams events from the source (oldest first) and re-stores them on the
+destination, preserving per-stream ordering. Each stream migrates independently:
+a failing stream is logged and recorded in `failed_streams`, not fatal. Pass
+`stream_id=` to migrate one stream, `batch_size=` and `on_progress=` to drive a
+progress bar.
+
+> **Caveats — read before migrating production data:** event IDs are *not*
+> preserved (the destination assigns fresh ones), timestamps reset (TTL clock
+> restarts), and resumability tokens are therefore invalidated — clients holding
+> a `Last-Event-ID` from the source cannot resume against the destination. The
+> copy is also not consistent under concurrent writes, so stop writes to the
+> source first. See [docs/production.md](docs/production.md) for the full
+> migration runbook.
+
+## Metrics & observability
+
+Every store accepts an optional `metrics=` collector that fires on each store,
+replay, and error. The default is a no-op the stores special-case to zero
+overhead, so you pay nothing unless you opt in:
+
+```python
+from mcp_persist import RedisEventStore, LoggingMetricsCollector
+
+# Batteries-included: logs one line per operation at DEBUG.
+store = RedisEventStore(redis_client, ttl=3600, metrics=LoggingMetricsCollector())
+```
+
+To emit to Prometheus, Datadog, or anything else, pass any object with three
+synchronous methods — `on_store_event(stream_id, event_id, duration_ms)`,
+`on_replay(stream_id, events_replayed, duration_ms)`, and
+`on_error(operation, error)`. It does not need to subclass `MetricsCollector`
+(it's a `Protocol`). A collector that raises is logged and ignored rather than
+allowed to fail the underlying operation.
+
 ## Examples
 
 The [`examples/`](examples/) directory contains minimal, runnable MCP servers
