@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-06-03
+
+### Added
+- **Payload compression** (`compression`, `compress_min_bytes`):
+  - All three stores accept `compression="gzip"` to gzip-compress event payloads above `compress_min_bytes` (default `1024`) before storing them, cutting storage and (on Redis) memory for large tool results / JSON-RPC bodies. The stored form is marker-prefixed (`gz:` + base64), so it can never collide with a real payload, and **decompression on read is automatic and independent of the setting** — a store reads compressed payloads written by another store even with compression disabled, so the option is safe to roll out incrementally and across `migrate()`. Compression is only kept when it actually shrinks the payload, so small/incompressible messages are never made larger. Default is `None` (no compression); existing data is unaffected.
+- **Batched purge** (`purge_expired(batch_size=...)`):
+  - `SQLiteEventStore.purge_expired` and `PostgresEventStore.purge_expired` now accept an optional `batch_size`. When set, expired rows are deleted in bounded chunks (SQLite via an indexed `event_id` subselect; Postgres via a `ctid` subselect) committing per chunk, so a large purge does not hold one long lock that contends with live inserts and replay scans. The expiry cutoff is captured once up front. `batch_size=None` (the default) keeps the previous single-statement `DELETE`.
+- **Replay gap detection**:
+  - `replay_events_after` now logs a `WARNING` when the anchor (`Last-Event-ID`) still exists but one or more events after it have expired / are missing and will be silently skipped — surfacing an otherwise invisible, unrecoverable gap to a reconnecting client. SQLite/Postgres detect this with a `ttl`-gated existence check; Redis warns when stream-index entries after the anchor have lost their payloads. `replay_events_after` still returns normally and delivers every event it can.
+- **`ping()` readiness probe**:
+  - All three stores expose `async ping() -> bool` (Redis `PING`, Postgres/SQLite `SELECT 1`) for liveness/readiness probes. Returns `True` on success and lets connection errors propagate so a probe can treat a raised exception as "not ready".
+- **`PurgeScheduler`**:
+  - A batteries-included async context manager / `start()`+`aclose()` wrapper that runs `purge_expired()` on an interval (with optional `batch_size`), logs `purged N events`, and swallows transient errors so the loop survives a backend blip. Rejects stores without `purge_expired` (e.g. `RedisEventStore`, which expires keys natively) at construction. Replaces the hand-rolled purge-loop snippet from `docs/production.md`. Exported from `mcp_persist`.
+- **`event_store_from_env()`**:
+  - Builds a store from `MCP_PERSIST_BACKEND` / `MCP_PERSIST_URL` (+ optional `MCP_PERSIST_TTL`, `MCP_PERSIST_TABLE_NAME`, `MCP_PERSIST_KEY_PREFIX`, `MCP_PERSIST_MAX_STREAM_LENGTH`) and returns the matching backend's `create()` context manager, so a deployment can pick its store from config without branching on the backend. Exported from `mcp_persist`.
+- **Tooling & docs**:
+  - `compose.yaml` at the repo root spins up local Redis + Postgres for the examples and for running the test suite against real backends.
+  - New `docs/production.md` material: deployment topologies (rolling deploys / load balancers without sticky sessions, serverless / read-only filesystems), the scope boundary of resumability ("what it does *not* give you"), the Redis monotonic-counter throughput ceiling, and guidance for the new features above.
+  - **Multi-process integration test**: a separate OS process writes events to a shared Redis/Postgres while the test process concurrently replays them, validating cross-process resumability (the reason to choose Redis/Postgres over single-writer SQLite). Gated on backend availability.
+
 ## [1.3.0] - 2026-06-01
 
 ### Changed

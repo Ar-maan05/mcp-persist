@@ -534,3 +534,79 @@ async def test_max_stream_length_caps_sorted_set(redis_client, recwarn):
 def test_max_stream_length_must_be_positive():
     with pytest.raises(ValueError):
         RedisEventStore(object(), max_stream_length=0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ping() / compression / replay gap (1.4.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _big_msg(marker: str, size: int = 5000) -> JSONRPCRequest:
+    return JSONRPCRequest(jsonrpc="2.0", id="1", method="big", params={"data": marker * size})
+
+
+def _as_str(raw) -> str:
+    return raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+
+
+@pytest.mark.anyio
+async def test_ping_returns_true(store):
+    assert await store.ping() is True
+
+
+@pytest.mark.anyio
+async def test_compression_roundtrips_large_payload(redis_client):
+    store = RedisEventStore(redis_client, key_prefix="test:", ttl=None, compression="gzip", compress_min_bytes=100)
+
+    anchor = await store.store_event("s", SAMPLE_MSG)
+    eid = await store.store_event("s", _big_msg("x"))
+
+    stored = _as_str(await redis_client.hget(f"test:event:{eid}", "payload"))
+    assert stored.startswith("gz:")
+    assert len(stored) < 5000
+
+    events, _ = await collect_events(store, anchor)
+    assert [e.event_id for e in events] == [eid]
+    assert events[0].message.root.params == {"data": "x" * 5000}
+
+
+@pytest.mark.anyio
+async def test_compression_skips_small_payload(redis_client):
+    store = RedisEventStore(redis_client, key_prefix="test:", ttl=None, compression="gzip", compress_min_bytes=100000)
+
+    eid = await store.store_event("s", SAMPLE_MSG)
+    stored = _as_str(await redis_client.hget(f"test:event:{eid}", "payload"))
+    assert not stored.startswith("gz:")
+    assert stored.startswith("{")
+
+
+@pytest.mark.anyio
+async def test_uncompressed_store_reads_compressed_payload(redis_client):
+    writer = RedisEventStore(redis_client, key_prefix="test:", ttl=None, compression="gzip", compress_min_bytes=100)
+    anchor = await writer.store_event("s", SAMPLE_MSG)
+    await writer.store_event("s", _big_msg("z", 3000))
+
+    reader = RedisEventStore(redis_client, key_prefix="test:", ttl=None)  # compression disabled
+    events, _ = await collect_events(reader, anchor)
+    assert events[0].message.root.params == {"data": "z" * 3000}
+
+
+def test_invalid_compression_codec_raises():
+    with pytest.raises(ValueError):
+        RedisEventStore(object(), compression="zstd")
+
+
+@pytest.mark.anyio
+async def test_replay_gap_logs_warning_for_missing_payload(store, redis_client, caplog):
+    anchor = await store.store_event("s", SAMPLE_MSG)
+    gone = await store.store_event("s", SAMPLE_MSG)
+    present = await store.store_event("s", SAMPLE_MSG)
+
+    # Simulate the payload hash expiring while its stream-index entry lingers.
+    await redis_client.delete(f"test:event:{gone}")
+
+    with caplog.at_level(logging.WARNING, logger="mcp_persist.redis"):
+        events, _ = await collect_events(store, anchor)
+
+    assert [e.event_id for e in events] == [present]
+    assert "Replay gap" in caplog.text

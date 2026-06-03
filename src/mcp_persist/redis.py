@@ -37,6 +37,7 @@ from mcp.server.streamable_http import (
 from mcp.types import JSONRPCMessage
 from pydantic import TypeAdapter, ValidationError
 
+from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 
 if TYPE_CHECKING:
@@ -90,6 +91,20 @@ class RedisEventStore(EventStore):
                     round-trip per write and :meth:`subscribe` raises if called.
                     The publish is best-effort: a failure is logged and never
                     fails the write.
+        compression:
+                    Optional payload codec. ``"gzip"`` gzip-compresses event
+                    payloads above ``compress_min_bytes`` before storing them,
+                    cutting Redis memory for large messages; ``None`` (the
+                    default) stores them as-is. Decompression on read is automatic
+                    and independent of this setting — a store reads compressed
+                    payloads written by another store even with compression off,
+                    so the option is safe to roll out incrementally and across
+                    :func:`mcp_persist.migrate`.
+        compress_min_bytes:
+                    Only compress payloads whose serialized size is at least this
+                    many bytes (default ``1024``). Smaller payloads are stored
+                    plain, since base64 overhead would outweigh the saving.
+                    Ignored when ``compression`` is ``None``.
 
     The Redis client may be configured with ``decode_responses`` either way:
     values are normalized whether Redis returns ``bytes`` or ``str``.
@@ -104,9 +119,14 @@ class RedisEventStore(EventStore):
         max_stream_length: int | None = None,
         metrics: MetricsCollector | None = None,
         enable_streaming: bool = False,
+        compression: str | None = None,
+        compress_min_bytes: int = 1024,
     ) -> None:
         if max_stream_length is not None and max_stream_length <= 0:
             raise ValueError(f"max_stream_length must be a positive integer or None, got {max_stream_length!r}")
+        validate_compression(compression)
+        if compress_min_bytes < 0:
+            raise ValueError(f"compress_min_bytes must be a non-negative integer, got {compress_min_bytes!r}")
 
         self._redis = redis
         self._prefix = key_prefix
@@ -114,6 +134,8 @@ class RedisEventStore(EventStore):
         self._max_stream_length = max_stream_length
         self._metrics: MetricsCollector = metrics if metrics is not None else NoOpMetricsCollector()
         self._enable_streaming = enable_streaming
+        self._compression = compression
+        self._compress_min_bytes = compress_min_bytes
 
         if ttl is None:
             logger.warning(
@@ -203,6 +225,15 @@ class RedisEventStore(EventStore):
             return value.decode("utf-8")
         return value
 
+    async def ping(self) -> bool:
+        """Check Redis is reachable, for readiness/health probes.
+
+        Issues a Redis ``PING``. Returns ``True`` on success and lets any
+        connection error propagate, so a probe can treat a raised exception as
+        "not ready".
+        """
+        return bool(await self._redis.ping())
+
     # EventStore interface
 
     async def store_event(
@@ -237,6 +268,7 @@ class RedisEventStore(EventStore):
                 by_alias=True,
                 exclude_none=True,
             )
+            payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
 
         # Write the event hash, its sorted-set entry, and their TTLs in a single
         # pipelined round-trip. transaction=False (no MULTI/EXEC) keeps this
@@ -359,7 +391,7 @@ class RedisEventStore(EventStore):
                 continue
 
             try:
-                message = jsonrpc_message_adapter.validate_json(payload_str)
+                message = jsonrpc_message_adapter.validate_json(decompress_payload(payload_str))
             except ValidationError:
                 # A single corrupt/unparseable payload must not abort the whole
                 # replay: a reconnecting client would otherwise lose every event
@@ -374,6 +406,16 @@ class RedisEventStore(EventStore):
             await send_callback(EventMessage(message=message, event_id=eid))
 
         if stale:
+            # Their stream-index entries are still after the anchor, but the
+            # payloads are gone (expired, or a mid-write disconnect never wrote
+            # them), so the resuming client misses them with no other signal.
+            logger.warning(
+                "Replay gap on stream %s: %d event(s) after Last-Event-ID %s are missing "
+                "(expired or never completed) and cannot be replayed; the resuming client will miss them.",
+                stream_id,
+                len(stale),
+                last_event_id,
+            )
             await self._redis.zrem(self._stream_key(stream_id), *stale)
 
         return stream_id
@@ -431,7 +473,7 @@ class RedisEventStore(EventStore):
                 continue
 
             try:
-                message = jsonrpc_message_adapter.validate_json(payload_str)
+                message = jsonrpc_message_adapter.validate_json(decompress_payload(payload_str))
             except ValidationError:
                 logger.warning(
                     "Skipping event %s on stream %s during migration: payload failed JSONRPC validation",
@@ -509,7 +551,7 @@ class RedisEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(payload_str)
+                    message = jsonrpc_message_adapter.validate_json(decompress_payload(payload_str))
                 except ValidationError:
                     logger.warning(
                         "Skipping event %s on stream %s during subscribe: payload failed JSONRPC validation",

@@ -669,3 +669,133 @@ async def test_long_stream_id_notify_channel_within_limit(pg_pool, clean_table):
     await store.store_event(long_stream, _stream_msg(7))
     await asyncio.wait_for(task, timeout=5)
     assert received == ["7"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ping() / compression / batched purge / replay gap (1.4.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _big_msg(marker: str, size: int = 5000) -> JSONRPCRequest:
+    return JSONRPCRequest(jsonrpc="2.0", id="1", method="big", params={"data": marker * size})
+
+
+@pytest.mark.anyio
+async def test_ping_returns_true(store):
+    assert await store.ping() is True
+
+
+@pytest.mark.anyio
+async def test_compression_roundtrips_large_payload(pg_pool, clean_table):
+    store = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None, compression="gzip", compress_min_bytes=100)
+    await store.initialize()
+
+    anchor = await store.store_event("s", SAMPLE_MSG)
+    eid = await store.store_event("s", _big_msg("x"))
+
+    stored = await pg_pool.fetchval(f"SELECT payload FROM {TABLE} WHERE event_id = $1", int(eid))
+    assert stored.startswith("gz:")
+    assert len(stored) < 5000
+
+    events, _ = await collect_events(store, anchor)
+    assert [e.event_id for e in events] == [eid]
+    assert events[0].message.root.params == {"data": "x" * 5000}
+
+
+@pytest.mark.anyio
+async def test_compression_skips_small_payload(pg_pool, clean_table):
+    store = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None, compression="gzip", compress_min_bytes=100000)
+    await store.initialize()
+
+    eid = await store.store_event("s", SAMPLE_MSG)
+    stored = await pg_pool.fetchval(f"SELECT payload FROM {TABLE} WHERE event_id = $1", int(eid))
+    assert not stored.startswith("gz:")
+    assert stored.startswith("{")
+
+
+@pytest.mark.anyio
+async def test_uncompressed_store_reads_compressed_payload(pg_pool, clean_table):
+    writer = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None, compression="gzip", compress_min_bytes=100)
+    await writer.initialize()
+    anchor = await writer.store_event("s", SAMPLE_MSG)
+    await writer.store_event("s", _big_msg("y", 3000))
+
+    reader = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None)  # compression disabled
+    events, _ = await collect_events(reader, anchor)
+    assert events[0].message.root.params == {"data": "y" * 3000}
+
+
+def test_invalid_compression_codec_raises():
+    with pytest.raises(ValueError):
+        PostgresEventStore(object(), compression="zstd")
+
+
+@pytest.mark.anyio
+async def test_purge_expired_batched_deletes_all(store_with_ttl, pg_pool):
+    ids = [await store_with_ttl.store_event("s", SAMPLE_MSG) for _ in range(5)]
+    for i in ids:
+        await _age_event(pg_pool, i, seconds_ago=120)
+
+    removed = await store_with_ttl.purge_expired(batch_size=2)
+    assert removed == 5
+
+    count = await pg_pool.fetchval(f"SELECT COUNT(*) FROM {TABLE}")
+    assert count == 0
+
+
+@pytest.mark.anyio
+async def test_purge_expired_batched_leaves_live_events(store_with_ttl, pg_pool):
+    old = await store_with_ttl.store_event("s", SAMPLE_MSG)
+    fresh = await store_with_ttl.store_event("s", SAMPLE_MSG)
+    await _age_event(pg_pool, old, seconds_ago=120)
+
+    removed = await store_with_ttl.purge_expired(batch_size=1)
+    assert removed == 1
+
+    rows = await pg_pool.fetch(f"SELECT event_id FROM {TABLE}")
+    assert [str(r["event_id"]) for r in rows] == [fresh]
+
+
+@pytest.mark.anyio
+async def test_purge_expired_rejects_bad_batch_size(store_with_ttl):
+    with pytest.raises(ValueError):
+        await store_with_ttl.purge_expired(batch_size=0)
+
+
+@pytest.mark.anyio
+async def test_replay_gap_logs_warning_for_expired(store_with_ttl, pg_pool, caplog):
+    anchor = await store_with_ttl.store_event("s", SAMPLE_MSG)
+    expired = await store_with_ttl.store_event("s", SAMPLE_MSG)
+    await _age_event(pg_pool, expired, seconds_ago=120)
+
+    with caplog.at_level(logging.WARNING, logger="mcp_persist.postgres"):
+        events, _ = await collect_events(store_with_ttl, anchor)
+
+    assert [e.event_id for e in events] == []
+    assert "Replay gap" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_replay_no_gap_warning_when_all_live(store_with_ttl, caplog):
+    anchor = await store_with_ttl.store_event("s", SAMPLE_MSG)
+    await store_with_ttl.store_event("s", SAMPLE_MSG)
+
+    with caplog.at_level(logging.WARNING, logger="mcp_persist.postgres"):
+        await collect_events(store_with_ttl, anchor)
+
+    assert "Replay gap" not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_replay_no_gap_warning_for_expired_priming_event(store_with_ttl, pg_pool, caplog):
+    # An expired priming event (empty payload) is never replayed, so it is not a
+    # client-visible gap and must not trigger the warning.
+    anchor = await store_with_ttl.store_event("s", SAMPLE_MSG)
+    priming = await store_with_ttl.store_event("s", None)
+    await _age_event(pg_pool, priming, seconds_ago=120)
+
+    with caplog.at_level(logging.WARNING, logger="mcp_persist.postgres"):
+        events, _ = await collect_events(store_with_ttl, anchor)
+
+    assert [e.event_id for e in events] == []
+    assert "Replay gap" not in caplog.text

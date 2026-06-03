@@ -45,6 +45,7 @@ from mcp.server.streamable_http import (
 from mcp.types import JSONRPCMessage
 from pydantic import TypeAdapter, ValidationError
 
+from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 
 if TYPE_CHECKING:
@@ -100,6 +101,19 @@ class SQLiteEventStore(EventStore):
                     (the default) makes :meth:`subscribe` raise. Unlike Redis and
                     Postgres, SQLite has no native push, so ``subscribe`` polls
                     the table and ``store_event`` is unaffected by this flag.
+        compression:
+                    Optional payload codec. ``"gzip"`` gzip-compresses event
+                    payloads above ``compress_min_bytes`` before storing them;
+                    ``None`` (the default) stores them as-is. Decompression on
+                    read is automatic and independent of this setting — a store
+                    reads compressed payloads written by another store even with
+                    compression off, so the option is safe to roll out
+                    incrementally and across :func:`mcp_persist.migrate`.
+        compress_min_bytes:
+                    Only compress payloads whose serialized size is at least this
+                    many bytes (default ``1024``). Smaller payloads are stored
+                    plain, since base64 overhead would outweigh the saving.
+                    Ignored when ``compression`` is ``None``.
     """
 
     def __init__(
@@ -111,10 +125,15 @@ class SQLiteEventStore(EventStore):
         timeout: float | None = None,
         metrics: MetricsCollector | None = None,
         enable_streaming: bool = False,
+        compression: str | None = None,
+        compress_min_bytes: int = 1024,
     ) -> None:
         parts = table_name.split(".")
         if len(parts) > 2 or not all(part and IDENTIFIER_RE.match(part) for part in parts):
             raise ValueError(f"table_name must be a valid SQL identifier or 'schema.table', got {table_name!r}")
+        validate_compression(compression)
+        if compress_min_bytes < 0:
+            raise ValueError(f"compress_min_bytes must be a non-negative integer, got {compress_min_bytes!r}")
 
         self._conn = conn
         quoted_parts = [f'"{part}"' for part in parts]
@@ -131,6 +150,8 @@ class SQLiteEventStore(EventStore):
         self._timeout = timeout
         self._metrics: MetricsCollector = metrics if metrics is not None else NoOpMetricsCollector()
         self._enable_streaming = enable_streaming
+        self._compression = compression
+        self._compress_min_bytes = compress_min_bytes
         self._initialized = False
         self._init_lock = asyncio.Lock()
 
@@ -279,6 +300,7 @@ class SQLiteEventStore(EventStore):
             payload = ""
         else:
             payload = message.model_dump_json(by_alias=True, exclude_none=True)
+            payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
 
         async with self._conn.execute(
             f"INSERT INTO {self._table} (stream_id, payload, created_at) VALUES (?, ?, ?)",
@@ -338,6 +360,25 @@ class SQLiteEventStore(EventStore):
         stream_id: StreamId = row[0]
 
         if self._ttl is not None:
+            cutoff = time.time() - self._ttl
+            # Detect an unrecoverable gap: the anchor still exists but one or more
+            # client-visible events after it have expired and will be silently
+            # skipped below, so the resuming client misses them with no other
+            # signal. Priming events (empty payload) are never replayed, so an
+            # expired one is not a gap and is excluded here.
+            async with self._conn.execute(
+                f"SELECT 1 FROM {self._table} "
+                "WHERE stream_id = ? AND event_id > ? AND created_at < ? AND payload <> '' LIMIT 1",
+                (stream_id, anchor_id, cutoff),
+            ) as gap_cursor:
+                if await gap_cursor.fetchone() is not None:
+                    logger.warning(
+                        "Replay gap on stream %s: one or more events after Last-Event-ID %s have expired "
+                        "(ttl=%ss) and cannot be replayed; the resuming client will miss them.",
+                        stream_id,
+                        last_event_id,
+                        self._ttl,
+                    )
             query = (
                 f"SELECT event_id, payload FROM {self._table} "
                 "WHERE stream_id = ? AND event_id > ? AND created_at >= ? "
@@ -346,7 +387,7 @@ class SQLiteEventStore(EventStore):
             params: tuple[Any, ...] = (
                 stream_id,
                 anchor_id,
-                time.time() - self._ttl,
+                cutoff,
             )
         else:
             query = (
@@ -364,7 +405,7 @@ class SQLiteEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(payload)
+                    message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
                 except ValidationError:
                     # A single corrupt/unparseable payload must not abort the whole
                     # replay: a reconnecting client would otherwise lose every event
@@ -381,25 +422,67 @@ class SQLiteEventStore(EventStore):
 
     # Maintenance
 
-    async def purge_expired(self) -> int:
+    async def ping(self) -> bool:
+        """Check the database connection is usable, for readiness/health probes.
+
+        Runs a trivial ``SELECT 1``. Returns ``True`` on success and lets any
+        driver error propagate (e.g. a closed connection), so a probe can treat a
+        raised exception as "not ready".
+        """
+        async with self._conn.execute("SELECT 1"):
+            return True
+
+    async def purge_expired(self, *, batch_size: int | None = None) -> int:
         """Delete events older than ``ttl`` and return the number removed.
 
         No-op returning ``0`` when ``ttl`` is ``None``. SQLite has no automatic
         key expiry, so schedule this (e.g. from a periodic background task) to
         keep the database from growing without bound.
+
+        Args:
+            batch_size: When ``None`` (the default) every expired row is removed
+                in a single ``DELETE``. When set to a positive integer, rows are
+                deleted in chunks of that many, committing after each chunk, so a
+                large purge does not hold one long write lock that contends with
+                live inserts and replay scans. The expiry cutoff is captured once
+                up front, so events that expire while the loop runs are left for
+                the next call.
         """
         if self._ttl is None:
             return 0
 
+        if batch_size is not None and batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer or None, got {batch_size!r}")
+
         if not self._initialized:
             await self.initialize()
 
-        async with self._conn.execute(
-            f"DELETE FROM {self._table} WHERE created_at < ?",
-            (time.time() - self._ttl,),
-        ) as cursor:
-            await self._conn.commit()
-            return cursor.rowcount
+        cutoff = time.time() - self._ttl
+
+        if batch_size is None:
+            async with self._conn.execute(
+                f"DELETE FROM {self._table} WHERE created_at < ?",
+                (cutoff,),
+            ) as cursor:
+                await self._conn.commit()
+                return cursor.rowcount
+
+        total = 0
+        while True:
+            # SQLite only supports DELETE ... LIMIT when built with
+            # SQLITE_ENABLE_UPDATE_DELETE_LIMIT (not the default), so bound the
+            # batch via a subselect on the indexed event_id instead.
+            async with self._conn.execute(
+                f"DELETE FROM {self._table} WHERE event_id IN "
+                f"(SELECT event_id FROM {self._table} WHERE created_at < ? ORDER BY event_id LIMIT ?)",
+                (cutoff, batch_size),
+            ) as cursor:
+                await self._conn.commit()
+                removed = cursor.rowcount
+            total += removed
+            if removed < batch_size:
+                break
+        return total
 
     # Migration support
 
@@ -440,7 +523,7 @@ class SQLiteEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(payload)
+                    message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
                 except ValidationError:
                     logger.warning(
                         "Skipping event %s on stream %s during migration: payload failed JSONRPC validation",
@@ -508,7 +591,7 @@ class SQLiteEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(payload)
+                    message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
                 except ValidationError:
                     logger.warning(
                         "Skipping event %s on stream %s during subscribe: payload failed JSONRPC validation",

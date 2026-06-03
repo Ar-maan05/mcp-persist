@@ -447,3 +447,142 @@ async def test_sqlite_timeout_applied(conn):
     async with conn.execute("PRAGMA busy_timeout") as cursor:
         row = await cursor.fetchone()
     assert row[0] == 5000
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ping() / compression / batched purge / replay gap (1.4.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _big_msg(marker: str, size: int = 5000) -> JSONRPCRequest:
+    return JSONRPCRequest(jsonrpc="2.0", id="1", method="big", params={"data": marker * size})
+
+
+@pytest.mark.anyio
+async def test_ping_returns_true(store):
+    assert await store.ping() is True
+
+
+@pytest.mark.anyio
+async def test_compression_roundtrips_large_payload(conn):
+    store = SQLiteEventStore(conn, table_name=TABLE, ttl=None, compression="gzip", compress_min_bytes=100)
+    await store.initialize()
+
+    anchor = await store.store_event("s", SAMPLE_MSG)
+    eid = await store.store_event("s", _big_msg("x"))
+
+    async with conn.execute(f"SELECT payload FROM {TABLE} WHERE event_id = ?", (int(eid),)) as cur:
+        (stored,) = await cur.fetchone()
+    assert stored.startswith("gz:")
+    assert len(stored) < 5000  # actually compressed, not just marked
+
+    events, _ = await collect_events(store, anchor)
+    assert [e.event_id for e in events] == [eid]
+    assert events[0].message.root.params == {"data": "x" * 5000}
+
+
+@pytest.mark.anyio
+async def test_compression_skips_small_payload(conn):
+    store = SQLiteEventStore(conn, table_name=TABLE, ttl=None, compression="gzip", compress_min_bytes=100000)
+    await store.initialize()
+
+    eid = await store.store_event("s", SAMPLE_MSG)
+    async with conn.execute(f"SELECT payload FROM {TABLE} WHERE event_id = ?", (int(eid),)) as cur:
+        (stored,) = await cur.fetchone()
+    assert not stored.startswith("gz:")
+    assert stored.startswith("{")
+
+
+@pytest.mark.anyio
+async def test_uncompressed_store_reads_compressed_payload(conn):
+    writer = SQLiteEventStore(conn, table_name=TABLE, ttl=None, compression="gzip", compress_min_bytes=100)
+    await writer.initialize()
+    anchor = await writer.store_event("s", SAMPLE_MSG)
+    await writer.store_event("s", _big_msg("y", 3000))
+
+    reader = SQLiteEventStore(conn, table_name=TABLE, ttl=None)  # compression disabled
+    events, _ = await collect_events(reader, anchor)
+    assert events[0].message.root.params == {"data": "y" * 3000}
+
+
+def test_invalid_compression_codec_raises():
+    with pytest.raises(ValueError):
+        SQLiteEventStore(object(), compression="zstd")
+
+
+def test_negative_compress_min_bytes_raises():
+    with pytest.raises(ValueError):
+        SQLiteEventStore(object(), compression="gzip", compress_min_bytes=-1)
+
+
+@pytest.mark.anyio
+async def test_purge_expired_batched_deletes_all(store_with_ttl, conn):
+    ids = [await store_with_ttl.store_event("s", SAMPLE_MSG) for _ in range(5)]
+    for i in ids:
+        await _age_event(conn, i, seconds_ago=120)
+
+    removed = await store_with_ttl.purge_expired(batch_size=2)
+    assert removed == 5
+
+    async with conn.execute(f"SELECT COUNT(*) FROM {TABLE}") as cur:
+        (count,) = await cur.fetchone()
+    assert count == 0
+
+
+@pytest.mark.anyio
+async def test_purge_expired_batched_leaves_live_events(store_with_ttl, conn):
+    old = await store_with_ttl.store_event("s", SAMPLE_MSG)
+    fresh = await store_with_ttl.store_event("s", SAMPLE_MSG)
+    await _age_event(conn, old, seconds_ago=120)
+
+    removed = await store_with_ttl.purge_expired(batch_size=1)
+    assert removed == 1
+
+    async with conn.execute(f"SELECT event_id FROM {TABLE}") as cur:
+        rows = await cur.fetchall()
+    assert [str(r[0]) for r in rows] == [fresh]
+
+
+@pytest.mark.anyio
+async def test_purge_expired_rejects_bad_batch_size(store_with_ttl):
+    with pytest.raises(ValueError):
+        await store_with_ttl.purge_expired(batch_size=0)
+
+
+@pytest.mark.anyio
+async def test_replay_gap_logs_warning_for_expired(store_with_ttl, conn, caplog):
+    anchor = await store_with_ttl.store_event("s", SAMPLE_MSG)
+    expired = await store_with_ttl.store_event("s", SAMPLE_MSG)
+    await _age_event(conn, expired, seconds_ago=120)
+
+    with caplog.at_level(logging.WARNING, logger="mcp_persist.sqlite"):
+        events, _ = await collect_events(store_with_ttl, anchor)
+
+    assert [e.event_id for e in events] == []
+    assert "Replay gap" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_replay_no_gap_warning_when_all_live(store_with_ttl, caplog):
+    anchor = await store_with_ttl.store_event("s", SAMPLE_MSG)
+    await store_with_ttl.store_event("s", SAMPLE_MSG)
+
+    with caplog.at_level(logging.WARNING, logger="mcp_persist.sqlite"):
+        await collect_events(store_with_ttl, anchor)
+
+    assert "Replay gap" not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_replay_no_gap_warning_for_expired_priming_event(store_with_ttl, conn, caplog):
+    # An expired priming event (empty payload) is never replayed, so it is not a
+    # client-visible gap and must not trigger the warning.
+    anchor = await store_with_ttl.store_event("s", SAMPLE_MSG)
+    priming = await store_with_ttl.store_event("s", None)
+    await _age_event(conn, priming, seconds_ago=120)
+
+    with caplog.at_level(logging.WARNING, logger="mcp_persist.sqlite"):
+        events, _ = await collect_events(store_with_ttl, anchor)
+
+    assert [e.event_id for e in events] == []
+    assert "Replay gap" not in caplog.text
