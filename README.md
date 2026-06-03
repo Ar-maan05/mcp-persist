@@ -39,6 +39,14 @@ Start from how you deploy:
 | Runs as a single process and you want zero extra infrastructure | `SQLiteEventStore` |
 | Runs multiple workers / replicas behind a load balancer | `RedisEventStore` |
 | Already runs PostgreSQL, or needs durable storage at team / multi-node scale | `PostgresEventStore` |
+| Runs on serverless / a read-only or ephemeral filesystem | `RedisEventStore` or `PostgresEventStore` (never SQLite) |
+
+> **Any replica count > 1 needs a *shared* store (Redis/Postgres), not SQLite.**
+> A local SQLite file is visible only to the process that opened it, so behind a
+> load balancer — or during a rolling deploy, when a reconnecting client lands on
+> a different pod — that pod won't have the client's events and the resume
+> silently returns nothing. SQLite is for a genuine single process. See
+> [deployment topologies](docs/production.md#deployment-topologies-rolling-deploys-load-balancers-serverless).
 
 How they compare:
 
@@ -166,6 +174,7 @@ SQLiteEventStore(
     conn,                   # an open aiosqlite.Connection
     table_name="mcp_events",  # isolate multiple servers in one database file
     ttl=3600,               # seconds; None = never expire (not recommended)
+    compression=None,       # "gzip" to compress large payloads (see "Large payloads")
 )
 ```
 
@@ -211,6 +220,7 @@ RedisEventStore(
     key_prefix="mcp:",      # isolate multiple servers on one Redis instance
     ttl=3600,               # seconds; None = never expire (not recommended)
     max_stream_length=None, # optional cap on how many event IDs each stream retains
+    compression=None,       # "gzip" to compress large payloads (see "Large payloads")
 )
 ```
 
@@ -276,6 +286,7 @@ PostgresEventStore(
     table_name="mcp_events",  # isolate multiple servers in one database
     ttl=3600,                 # seconds; None = never expire (not recommended)
     replay_batch_size=500,    # rows fetched per round-trip on replay; lower for very large payloads
+    compression=None,         # "gzip" to compress large payloads (see "Large payloads")
 )
 ```
 
@@ -387,6 +398,67 @@ synchronous methods — `on_store_event(stream_id, event_id, duration_ms)`,
 (it's a `Protocol`). A collector that raises is logged and ignored rather than
 allowed to fail the underlying operation.
 
+## Large payloads: `compression`
+
+When MCP messages carry large tool results or big JSON-RPC bodies, pass
+`compression="gzip"` to gzip-compress payloads above `compress_min_bytes`
+(default `1024`) before they are stored — cutting storage and, on Redis, memory:
+
+```python
+store = PostgresEventStore(pool, ttl=3600, compression="gzip", compress_min_bytes=1024)
+```
+
+Decompression on read is automatic and **independent of the setting**: a store
+with compression off still reads payloads written compressed, so you can enable
+it on a rolling deploy and `migrate()` across stores with mismatched settings.
+Small or incompressible payloads are stored plain (never made larger), and
+existing data is unaffected. Available on all three backends.
+
+## Scheduled cleanup: `PurgeScheduler`
+
+SQLite and Postgres need `purge_expired()` called periodically (Redis expires
+keys natively). `PurgeScheduler` runs it for you on an interval:
+
+```python
+from mcp_persist import PurgeScheduler
+
+async with PurgeScheduler(store, interval=300, batch_size=1000):
+    async with manager.run():
+        yield
+```
+
+It logs `purged N events`, survives transient backend errors, and rejects a
+`RedisEventStore` (which has nothing to purge). `batch_size` is optional and
+forwards to `purge_expired(batch_size=...)` so a large purge deletes in bounded
+chunks instead of one long-locking `DELETE`. Use `start()` / `aclose()` if you
+prefer explicit lifecycle management over a `with` block.
+
+## Configuration from the environment: `event_store_from_env()`
+
+Pick the backend at deploy time without branching in code:
+
+```python
+from mcp_persist import event_store_from_env
+
+# MCP_PERSIST_BACKEND=redis  MCP_PERSIST_URL=redis://localhost:6379  MCP_PERSIST_TTL=3600
+async with event_store_from_env() as store:
+    ...
+```
+
+Reads `MCP_PERSIST_BACKEND` (`sqlite`/`redis`/`postgres`) and `MCP_PERSIST_URL`,
+plus optional `MCP_PERSIST_TTL`, `MCP_PERSIST_TABLE_NAME` (SQLite/Postgres), and
+`MCP_PERSIST_KEY_PREFIX` / `MCP_PERSIST_MAX_STREAM_LENGTH` (Redis). Returns the
+chosen backend's `create()` context manager, so the connection is opened on entry
+and closed on exit.
+
+## Readiness probes: `ping()`
+
+Every store exposes `await store.ping()` (Redis `PING`, Postgres/SQLite
+`SELECT 1`) for liveness/readiness checks. It returns `True` when the backend is
+reachable and lets the driver error propagate otherwise, so a health endpoint can
+report "not ready" when the store's dependency is down. See
+[docs/production.md](docs/production.md#11-readiness-probes-ping).
+
 ## Examples
 
 The [`examples/`](examples/) directory contains minimal, runnable MCP servers
@@ -469,6 +541,7 @@ This section outlines the consistency, ordering, and concurrency guarantees of `
   - **SQLite:** SQLite is single-writer and serializes all writes. `aiosqlite` uses an in-process thread pool to queue commands on a single connection. Concurrent writes from multiple processes are not supported and will raise `SQLITE_BUSY` errors.
   - **PostgreSQL:** Uses a native `BIGINT GENERATED ALWAYS AS IDENTITY` column which handles concurrent sequence increments safely across database sessions.
 - **Duplicate Event IDs:** Duplicate event IDs are structurally impossible. All backends rely on atomic database counters (`AUTOINCREMENT` for SQLite, `IDENTITY` for Postgres, and `INCR` for Redis) which generate strictly unique and non-overlapping sequence numbers.
+- **Redis counter as the write ceiling:** Because every write `INCR`s a single `{prefix}counter` key, all writes serialize through that one key. On a single Redis it is rarely the bottleneck, but on **Redis Cluster** the counter lives on one shard, setting the aggregate write-throughput ceiling regardless of cluster size. See [docs/production.md](docs/production.md#redis-monotonic-counter-throughput-ceiling) for benchmarking guidance.
 
 ### 3. Consistency & Durability
 - **SQLite:** Configured with WAL (`Write-Ahead Logging`) journaling. Writes are flushed to disk on commit, ensuring durability across process restarts.

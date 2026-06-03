@@ -17,6 +17,7 @@ Usage:
 
 from importlib.metadata import PackageNotFoundError, version
 
+from mcp_persist.config import event_store_from_env
 from mcp_persist.metrics import (
     LoggingMetricsCollector,
     MetricsCollector,
@@ -25,6 +26,7 @@ from mcp_persist.metrics import (
 from mcp_persist.migration import MigrationResult, migrate
 from mcp_persist.postgres import PostgresEventStore
 from mcp_persist.redis import RedisEventStore
+from mcp_persist.scheduler import PurgeScheduler
 from mcp_persist.sqlite import SQLiteEventStore
 
 try:
@@ -38,8 +40,10 @@ __all__ = [
     "MigrationResult",
     "NoOpMetricsCollector",
     "PostgresEventStore",
+    "PurgeScheduler",
     "RedisEventStore",
     "SQLiteEventStore",
     "__version__",
+    "event_store_from_env",
     "migrate",
 ]

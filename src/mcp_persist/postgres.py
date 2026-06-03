@@ -48,6 +48,7 @@ from mcp.server.streamable_http import (
 from mcp.types import JSONRPCMessage
 from pydantic import TypeAdapter, ValidationError
 
+from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 
 if TYPE_CHECKING:
@@ -131,6 +132,19 @@ class PostgresEventStore(EventStore):
                     Note each active subscriber holds one pool connection for its
                     lifetime — size the pool accordingly (see
                     ``docs/production.md``).
+        compression:
+                    Optional payload codec. ``"gzip"`` gzip-compresses event
+                    payloads above ``compress_min_bytes`` before storing them;
+                    ``None`` (the default) stores them as-is. Decompression on
+                    read is automatic and independent of this setting — a store
+                    reads compressed payloads written by another store even with
+                    compression off, so the option is safe to roll out
+                    incrementally and across :func:`mcp_persist.migrate`.
+        compress_min_bytes:
+                    Only compress payloads whose serialized size is at least this
+                    many bytes (default ``1024``). Smaller payloads are stored
+                    plain, since base64 overhead would outweigh the saving.
+                    Ignored when ``compression`` is ``None``.
     """
 
     def __init__(
@@ -143,12 +157,17 @@ class PostgresEventStore(EventStore):
         replay_batch_size: int = _DEFAULT_REPLAY_BATCH_SIZE,
         metrics: MetricsCollector | None = None,
         enable_streaming: bool = False,
+        compression: str | None = None,
+        compress_min_bytes: int = 1024,
     ) -> None:
         parts = table_name.split(".")
         if len(parts) > 2 or not all(part and IDENTIFIER_RE.match(part) for part in parts):
             raise ValueError(f"table_name must be a valid SQL identifier or 'schema.table', got {table_name!r}")
         if replay_batch_size < 1:
             raise ValueError(f"replay_batch_size must be a positive integer, got {replay_batch_size!r}")
+        validate_compression(compression)
+        if compress_min_bytes < 0:
+            raise ValueError(f"compress_min_bytes must be a non-negative integer, got {compress_min_bytes!r}")
 
         self._pool = pool
         quoted_parts = [f'"{part}"' for part in parts]
@@ -163,6 +182,8 @@ class PostgresEventStore(EventStore):
         self._replay_batch_size = replay_batch_size
         self._metrics: MetricsCollector = metrics if metrics is not None else NoOpMetricsCollector()
         self._enable_streaming = enable_streaming
+        self._compression = compression
+        self._compress_min_bytes = compress_min_bytes
         self._initialized = False
         self._init_lock = asyncio.Lock()
 
@@ -304,6 +325,7 @@ class PostgresEventStore(EventStore):
             payload = ""
         else:
             payload = message.model_dump_json(by_alias=True, exclude_none=True)
+            payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
 
         event_id = await self._pool.fetchval(
             f"INSERT INTO {self._table} (stream_id, payload, created_at) VALUES ($1, $2, $3) RETURNING event_id",
@@ -380,6 +402,29 @@ class PostgresEventStore(EventStore):
         min_created = time.time() - self._ttl if self._ttl is not None else None
         cursor_id = anchor_id
 
+        if min_created is not None:
+            # Detect an unrecoverable gap: the anchor still exists but one or more
+            # client-visible events after it have expired and will be silently
+            # skipped below, so the resuming client misses them with no other
+            # signal. Priming events (empty payload) are never replayed, so an
+            # expired one is not a gap and is excluded here.
+            gap = await self._pool.fetchval(
+                f"SELECT 1 FROM {self._table} "
+                "WHERE stream_id = $1 AND event_id > $2 AND created_at < $3 AND payload <> '' LIMIT 1",
+                stream_id,
+                anchor_id,
+                min_created,
+                timeout=self._timeout,
+            )
+            if gap is not None:
+                logger.warning(
+                    "Replay gap on stream %s: one or more events after Last-Event-ID %s have expired "
+                    "(ttl=%ss) and cannot be replayed; the resuming client will miss them.",
+                    stream_id,
+                    last_event_id,
+                    self._ttl,
+                )
+
         while True:
             if min_created is not None:
                 rows = await self._pool.fetch(
@@ -415,7 +460,7 @@ class PostgresEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(payload)
+                    message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
                 except ValidationError:
                     # A single corrupt/unparseable payload must not abort the whole
                     # replay: a reconnecting client would otherwise lose every event
@@ -435,7 +480,17 @@ class PostgresEventStore(EventStore):
 
     # Maintenance
 
-    async def purge_expired(self) -> int:
+    async def ping(self) -> bool:
+        """Check the pool can reach the database, for readiness/health probes.
+
+        Runs a trivial ``SELECT 1`` (honoring the store ``timeout``). Returns
+        ``True`` on success and lets any driver error propagate, so a probe can
+        treat a raised exception as "not ready".
+        """
+        await self._pool.fetchval("SELECT 1", timeout=self._timeout)
+        return True
+
+    async def purge_expired(self, *, batch_size: int | None = None) -> int:
         """Delete events older than ``ttl`` and return the number removed.
 
         No-op returning ``0`` when ``ttl`` is ``None``. PostgreSQL has no
@@ -443,22 +498,52 @@ class PostgresEventStore(EventStore):
         task or ``pg_cron``) to keep the table from growing without bound.
         (``pg_cron`` is a PostgreSQL extension that runs scheduled jobs inside
         the database itself, so cleanup can run without an external scheduler.)
+
+        Args:
+            batch_size: When ``None`` (the default) every expired row is removed
+                in a single ``DELETE``. When set to a positive integer, rows are
+                deleted in chunks of that many (via a ``ctid`` subselect) so a
+                large purge does not hold one long lock that contends with live
+                inserts and replay scans. The expiry cutoff is captured once up
+                front, so events that expire while the loop runs are left for the
+                next call.
         """
         if self._ttl is None:
             return 0
 
+        if batch_size is not None and batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer or None, got {batch_size!r}")
+
         if not self._initialized:
             await self.initialize()
+
+        cutoff = time.time() - self._ttl
 
         # asyncpg returns a command tag like "DELETE 5"; the count is the last token.
         # The created_at index added in initialize() keeps this an index scan
         # instead of a full table scan.
-        result = await self._pool.execute(
-            f"DELETE FROM {self._table} WHERE created_at < $1",
-            time.time() - self._ttl,
-            timeout=self._timeout,
-        )
-        return int(result.split()[-1])
+        if batch_size is None:
+            result = await self._pool.execute(
+                f"DELETE FROM {self._table} WHERE created_at < $1",
+                cutoff,
+                timeout=self._timeout,
+            )
+            return int(result.split()[-1])
+
+        total = 0
+        while True:
+            result = await self._pool.execute(
+                f"DELETE FROM {self._table} WHERE ctid IN "
+                f"(SELECT ctid FROM {self._table} WHERE created_at < $1 ORDER BY created_at LIMIT $2)",
+                cutoff,
+                batch_size,
+                timeout=self._timeout,
+            )
+            removed = int(result.split()[-1])
+            total += removed
+            if removed < batch_size:
+                break
+        return total
 
     # Migration support
 
@@ -518,7 +603,7 @@ class PostgresEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(payload)
+                    message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
                 except ValidationError:
                     logger.warning(
                         "Skipping event %s on stream %s during migration: payload failed JSONRPC validation",
@@ -628,7 +713,7 @@ class PostgresEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(payload)
+                    message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
                 except ValidationError:
                     logger.warning(
                         "Skipping event %s on stream %s during subscribe: payload failed JSONRPC validation",

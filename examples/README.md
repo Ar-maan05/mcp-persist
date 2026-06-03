@@ -18,6 +18,20 @@ pip install "mcp-persist[redis]" uvicorn starlette
 pip install "mcp-persist[postgres]" uvicorn starlette
 ```
 
+### Local Redis + Postgres
+
+The Redis and Postgres examples need a running backend. The repo ships a
+[`compose.yaml`](../compose.yaml) that starts both on their default ports:
+
+```bash
+docker compose up -d        # or: podman compose up -d
+# ... run the examples ...
+docker compose down         # add -v to drop the Postgres volume
+```
+
+The same services back the integration tests when you set `MCP_TEST_REDIS_URL`
+and `MCP_TEST_POSTGRES_URL` (see [`compose.yaml`](../compose.yaml)).
+
 ## sqlite_server.py
 
 Single-process durability with no external services. Events are persisted to
