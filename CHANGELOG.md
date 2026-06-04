@@ -257,7 +257,8 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore` — Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/Ar-maan05/mcp-persist/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.1.4...v1.2.0
