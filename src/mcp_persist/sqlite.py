@@ -33,6 +33,7 @@ import sqlite3
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
 from mcp.server.streamable_http import (
@@ -43,7 +44,7 @@ from mcp.server.streamable_http import (
     StreamId,
 )
 from mcp.types import JSONRPCMessage
-from pydantic import TypeAdapter, ValidationError
+from pydantic import TypeAdapter
 
 from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
@@ -114,6 +115,27 @@ class SQLiteEventStore(EventStore):
                     many bytes (default ``1024``). Smaller payloads are stored
                     plain, since base64 overhead would outweigh the saving.
                     Ignored when ``compression`` is ``None``.
+        commit_interval:
+                    Optional write-behind interval in seconds. When set (must be
+                    ``> 0``), ``store_event`` no longer commits on every call;
+                    instead a background task commits all buffered inserts every
+                    ``commit_interval`` seconds, trading durability for throughput
+                    (one fsync per interval instead of one per event). Buffered
+                    events stay fully visible to replay/subscribe on this store
+                    immediately (they live in SQLite's open transaction), but a
+                    process crash loses up to one interval of uncommitted events.
+                    ``None`` (the default) keeps durable commit-per-event.
+                    **With write-behind on you must close the store** — via
+                    :meth:`aclose`, ``async with``, or :meth:`create` — so the
+                    final interval is flushed on shutdown.
+        commit_max_pending:
+                    Optional cap on buffered (uncommitted) events. When set (must
+                    be ``>= 1``), ``store_event`` commits inline once this many
+                    events are pending, bounding both the crash-loss window and the
+                    size of the open transaction under bursts. Combine with
+                    ``commit_interval`` (whichever limit is hit first commits), use
+                    alone for pure count-based group commit (the tail below the cap
+                    is flushed on close), or leave ``None`` (the default).
     """
 
     def __init__(
@@ -127,6 +149,8 @@ class SQLiteEventStore(EventStore):
         enable_streaming: bool = False,
         compression: str | None = None,
         compress_min_bytes: int = 1024,
+        commit_interval: float | None = None,
+        commit_max_pending: int | None = None,
     ) -> None:
         parts = table_name.split(".")
         if len(parts) > 2 or not all(part and IDENTIFIER_RE.match(part) for part in parts):
@@ -134,6 +158,10 @@ class SQLiteEventStore(EventStore):
         validate_compression(compression)
         if compress_min_bytes < 0:
             raise ValueError(f"compress_min_bytes must be a non-negative integer, got {compress_min_bytes!r}")
+        if commit_interval is not None and commit_interval <= 0:
+            raise ValueError(f"commit_interval must be a positive number of seconds or None, got {commit_interval!r}")
+        if commit_max_pending is not None and commit_max_pending < 1:
+            raise ValueError(f"commit_max_pending must be a positive integer or None, got {commit_max_pending!r}")
 
         self._conn = conn
         quoted_parts = [f'"{part}"' for part in parts]
@@ -152,6 +180,11 @@ class SQLiteEventStore(EventStore):
         self._enable_streaming = enable_streaming
         self._compression = compression
         self._compress_min_bytes = compress_min_bytes
+        self._commit_interval = commit_interval
+        self._commit_max_pending = commit_max_pending
+        self._pending = 0
+        self._flush_task: asyncio.Task[None] | None = None
+        self._commit_lock = asyncio.Lock()
         self._initialized = False
         self._init_lock = asyncio.Lock()
 
@@ -175,6 +208,8 @@ class SQLiteEventStore(EventStore):
         table_name: str = "mcp_events",
         ttl: int | None = None,
         timeout: float | None = None,
+        commit_interval: float | None = None,
+        commit_max_pending: int | None = None,
         **connect_kwargs: Any,
     ) -> AsyncIterator[SQLiteEventStore]:
         """Open an SQLite connection, initialize, yield a store, and close on exit.
@@ -187,10 +222,12 @@ class SQLiteEventStore(EventStore):
                 await store.store_event(...)
 
         ``path`` and any extra ``connect_kwargs`` are passed to
-        ``aiosqlite.connect``; ``table_name``, ``ttl``, and ``timeout`` configure
-        the store and behave exactly as in :meth:`__init__`. :meth:`initialize`
-        is called before the store is yielded. The connection is always closed on
-        exit, including when ``initialize`` or the body raises. Pass ``":memory:"``
+        ``aiosqlite.connect``; ``table_name``, ``ttl``, ``timeout``,
+        ``commit_interval``, and ``commit_max_pending`` configure the store and
+        behave exactly as in :meth:`__init__`. :meth:`initialize` is called before
+        the store is yielded. On exit the store is closed first (:meth:`aclose`,
+        which flushes any write-behind buffer) and then the connection is closed —
+        always, including when ``initialize`` or the body raises. Pass ``":memory:"``
         for an ephemeral database (note: it is gone once the context exits).
 
         Requires the ``sqlite`` extra (``pip install "mcp-persist[sqlite]"``); the
@@ -200,12 +237,24 @@ class SQLiteEventStore(EventStore):
         import aiosqlite
 
         conn = await aiosqlite.connect(path, **connect_kwargs)
-        store = cls(conn, table_name=table_name, ttl=ttl, timeout=timeout)
+        store = cls(
+            conn,
+            table_name=table_name,
+            ttl=ttl,
+            timeout=timeout,
+            commit_interval=commit_interval,
+            commit_max_pending=commit_max_pending,
+        )
         try:
             await store.initialize()
             yield store
         finally:
-            await conn.close()
+            # Flush + stop the write-behind task before closing the connection;
+            # committing on a closed connection would fail and lose buffered events.
+            try:
+                await store.aclose()
+            finally:
+                await conn.close()
 
     # Schema
 
@@ -302,12 +351,108 @@ class SQLiteEventStore(EventStore):
             payload = message.model_dump_json(by_alias=True, exclude_none=True)
             payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
 
-        async with self._conn.execute(
-            f"INSERT INTO {self._table} (stream_id, payload, created_at) VALUES (?, ?, ?)",
-            (stream_id, payload, time.time()),
-        ) as cursor:
+        if self._commit_interval is None and self._commit_max_pending is None:
+            # Default: durable commit-per-event (one fsync each).
+            async with self._conn.execute(
+                f"INSERT INTO {self._table} (stream_id, payload, created_at) VALUES (?, ?, ?)",
+                (stream_id, payload, time.time()),
+            ) as cursor:
+                await self._conn.commit()
+                return str(cursor.lastrowid)
+
+        # Write-behind: leave the insert in SQLite's open transaction and let the
+        # background flusher (or an inline max-pending commit) persist it later.
+        # The commit lock guards the insert + counter so a concurrent flush can't
+        # zero ``_pending`` while a row it didn't commit is still outstanding.
+        self._ensure_flusher()
+        async with self._commit_lock:
+            async with self._conn.execute(
+                f"INSERT INTO {self._table} (stream_id, payload, created_at) VALUES (?, ?, ?)",
+                (stream_id, payload, time.time()),
+            ) as cursor:
+                event_id = str(cursor.lastrowid)
+            self._pending += 1
+            flush_now = self._commit_max_pending is not None and self._pending >= self._commit_max_pending
+        if flush_now:
+            await self._flush()
+        return event_id
+
+    # Write-behind commits
+
+    def _ensure_flusher(self) -> None:
+        """Start the background commit loop on first write-behind write (idempotent).
+
+        Lazy-started from the write path so it binds to the running event loop, and
+        only when ``commit_interval`` is set. Restarts the task if it has somehow
+        finished, so a one-off error can't permanently stop flushing.
+        """
+        if self._commit_interval is None:
+            return
+        if self._flush_task is not None and not self._flush_task.done():
+            return
+        self._flush_task = asyncio.create_task(self._commit_loop())
+
+    async def _commit_loop(self) -> None:
+        """Commit buffered write-behind inserts every ``commit_interval`` seconds."""
+        assert self._commit_interval is not None
+        while True:
+            await asyncio.sleep(self._commit_interval)
+            try:
+                await self._flush()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - keep flushing across a transient commit error
+                logger.exception("write-behind commit failed; will retry next interval")
+
+    async def _flush(self) -> None:
+        """Commit any buffered write-behind inserts; a no-op when none are pending.
+
+        Holds ``_commit_lock`` so the commit and the ``_pending`` reset are atomic
+        with respect to a concurrent ``store_event`` — at commit time every counted
+        row has finished its insert and none is mid-flight, so resetting to ``0``
+        can't drop an as-yet-uncommitted row.
+        """
+        async with self._commit_lock:
+            if self._pending == 0:
+                return
             await self._conn.commit()
-            return str(cursor.lastrowid)
+            self._pending = 0
+
+    async def aclose(self) -> None:
+        """Stop the write-behind flusher and commit any still-buffered events.
+
+        Idempotent, and safe to call when write-behind is off (it commits nothing).
+        **Required** when ``commit_interval`` / ``commit_max_pending`` is set and you
+        constructed the store directly: otherwise the last buffered events sit in an
+        uncommitted transaction and are lost on shutdown. :meth:`create` and the
+        ``async with`` form call this for you.
+        """
+        task = self._flush_task
+        self._flush_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        try:
+            await self._flush()
+        except Exception:  # noqa: BLE001 - best-effort final flush; log rather than mask the close
+            logger.exception(
+                "final write-behind flush failed on close; up to one commit_interval of events may be lost"
+            )
+
+    async def __aenter__(self) -> SQLiteEventStore:
+        await self.initialize()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
 
     async def replay_events_after(
         self,
@@ -406,14 +551,15 @@ class SQLiteEventStore(EventStore):
 
                 try:
                     message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
-                except ValidationError:
+                except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
                     # A single corrupt/unparseable payload must not abort the whole
                     # replay: a reconnecting client would otherwise lose every event
                     # on the stream, not just the bad one. Skip it and keep going.
                     logger.warning(
-                        "Skipping event %s on stream %s during replay: payload failed JSONRPC validation",
+                        "Skipping event %s on stream %s during replay: failed JSONRPC validation/decompression: %s",
                         event_id_int,
                         stream_id,
+                        exc,
                     )
                     continue
                 await send_callback(EventMessage(message=message, event_id=str(event_id_int)))
@@ -524,11 +670,12 @@ class SQLiteEventStore(EventStore):
 
                 try:
                     message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
-                except ValidationError:
+                except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
                     logger.warning(
-                        "Skipping event %s on stream %s during migration: payload failed JSONRPC validation",
+                        "Skipping event %s on stream %s during migration: failed JSONRPC validation/decompression: %s",
                         event_id,
                         stream_id,
+                        exc,
                     )
                     continue
 
@@ -592,11 +739,12 @@ class SQLiteEventStore(EventStore):
 
                 try:
                     message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
-                except ValidationError:
+                except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
                     logger.warning(
-                        "Skipping event %s on stream %s during subscribe: payload failed JSONRPC validation",
+                        "Skipping event %s on stream %s during subscribe: failed JSONRPC validation/decompression: %s",
                         event_id_int,
                         stream_id,
+                        exc,
                     )
                     continue
 

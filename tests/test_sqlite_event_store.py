@@ -586,3 +586,174 @@ async def test_replay_no_gap_warning_for_expired_priming_event(store_with_ttl, c
 
     assert [e.event_id for e in events] == []
     assert "Replay gap" not in caplog.text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Write-behind / batch-commit (1.5.0)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# These need an on-disk file (not ``:memory:``): a second connection to the same
+# file is how we distinguish committed from merely-buffered rows, and a second
+# ``:memory:`` connection would be a different database entirely.
+
+
+async def _committed_count(path: str, table: str = TABLE) -> int:
+    """Rows visible to a *separate* connection — i.e. actually committed."""
+    other = await aiosqlite.connect(path)
+    try:
+        async with other.execute(f"SELECT COUNT(*) FROM {table}") as cur:
+            (count,) = await cur.fetchone()
+        return count
+    finally:
+        await other.close()
+
+
+@pytest.mark.anyio
+async def test_commit_interval_defers_commit_but_reads_own_writes(tmp_path):
+    path = str(tmp_path / "wb.db")
+    conn = await aiosqlite.connect(path)
+    try:
+        store = SQLiteEventStore(conn, table_name=TABLE, ttl=None, commit_interval=100)
+        await store.initialize()
+        anchor = await store.store_event("s", SAMPLE_MSG)
+        await store.store_event("s", SAMPLE_MSG)
+
+        # Not yet committed: a separate connection sees no data rows ...
+        assert await _committed_count(path) == 0
+        # ... but this store reads its own uncommitted writes during replay.
+        events, stream_id = await collect_events(store, anchor)
+        assert stream_id == "s"
+        assert len(events) == 1
+
+        await store.aclose()
+        assert await _committed_count(path) == 2
+    finally:
+        await conn.close()
+
+
+@pytest.mark.anyio
+async def test_commit_interval_background_flush_commits(tmp_path):
+    path = str(tmp_path / "wb.db")
+    conn = await aiosqlite.connect(path)
+    try:
+        store = SQLiteEventStore(conn, table_name=TABLE, ttl=None, commit_interval=0.02)
+        await store.initialize()
+        await store.store_event("s", SAMPLE_MSG)
+
+        committed = 0
+        for _ in range(100):
+            committed = await _committed_count(path)
+            if committed:
+                break
+            await asyncio.sleep(0.02)
+        assert committed == 1
+        await store.aclose()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.anyio
+async def test_commit_max_pending_flushes_inline(tmp_path):
+    path = str(tmp_path / "wb.db")
+    conn = await aiosqlite.connect(path)
+    try:
+        # No interval: only the count threshold triggers a commit.
+        store = SQLiteEventStore(conn, table_name=TABLE, ttl=None, commit_max_pending=3)
+        await store.initialize()
+        await store.store_event("s", SAMPLE_MSG)
+        await store.store_event("s", SAMPLE_MSG)
+        assert await _committed_count(path) == 0  # below the cap, still buffered
+        await store.store_event("s", SAMPLE_MSG)
+        assert await _committed_count(path) == 3  # cap hit -> committed inline
+        await store.aclose()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.anyio
+async def test_commit_max_pending_tail_flushed_on_close(tmp_path):
+    path = str(tmp_path / "wb.db")
+    conn = await aiosqlite.connect(path)
+    try:
+        store = SQLiteEventStore(conn, table_name=TABLE, ttl=None, commit_max_pending=10)
+        await store.initialize()
+        await store.store_event("s", SAMPLE_MSG)
+        await store.store_event("s", SAMPLE_MSG)
+        assert await _committed_count(path) == 0  # never reached the cap
+        await store.aclose()
+        assert await _committed_count(path) == 2  # close flushes the tail
+    finally:
+        await conn.close()
+
+
+@pytest.mark.anyio
+async def test_write_behind_context_manager_flushes_on_exit(tmp_path):
+    path = str(tmp_path / "wb.db")
+    conn = await aiosqlite.connect(path)
+    try:
+        async with SQLiteEventStore(conn, table_name=TABLE, ttl=None, commit_interval=100) as store:
+            await store.store_event("s", SAMPLE_MSG)
+            assert await _committed_count(path) == 0
+        assert await _committed_count(path) == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.anyio
+async def test_create_flushes_write_behind_on_exit(tmp_path):
+    path = str(tmp_path / "wb.db")
+    async with SQLiteEventStore.create(path, table_name=TABLE, ttl=None, commit_interval=100) as store:
+        await store.store_event("s", SAMPLE_MSG)
+    # Reopen the file with a fresh connection: the event must have persisted.
+    assert await _committed_count(path) == 1
+
+
+@pytest.mark.anyio
+async def test_write_behind_event_ids_stay_monotonic(conn):
+    store = SQLiteEventStore(conn, table_name=TABLE, ttl=None, commit_interval=100)
+    await store.initialize()
+    id1 = await store.store_event("s", SAMPLE_MSG)
+    id2 = await store.store_event("s", SAMPLE_MSG)
+    assert id1 == "1"
+    assert int(id2) == int(id1) + 1
+    await store.aclose()
+
+
+@pytest.mark.anyio
+async def test_aclose_without_write_behind_is_safe(store):
+    await store.store_event("s", SAMPLE_MSG)
+    await store.aclose()  # nothing configured -> no-op
+    await store.aclose()  # idempotent
+
+
+@pytest.mark.anyio
+async def test_aclose_is_idempotent_with_write_behind(conn):
+    store = SQLiteEventStore(conn, table_name=TABLE, ttl=None, commit_interval=100)
+    await store.initialize()
+    await store.store_event("s", SAMPLE_MSG)
+    await store.aclose()
+    await store.aclose()  # must not raise
+
+
+@pytest.mark.anyio
+async def test_default_commits_per_event(tmp_path):
+    # Regression: with no write-behind config, every store_event commits at once.
+    path = str(tmp_path / "default.db")
+    conn = await aiosqlite.connect(path)
+    try:
+        store = SQLiteEventStore(conn, table_name=TABLE, ttl=None)
+        await store.initialize()
+        await store.store_event("s", SAMPLE_MSG)
+        assert await _committed_count(path) == 1
+    finally:
+        await conn.close()
+
+
+def test_invalid_commit_interval_raises():
+    with pytest.raises(ValueError):
+        SQLiteEventStore(object(), commit_interval=0)
+
+
+def test_invalid_commit_max_pending_raises():
+    with pytest.raises(ValueError):
+        SQLiteEventStore(object(), commit_max_pending=0)

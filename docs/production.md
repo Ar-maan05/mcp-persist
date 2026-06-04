@@ -535,6 +535,48 @@ Because the event store sits in the message-delivery path (see
 probe lets the orchestrator stop routing to a pod whose backend is unreachable
 rather than letting it accept traffic it cannot serve.
 
+## 12. Write-behind commits (SQLite)
+
+By default `SQLiteEventStore` commits on every `store_event` — one `fsync` per
+event, which is what makes a single-node deployment durable across restarts but
+also caps write throughput. If you write events faster than the disk can sync
+them and can tolerate a small, bounded loss window on a crash, **write-behind**
+mode amortizes the syncs: the inserts go into SQLite's open transaction
+immediately and a background task commits them on an interval.
+
+```python
+# Commit at most every second, and never let more than 500 events buffer.
+async with SQLiteEventStore.create(
+    "events.db", ttl=3600, commit_interval=1.0, commit_max_pending=500
+) as store:
+    ...
+```
+
+- **What you gain / what you risk.** One `fsync` per interval instead of per
+  event. Buffered events are **fully visible to `replay_events_after` and
+  `subscribe` on this store immediately** — they live in the connection's open
+  transaction — so resumability within a running process is unaffected. The
+  trade-off is durability: a process crash (or `kill -9`) rolls back the
+  uncommitted transaction, losing up to one `commit_interval` of events. Use it
+  only where a dropped tail of events on a hard crash is acceptable.
+- **Bound the window two ways.** `commit_interval` bounds loss by *time*;
+  `commit_max_pending` bounds it by *count* (and keeps the open transaction from
+  growing without limit under a burst) by committing inline once that many events
+  are buffered. Use either or both — whichever limit is hit first commits.
+  `commit_max_pending` alone gives pure count-based group commit with no timer.
+- **You must close the store.** This is the one footgun: the final interval's
+  buffered events are only committed on close. Use `SQLiteEventStore.create()` or
+  `async with store:` (both call `aclose()` for you), or call `await
+  store.aclose()` yourself on shutdown. Skip it and you silently drop the tail.
+- **Single-writer only.** Write-behind holds an open write transaction between
+  commits, so a *second* process writing to the same file is blocked until the
+  next flush. That's consistent with SQLite already being single-writer
+  (multi-process deployments belong on Redis/Postgres — see
+  [§6](#6-scaling-workers--nodes)); just don't reach for write-behind to paper
+  over a topology SQLite can't serve.
+- **Off by default.** Leave `commit_interval` / `commit_max_pending` unset for the
+  durable commit-per-event behavior; existing deployments are unaffected.
+
 ## Production checklist
 
 - [ ] `ttl` set to **≥ 2× `session_idle_timeout`** (never `None`)
@@ -548,6 +590,9 @@ rather than letting it accept traffic it cannot serve.
 - [ ] TLS enabled, credentials from a secret store, backend network-isolated
 - [ ] Connection/pool size matched to worker concurrency; connection/pool closed
       on shutdown
+- [ ] If SQLite write-behind (`commit_interval`) is on, the store is closed on
+      shutdown (`create()` / `async with` / `aclose()`) and the crash-loss window
+      is acceptable
 - [ ] Backend matches your topology: SQLite = **single process only** (not behind
       a load balancer / rolling deploy, not on serverless/read-only FS);
       Redis/Postgres for any replica count > 1

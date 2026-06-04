@@ -166,6 +166,7 @@ One row per event:
 - **TTL support** — expired events are skipped on replay and removed by `purge_expired()`
 - **Multi-tenant isolation** via configurable `table_name`
 - **Priming event handling** — sentinel empty-string payloads are stored but never replayed
+- **Optional write-behind** — `commit_interval` batches commits for higher write throughput at a bounded durability window (see below)
 
 ### Configuration
 
@@ -175,12 +176,34 @@ SQLiteEventStore(
     table_name="mcp_events",  # isolate multiple servers in one database file
     ttl=3600,               # seconds; None = never expire (not recommended)
     compression=None,       # "gzip" to compress large payloads (see "Large payloads")
+    commit_interval=None,   # seconds; set to batch commits (write-behind, see below)
+    commit_max_pending=None,  # cap buffered events under write-behind
 )
 ```
 
 **TTL note:** SQLite has no automatic key expiry. Events past `ttl` are skipped on
 replay, but to reclaim disk space call `await store.purge_expired()` periodically
 (e.g. from a background task). It returns the number of rows deleted.
+
+### Write-behind commits
+
+By default every `store_event` commits (one `fsync` each) — durable, but the
+throughput ceiling. Set `commit_interval` (seconds) to commit on a background
+timer instead, and optionally `commit_max_pending` to also commit once that many
+events are buffered:
+
+```python
+async with SQLiteEventStore.create("events.db", ttl=3600, commit_interval=1.0) as store:
+    ...  # commits at most once a second; far higher write throughput
+```
+
+Buffered events are still immediately visible to replay/subscribe on the same
+store; the trade-off is that a crash loses up to one `commit_interval` of
+uncommitted events. **You must close the store** so the last batch is flushed —
+`create()` and `async with store:` do this for you, or call `await store.aclose()`
+on shutdown. Off by default. See
+[docs/production.md](docs/production.md#12-write-behind-commits-sqlite) for the
+full trade-off and single-writer caveat.
 
 ### Multi-tenant deployments
 
@@ -496,8 +519,8 @@ uv run python benchmarks/benchmark.py --events 5000 --concurrency 500
 The table below was measured with the following configuration:
 - **CPU / Machine:** AMD Ryzen AI 7 350 (8 cores, 16 threads), 24GB DDR5 5600, PCIe Gen 5 NVMe SSD storage, running Fedora Linux 44 (Workstation Edition) x86_64
 - **Python Version:** 3.12.2
-- **Redis Version:** 7.2.4 (Docker container on localhost)
-- **PostgreSQL Version:** 16.2 (Docker container on localhost)
+- **Redis Version:** 8.8.0 (container on localhost)
+- **PostgreSQL Version:** 18.4 (container on localhost)
 
 Measured with `--events 5000 --concurrency 500`:
 

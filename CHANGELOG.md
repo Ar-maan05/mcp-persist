@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-06-04
+
+### Added
+- **SQLite write-behind commits** (`commit_interval`, `commit_max_pending`):
+  - `SQLiteEventStore` (and `SQLiteEventStore.create()`) accept an optional `commit_interval` (seconds). When set, `store_event` no longer commits on every call; instead the insert stays in SQLite's open transaction and a background task commits all buffered events every `commit_interval` seconds — one `fsync` per interval instead of one per event, trading a bounded durability window for substantially higher write throughput. Buffered events remain **immediately visible to `replay_events_after` and `subscribe` on the same store** (read-your-writes within the process); only a hard crash loses the uncommitted tail (≤ one interval). `commit_max_pending` additionally commits inline once that many events are buffered, bounding the loss window by count and capping the open transaction size under bursts; it can be used alone for pure count-based group commit. Both default to `None`, so the existing durable commit-per-event behavior is unchanged.
+  - New lifecycle: `SQLiteEventStore` is now an async context manager and exposes `await store.aclose()`, which stops the flusher and commits the final batch. **Write-behind requires closing the store** (via `create()`, `async with store:`, or `aclose()`) or the last interval of events is dropped on shutdown; `create()`'s context manager flushes and closes for you. `aclose()` is idempotent and a no-op when write-behind is off.
+  - Docs: new "Write-behind commits (SQLite)" sections in the README and `docs/production.md` (durability trade-off, the mandatory-close footgun, the single-writer caveat, and a production-checklist item).
+
+### Fixed
+- **Corrupt or partial compressed payloads no longer crash replay, `subscribe`, or migration.** A `gz:`-marked payload that was truncated or otherwise not valid gzip/base64 raised `gzip.BadGzipFile` / `binascii.Error` from `decompress_payload`, which escaped the `ValidationError`-only guard and aborted the entire stream (or migration run) instead of skipping the one bad event. All three backends now skip an undecodable event — logging a warning with the underlying error — and continue, exactly as they already tolerated a single payload that failed JSON-RPC validation. Regression coverage in `tests/test_bug_finding_corruption.py`, plus new stress (`tests/test_stress_*.py`) and integrity (`tests/test_integrity_all.py`) suites.
+
 ## [1.4.0] - 2026-06-03
 
 ### Added
@@ -257,7 +268,8 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore` — Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/Ar-maan05/mcp-persist/compare/v1.2.0...v1.2.1

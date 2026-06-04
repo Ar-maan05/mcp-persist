@@ -46,7 +46,7 @@ from mcp.server.streamable_http import (
     StreamId,
 )
 from mcp.types import JSONRPCMessage
-from pydantic import TypeAdapter, ValidationError
+from pydantic import TypeAdapter
 
 from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
@@ -461,14 +461,15 @@ class PostgresEventStore(EventStore):
 
                 try:
                     message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
-                except ValidationError:
+                except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
                     # A single corrupt/unparseable payload must not abort the whole
                     # replay: a reconnecting client would otherwise lose every event
                     # on the stream, not just the bad one. Skip it and keep going.
                     logger.warning(
-                        "Skipping event %s on stream %s during replay: payload failed JSONRPC validation",
+                        "Skipping event %s on stream %s during replay: failed JSONRPC validation/decompression: %s",
                         record["event_id"],
                         stream_id,
+                        exc,
                     )
                     continue
                 await send_callback(EventMessage(message=message, event_id=str(record["event_id"])))
@@ -604,11 +605,12 @@ class PostgresEventStore(EventStore):
 
                 try:
                     message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
-                except ValidationError:
+                except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
                     logger.warning(
-                        "Skipping event %s on stream %s during migration: payload failed JSONRPC validation",
+                        "Skipping event %s on stream %s during migration: failed JSONRPC validation/decompression: %s",
                         event_id,
                         stream_id,
+                        exc,
                     )
                     continue
 
@@ -714,11 +716,12 @@ class PostgresEventStore(EventStore):
 
                 try:
                     message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
-                except ValidationError:
+                except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
                     logger.warning(
-                        "Skipping event %s on stream %s during subscribe: payload failed JSONRPC validation",
+                        "Skipping event %s on stream %s during subscribe: failed JSONRPC validation/decompression: %s",
                         event_id,
                         stream_id,
+                        exc,
                     )
                     continue
 

@@ -39,7 +39,7 @@ Redis backend against a real server, set `MCP_TEST_REDIS_URL`:
 
 ```bash
 # start a throwaway Redis (any of these)
-docker run --rm -d -p 6379:6379 redis:7
+docker run --rm -d -p 6379:6379 redis:8
 
 MCP_TEST_REDIS_URL=redis://localhost:6379/0 uv run pytest tests/
 ```
@@ -55,7 +55,7 @@ unless `MCP_TEST_POSTGRES_URL` is set — local development without Postgres is
 unaffected. To run them, point it at a throwaway database:
 
 ```bash
-docker run --rm -d -e POSTGRES_HOST_AUTH_METHOD=trust -p 5432:5432 postgres:16
+docker run --rm -d -e POSTGRES_HOST_AUTH_METHOD=trust -p 5432:5432 postgres:18
 
 MCP_TEST_POSTGRES_URL=postgresql://postgres@localhost:5432/postgres uv run pytest tests/
 ```
