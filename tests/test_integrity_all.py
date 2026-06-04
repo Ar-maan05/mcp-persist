@@ -137,8 +137,14 @@ async def test_postgres_monotonicity_under_concurrency():
 
         assert len(all_ids) == total_writes
         assert len(set(all_ids)) == total_writes
-        # Bigint identity sequence is monotonic
-        assert all_ids == sorted(all_ids)
+        # IDs are assigned monotonically in time, but concurrent writers collect
+        # them grouped by task, so the flattened list is not globally sorted. The
+        # guarantee is that the N writes get N unique, gap-free IDs from the
+        # identity sequence — a contiguous block. Anchor the range at the observed
+        # minimum (not 1): the table persists across runs, so the sequence may
+        # already be past 1.
+        ordered = sorted(all_ids)
+        assert ordered == list(range(ordered[0], ordered[0] + total_writes))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
