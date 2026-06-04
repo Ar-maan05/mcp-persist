@@ -1,13 +1,18 @@
 # Examples
 
-Three minimal MCP servers showing how to wire `mcp-persist` backends into a
+Minimal, runnable MCP servers showing how to add `mcp-persist` resumability — the
+`with_persistence()` plugin one-liner, plus each backend wired manually into a
 real [`StreamableHTTPSessionManager`](https://github.com/modelcontextprotocol/python-sdk).
 
-All expose the same note-taking API over MCP at `http://localhost:8000/mcp`.
+All serve MCP at `http://localhost:8000/mcp`. The three backend servers share the
+same note-taking API; the plugin server is a minimal echo server.
 
 ## Prerequisites
 
 ```bash
+# FastMCP plugin example (SQLite) — uvicorn ships with mcp, so one install is enough
+pip install "mcp-persist[sqlite]"
+
 # SQLite example
 pip install "mcp-persist[sqlite]" uvicorn starlette
 
@@ -31,6 +36,16 @@ docker compose down         # add -v to drop the Postgres volume
 
 The same services back the integration tests when you set `MCP_TEST_REDIS_URL`
 and `MCP_TEST_POSTGRES_URL` (see [`compose.yaml`](../compose.yaml)).
+
+## fastmcp_plugin_server.py
+
+The simplest entry point: a FastMCP server made resumable with a single
+`with_persistence()` call — no manual store, manager, or lifespan wiring. Uses
+SQLite (persists to `echo_events.db`) and exposes `shout` / `slow_echo` tools.
+
+```bash
+python examples/fastmcp_plugin_server.py
+```
 
 ## sqlite_server.py
 
@@ -71,7 +86,9 @@ python examples/postgres_server.py
 
 With the server running, connect any MCP client to `http://localhost:8000/mcp`.
 
-Using the [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk):
+Using the [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
+(the `add_note` tool below is on the three note-taking servers; on the plugin
+server call `shout` instead):
 
 ```python
 import asyncio

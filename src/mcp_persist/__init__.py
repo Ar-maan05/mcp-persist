@@ -13,11 +13,19 @@ Usage:
     pip install "mcp-persist[redis]"     # or [sqlite] / [postgres]
 
     from mcp_persist import RedisEventStore, SQLiteEventStore, PostgresEventStore
+
+For FastMCP servers, ``with_persistence`` wires a store into a runnable ASGI app
+in one call (see :mod:`mcp_persist.fastmcp`):
+
+    from mcp_persist import with_persistence
+
+    app = with_persistence(mcp, backend="sqlite", url="events.db", ttl=3600)
 """
 
 from importlib.metadata import PackageNotFoundError, version
 
 from mcp_persist.config import event_store_from_env
+from mcp_persist.fastmcp import with_persistence
 from mcp_persist.metrics import (
     LoggingMetricsCollector,
     MetricsCollector,
@@ -46,4 +54,5 @@ __all__ = [
     "__version__",
     "event_store_from_env",
     "migrate",
+    "with_persistence",
 ]

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-06-04
+
+### Added
+- **FastMCP plugin** (`mcp_persist.with_persistence`):
+  - Takes a `FastMCP` instance and returns a runnable Starlette ASGI app with SSE stream resumability already wired in — collapsing the manual dance of opening a connection, building an `EventStore`, constructing a `StreamableHTTPSessionManager`, and writing a Starlette lifespan down to a single call. The returned app owns the store + session-manager lifecycle (opened on startup, closed on shutdown) and mounts the MCP endpoint at `mcp_path` (default `/mcp`).
+  - Three ways to supply the store, resolved in order: a pre-built `store=` (caller owns its lifecycle — **not** closed on shutdown); `backend=` + `url=` config kwargs (`ttl`/`table_name` for sqlite & postgres, `key_prefix`/`max_stream_length` for redis), built and closed for you; or neither, falling back to `event_store_from_env()` (`MCP_PERSIST_*`). Conflicting or inapplicable arguments (e.g. `store=` together with `backend=`, a redis-only option on sqlite, or config kwargs with no backend) raise `ValueError` rather than being silently ignored. The live store is exposed on `app.state.event_store` so a `PurgeScheduler` can run alongside the server.
+  - **No new dependencies** — `starlette` and `StreamableHTTPSessionManager` already ship with `mcp`. New example `examples/fastmcp_plugin_server.py` and end-to-end tests in `tests/test_fastmcp_plugin.py` (real MCP client over an in-process server, asserting events persist and replay through the plugin-wired store).
+
 ## [1.5.0] - 2026-06-04
 
 ### Added

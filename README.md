@@ -5,9 +5,91 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/mcp-persist.svg)](https://pypi.org/project/mcp-persist/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-The MCP Python SDK currently provides only an in-memory `EventStore`. **`mcp-persist` provides drop-in durable `EventStore` implementations for SQLite, Redis, and PostgreSQL.**
+When an MCP client reconnects, the server has to replay the events it missed — and with only the SDK's in-memory `EventStore`, that replay is impossible: the session lived in one process's memory, so a restart or a reconnect to a different worker loses it. **`mcp-persist` adds drop-in durable `EventStore` backends for SQLite, Redis, and PostgreSQL** that survive process restarts and scale across multi-worker deployments, keeping SSE stream resumability intact.
 
-This allows real deployments to survive process restarts and scale across multi-worker environments while retaining SSE stream resumability.
+## Two-line setup for FastMCP: `with_persistence()`
+
+The fastest way to add resumability to a FastMCP server. Wiring it by hand means
+an event store, a `StreamableHTTPSessionManager`, a Starlette lifespan to open and
+close them, and a `Mount`. `with_persistence()` collapses all of it to two lines —
+pass your `FastMCP` instance and get back a runnable Starlette ASGI app with the
+store and session manager already wired in, opened on startup and closed on
+shutdown.
+
+**Before** — the manual wiring:
+
+```python
+import contextlib
+
+import aiosqlite
+import uvicorn
+from mcp.server.fastmcp import FastMCP
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp_persist import SQLiteEventStore
+from starlette.applications import Starlette
+from starlette.routing import Mount
+
+mcp = FastMCP(name="MyServer")
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    conn = await aiosqlite.connect("events.db")
+    try:
+        store = SQLiteEventStore(conn, ttl=3600)
+        await store.initialize()
+        manager = StreamableHTTPSessionManager(app=mcp._mcp_server, event_store=store)
+        app.state.manager = manager
+        async with manager.run():
+            yield
+    finally:
+        await conn.close()
+
+
+async def handle_mcp(scope, receive, send):
+    await scope["app"].state.manager.handle_request(scope, receive, send)
+
+
+app = Starlette(lifespan=lifespan, routes=[Mount("/mcp", app=handle_mcp)])
+uvicorn.run(app, host="127.0.0.1", port=8000)
+```
+
+**After** — `with_persistence()`:
+
+```python
+import uvicorn
+from mcp.server.fastmcp import FastMCP
+from mcp_persist import with_persistence
+
+mcp = FastMCP(name="MyServer")
+
+app = with_persistence(mcp, backend="sqlite", url="events.db", ttl=3600)
+uvicorn.run(app, host="127.0.0.1", port=8000)  # MCP endpoint at /mcp
+```
+
+Switching backend is a one-word change (`backend="redis"` / `"postgres"` with
+the matching `url`). There are three ways to supply the store, resolved in order:
+
+```python
+# A — config kwargs; the app builds the store and owns its lifecycle:
+app = with_persistence(mcp, backend="redis", url="redis://localhost:6379", ttl=3600)
+
+# B — bring your own store; you own its lifecycle (the app does NOT close it):
+async with SQLiteEventStore.create("events.db", ttl=3600) as store:
+    app = with_persistence(mcp, store=store)
+    await uvicorn.Server(uvicorn.Config(app, port=8000)).serve()
+
+# C — configure from the environment (MCP_PERSIST_BACKEND / _URL / _TTL / …):
+app = with_persistence(mcp)
+```
+
+The live store is exposed on `app.state.event_store`, so you can run a
+[`PurgeScheduler`](#scheduled-cleanup-purgescheduler) alongside the server. No
+extra dependency is required — `starlette` and the session manager ship with
+`mcp`. See [`examples/fastmcp_plugin_server.py`](examples/fastmcp_plugin_server.py).
+
+Under the hood — whichever setup you use — it's the same layering: a
+`StreamableHTTPSessionManager` backed by a durable `EventStore` you choose.
 
 ```
 MCP Server
@@ -77,6 +159,30 @@ pip install "mcp-persist[sqlite,redis,postgres]"
 ```
 
 ## Quickstart
+
+On FastMCP, one line wires a durable store into a runnable app — see
+[Two-line setup](#two-line-setup-for-fastmcp-with_persistence) for the full
+before/after:
+
+```python
+from mcp.server.fastmcp import FastMCP
+from mcp_persist import with_persistence
+
+mcp = FastMCP(name="MyServer")
+
+# Swap backend="redis" / "postgres" with the matching url:
+app = with_persistence(mcp, backend="sqlite", url="events.db", ttl=3600)
+# run it:  uvicorn.run(app, host="127.0.0.1", port=8000)   # MCP endpoint at /mcp
+```
+
+Not on FastMCP, or want to own the wiring yourself? Build a store and pass it to
+`StreamableHTTPSessionManager` directly — see
+[Manual wiring](#manual-wiring-advanced-or-non-fastmcp) below.
+
+## Manual wiring (advanced or non-FastMCP)
+
+Construct a store and hand it to `StreamableHTTPSessionManager`. The backends are
+interchangeable; pick per [Choosing a backend](#choosing-a-backend).
 
 ### SQLite
 
@@ -484,18 +590,20 @@ report "not ready" when the store's dependency is down. See
 
 ## Examples
 
-The [`examples/`](examples/) directory contains minimal, runnable MCP servers
-that wire each backend into a real
+The [`examples/`](examples/) directory contains minimal, runnable MCP servers —
+the `with_persistence()` one-liner, plus each backend wired manually into a real
 [`StreamableHTTPSessionManager`](https://github.com/modelcontextprotocol/python-sdk):
 
-| File | Backend | Run |
+| File | Approach | Run |
 |---|---|---|
-| [`sqlite_server.py`](examples/sqlite_server.py) | `SQLiteEventStore` | `python examples/sqlite_server.py` |
-| [`redis_server.py`](examples/redis_server.py) | `RedisEventStore` | `python examples/redis_server.py` |
-| [`postgres_server.py`](examples/postgres_server.py) | `PostgresEventStore` | `python examples/postgres_server.py` |
+| [`fastmcp_plugin_server.py`](examples/fastmcp_plugin_server.py) | `with_persistence()` plugin (SQLite) | `python examples/fastmcp_plugin_server.py` |
+| [`sqlite_server.py`](examples/sqlite_server.py) | Manual `SQLiteEventStore` | `python examples/sqlite_server.py` |
+| [`redis_server.py`](examples/redis_server.py) | Manual `RedisEventStore` | `python examples/redis_server.py` |
+| [`postgres_server.py`](examples/postgres_server.py) | Manual `PostgresEventStore` | `python examples/postgres_server.py` |
 
-Each example is a self-contained note-taking MCP server (tools, resources) that
-you can connect to with any MCP client at `http://localhost:8000/mcp`.
+Each one is a self-contained MCP server you can connect to with any MCP client at
+`http://localhost:8000/mcp` (the three backend servers are a note-taking app; the
+plugin server is a minimal echo server).
 
 See [`examples/README.md`](examples/README.md) for prerequisites, setup, and a
 client snippet.
