@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Follows upstream redirects internally (e.g. a server's `/mcp` → `/mcp/` trailing-slash redirect), so the client sees a clean endpoint and never gets bounced past the proxy to the upstream.
   - **CLI** (`mcp-persist-proxy`): point at a running upstream (`--upstream URL --backend sqlite --url events.db [--port 8000] [--path /mcp]`), or start one as a subprocess, wait for it to come up, and proxy it (`--backend redis --url ... [--upstream-port 8001] -- uvicorn my_server:app --port 8001`) — the child is stopped (SIGTERM, then SIGKILL) when the proxy exits.
   - **No new dependencies** — `httpx` and `uvicorn` already ship transitively with `mcp`, so the proxy needs no extra install. New modules `mcp_persist/proxy.py`, `mcp_persist/_stream_buffer.py`, `mcp_persist/_sse_parser.py`, `mcp_persist/_cli.py`, with unit tests for the SSE parser, the stream buffer (cold/hot replay, live fan-out, disconnect survival), the proxy (JSON passthrough, POST/GET SSE, reconnect to a live buffer vs. store-only replay, mid-stream disconnect), and CLI argument handling.
+  - Documented in the README ("Resumability without touching the server") and the [production guide](docs/production.md) (proxy mode: single point of failure, the shared-store requirement across proxy replicas, and the upstream-restart scope boundary).
 
 ## [1.6.0] - 2026-06-04
 

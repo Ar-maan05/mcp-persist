@@ -106,6 +106,45 @@ It reads `MCP_PERSIST_BACKEND` (`sqlite` / `redis` / `postgres`) and
 connection is opened on entry and closed on exit, exactly like the lifespan
 above.
 
+### Proxy mode: resumability without modifying the server
+
+When you can't wire a store into the server itself — a third-party server, a
+binary you don't own, one written in another language — run the
+[`PersistenceProxy`](../README.md#resumability-without-touching-the-server-persistenceproxy)
+in front of it instead. It forwards requests upstream, intercepts the SSE
+responses, stores every event under its **own** monotonic IDs, and replays them
+when a client reconnects with `Last-Event-ID`. The upstream needs no event store
+of its own; the proxy is the store. Point your clients at the proxy instead of
+the server — nothing else on the client changes.
+
+```bash
+# in front of a running server
+mcp-persist-proxy --upstream http://localhost:8001 \
+    --backend postgres --url postgresql://localhost/mydb --ttl 3600 --port 8000
+```
+
+Everything else in this guide applies to the proxy's store unchanged — the same
+backend choice, `ttl` sizing (**at least 2× the upstream's `session_idle_timeout`**),
+`purge_expired()` scheduling, schema/permissions, and observability. Run it with
+this in mind:
+
+- **It is an extra hop and a single point of failure** in front of the upstream.
+  Run it like any other critical edge proxy: health checks, a restart policy, and
+  alerting. Its store sits in the message-delivery path with the same failure
+  modes as [§4](#4-high-availability--failure-modes).
+- **More than one proxy replica needs a shared store** (Redis/Postgres), for
+  exactly the reason in [§6](#deployment-topologies-rolling-deploys-load-balancers-serverless):
+  a client can reconnect through a different proxy instance than the one that
+  issued its `Last-Event-ID`. A per-instance SQLite file will silently replay
+  nothing. SQLite is for a single proxy process only.
+- **It covers client disconnects against a stable upstream, not an upstream
+  restart.** If the upstream itself restarts it starts a fresh session; the proxy
+  can replay what it already stored but cannot bridge the old stream to the
+  restarted server. This is the same boundary as
+  [scope](#scope-what-resumability-does-and-does-not-cover), one hop out.
+- **No extra dependency** — `httpx` and `uvicorn` already ship transitively with
+  `mcp`.
+
 ## 2. Reclaiming space — schedule `purge_expired()`
 
 | Backend | Expiry | Your job |
