@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-06-05
+
+### Added
+- **Persistence proxy** (`mcp_persist.PersistenceProxy` + the `mcp-persist-proxy` CLI):
+  - An ASGI app that adds SSE stream resumability in front of **any** upstream MCP server without modifying it. It forwards requests upstream and, for `text/event-stream` responses, intercepts the stream: each event is parsed, persisted to an `EventStore` (which assigns the proxy's own monotonic event ID), and forwarded to the client. A client that drops can reconnect with `Last-Event-ID`; the proxy replays the missed events from the store and then continues live. The upstream runs **without** its own event store — the proxy is the store. The buffer outlives the client request, so a disconnect mid-response keeps storing and a later reconnect gets a complete history.
+  - Scope is honest: it survives **client** disconnects against a stable upstream. It does not survive an upstream restart (new session, new IDs), and an event that neither the client nor the proxy received before storage is gone — same at-most-once guarantee as the SDK itself.
+  - Store resolution mirrors `with_persistence`: `PersistenceProxy.create(upstream, store=...)` (caller-owned), `backend=`+`url=`(+`ttl=`) built and closed for you, or neither → `event_store_from_env()` (`MCP_PERSIST_*`). `create()` owns the shared `httpx.AsyncClient` and the store/buffer lifecycle.
+  - Follows upstream redirects internally (e.g. a server's `/mcp` → `/mcp/` trailing-slash redirect), so the client sees a clean endpoint and never gets bounced past the proxy to the upstream.
+  - **CLI** (`mcp-persist-proxy`): point at a running upstream (`--upstream URL --backend sqlite --url events.db [--port 8000] [--path /mcp]`), or start one as a subprocess, wait for it to come up, and proxy it (`--backend redis --url ... [--upstream-port 8001] -- uvicorn my_server:app --port 8001`) — the child is stopped (SIGTERM, then SIGKILL) when the proxy exits.
+  - **No new dependencies** — `httpx` and `uvicorn` already ship transitively with `mcp`, so the proxy needs no extra install. New modules `mcp_persist/proxy.py`, `mcp_persist/_stream_buffer.py`, `mcp_persist/_sse_parser.py`, `mcp_persist/_cli.py`, with unit tests for the SSE parser, the stream buffer (cold/hot replay, live fan-out, disconnect survival), the proxy (JSON passthrough, POST/GET SSE, reconnect to a live buffer vs. store-only replay, mid-stream disconnect), and CLI argument handling.
+
 ## [1.6.0] - 2026-06-04
 
 ### Added
@@ -276,7 +287,9 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore` — Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.6.0...v1.7.0
+[1.6.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.2.1...v1.3.0

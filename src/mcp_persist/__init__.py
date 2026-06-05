@@ -20,6 +20,10 @@ in one call (see :mod:`mcp_persist.fastmcp`):
     from mcp_persist import with_persistence
 
     app = with_persistence(mcp, backend="sqlite", url="events.db", ttl=3600)
+
+To add resumability without modifying the server, ``PersistenceProxy`` (and the
+``mcp-persist-proxy`` CLI) fronts any upstream MCP endpoint and stores its SSE
+events (see :mod:`mcp_persist.proxy`).
 """
 
 from importlib.metadata import PackageNotFoundError, version
@@ -33,6 +37,7 @@ from mcp_persist.metrics import (
 )
 from mcp_persist.migration import MigrationResult, migrate
 from mcp_persist.postgres import PostgresEventStore
+from mcp_persist.proxy import PersistenceProxy
 from mcp_persist.redis import RedisEventStore
 from mcp_persist.scheduler import PurgeScheduler
 from mcp_persist.sqlite import SQLiteEventStore
@@ -47,6 +52,7 @@ __all__ = [
     "MetricsCollector",
     "MigrationResult",
     "NoOpMetricsCollector",
+    "PersistenceProxy",
     "PostgresEventStore",
     "PurgeScheduler",
     "RedisEventStore",

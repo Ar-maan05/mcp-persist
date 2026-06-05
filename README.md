@@ -104,6 +104,61 @@ EventStore
  └─ PostgreSQL
 ```
 
+## Resumability without touching the server: `PersistenceProxy`
+
+When you can't (or don't want to) modify the MCP server — a third-party server,
+another language, a binary you don't own — run the **proxy** in front of it. It
+forwards requests upstream and intercepts the SSE responses, persisting every
+event to a store and assigning its own event IDs. A client that disconnects
+reconnects with `Last-Event-ID`; the proxy replays the missed events from the
+store and continues live. The upstream needs **no** event store of its own — the
+proxy is the store.
+
+Point your clients at the proxy's address instead of the server's (e.g.
+`http://localhost:8000/mcp`) — nothing else on the client changes. Resumability
+rides the standard SSE `Last-Event-ID` header, so any MCP client that reconnects
+after a drop gets its missed events back automatically.
+
+```bash
+# Point at a running MCP server (no extra install needed — httpx & uvicorn
+# already ship with mcp):
+mcp-persist-proxy --upstream http://localhost:8001 \
+    --backend sqlite --url events.db --port 8000
+
+# …or start the server as a subprocess, wait for it, and proxy it:
+mcp-persist-proxy --backend redis --url redis://localhost:6379 \
+    --port 8000 --upstream-port 8001 -- uvicorn my_server:app --port 8001
+```
+
+Or embed it as an ASGI app:
+
+```python
+import uvicorn
+from mcp_persist import PersistenceProxy
+
+async def serve():
+    async with PersistenceProxy.create(
+        "http://localhost:8001", backend="sqlite", url="events.db", ttl=3600
+    ) as proxy:
+        await uvicorn.Server(uvicorn.Config(proxy, port=8000)).serve()
+```
+
+The store is resolved exactly like [`with_persistence`](#two-line-setup-for-fastmcp-with_persistence):
+a pre-built `store=`, `backend=`+`url=`, or `MCP_PERSIST_*` env vars. (`ttl` is
+how long stored events are kept, in seconds; it's available as `--ttl` on the CLI
+too.)
+
+**What it does and does not do.** It adds resumability against a *stable
+upstream* — a server that stays up while clients come and go. It survives client
+disconnects (flaky networks, mobile, tunnels), and, with a durable store like
+SQLite or Postgres, a restart of the proxy itself. Two things it can't do: it
+can't recover from the **upstream server** restarting — a restarted server is a
+clean break, so the proxy can replay what it already stored but can't carry the
+old connection over to the new server; and it can't replay an event that was
+never stored — if the client and the proxy both drop before an event is saved,
+it's gone. It never makes delivery less reliable than talking to the server
+directly.
+
 ## Backends
 
 | Backend | Extra | Use case |

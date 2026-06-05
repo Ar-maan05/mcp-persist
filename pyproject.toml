@@ -1,6 +1,6 @@
 [project]
 name = "mcp-persist"
-version = "1.6.0"
+version = "1.7.0"
 description = "Production-grade persistence backends for the MCP Python SDK"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,11 @@ dependencies = [
 redis = ["redis>=4.2.0"]
 sqlite = ["aiosqlite>=0.20.0"]
 postgres = ["asyncpg>=0.30.0"]
+# The mcp-persist-proxy CLI needs no extra: httpx and uvicorn are already
+# transitive dependencies of `mcp`.
+
+[project.scripts]
+mcp-persist-proxy = "mcp_persist._cli:main"
 
 [project.urls]
 Homepage = "https://github.com/Ar-maan05/mcp-persist"
