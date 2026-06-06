@@ -756,9 +756,9 @@ uv sync --all-extras --dev
 uv run pytest tests/
 ```
 
-The Redis tests use [fakeredis](https://github.com/cunla/fakeredis-py) and the
-SQLite tests use in-memory `aiosqlite`, so the default run needs no external
-servers. The Postgres tests require a real server and are skipped unless
+The suite is 300+ async tests covering all three backends. The Redis tests use
+[fakeredis](https://github.com/cunla/fakeredis-py) and the SQLite tests use
+in-memory `aiosqlite`, so the default run needs no external servers. The Postgres tests require a real server and are skipped unless
 `MCP_TEST_POSTGRES_URL` is set; to run them and the Redis suite against real
 backends:
 

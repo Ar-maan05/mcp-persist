@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`examples/resume_demo.py`** — a self-contained, recordable terminal demo of resumability in a single command (`python examples/resume_demo.py`). It runs a real FastMCP + `SQLiteEventStore` server in a background thread, starts a streaming tool call, yanks the connection mid-stream to simulate a client/network crash, then reconnects with `Last-Event-ID` and watches the server replay exactly the missed events before delivering the tool's result. Nothing is mocked — events round-trip through SQLite (`resume_demo.db`) and the client speaks the Streamable HTTP wire protocol, parsing the SSE stream with mcp-persist's own `SSEParser`. Needs only the `[sqlite]` extra (uvicorn + httpx already ship with `mcp`).
+
+### Changed
+- README now reflects the current test suite size (300+ async tests across all three backends), replacing the stale earlier count.
+
 ## [1.7.0] - 2026-06-05
 
 ### Added
