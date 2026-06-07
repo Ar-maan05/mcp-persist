@@ -1,6 +1,6 @@
 # Deploying mcp-persist in production
 
-This guide covers what it takes to run an `mcp-persist` backend in production —
+This guide covers what it takes to run an `mcp-persist` backend in production:
 the gap between "it runs" and "it survives." It assumes you have already
 [chosen a backend](../README.md#choosing-a-backend) and seen the
 [quickstart](../README.md#quickstart). For runnable references, see
@@ -8,7 +8,7 @@ the gap between "it runs" and "it survives." It assumes you have already
 
 Topics: [scope](#scope-what-resumability-does-and-does-not-cover) ·
 [wiring](#1-wiring-it-into-your-app) ·
-[reclaiming space](#2-reclaiming-space--schedule-purge_expired) ·
+[reclaiming space](#2-reclaiming-space-schedule-purge_expired) ·
 [schema & permissions](#3-schema--database-permissions) ·
 [availability & failure modes](#4-high-availability--failure-modes) ·
 [security](#5-security) · [scaling](#6-scaling-workers--nodes) ·
@@ -39,13 +39,13 @@ It does **not** persist:
 
 The practical rule: resumability makes a **dropped connection** recoverable, not
 a **lost computation**. Design long-running tools to be re-drivable by the client,
-and treat the store as delivery durability for messages already sent — not as a
+and treat the store as delivery durability for messages already sent, not as a
 checkpoint of server-side work.
 
 ## 1. Wiring it into your app
 
 Create the store **once** at startup and share it across requests. The store
-wraps a connection/pool that **you own** — `mcp-persist` never opens or closes
+wraps a connection/pool that **you own**: `mcp-persist` never opens or closes
 it for you, so create it on startup and close it on shutdown. The canonical
 pattern is an ASGI lifespan (Starlette/FastAPI shown; condensed from the
 examples):
@@ -82,7 +82,7 @@ async def lifespan(app):
 **Size `ttl` to your sessions.** Set `ttl` to **at least 2×
 `session_idle_timeout`** so a client that idles right up to the timeout can
 still resume. Leaving `ttl=None` logs a warning and lets events accumulate
-forever — treat that as a misconfiguration in production.
+forever; treat that as a misconfiguration in production.
 
 **Picking the backend from config.** To choose the backend at deploy time
 without branching in code, build the store from the environment:
@@ -102,20 +102,20 @@ async with event_store_from_env() as store:   # opens + closes the connection
 It reads `MCP_PERSIST_BACKEND` (`sqlite` / `redis` / `postgres`) and
 `MCP_PERSIST_URL`, plus optional `MCP_PERSIST_TTL`, `MCP_PERSIST_TABLE_NAME`
 (SQLite/Postgres), and `MCP_PERSIST_KEY_PREFIX` / `MCP_PERSIST_MAX_STREAM_LENGTH`
-(Redis), and returns that backend's `create()` context manager — so the
+(Redis), and returns that backend's `create()` context manager, so the
 connection is opened on entry and closed on exit, exactly like the lifespan
 above.
 
 ### Proxy mode: resumability without modifying the server
 
-When you can't wire a store into the server itself — a third-party server, a
-binary you don't own, one written in another language — run the
+When you can't wire a store into the server itself, such as a third-party server, a
+binary you don't own, one written in another language, run the
 [`PersistenceProxy`](../README.md#resumability-without-touching-the-server-persistenceproxy)
 in front of it instead. It forwards requests upstream, intercepts the SSE
 responses, stores every event under its **own** monotonic IDs, and replays them
 when a client reconnects with `Last-Event-ID`. The upstream needs no event store
 of its own; the proxy is the store. Point your clients at the proxy instead of
-the server — nothing else on the client changes.
+the server; nothing else on the client changes.
 
 ```bash
 # in front of a running server
@@ -123,7 +123,7 @@ mcp-persist-proxy --upstream http://localhost:8001 \
     --backend postgres --url postgresql://localhost/mydb --ttl 3600 --port 8000
 ```
 
-Everything else in this guide applies to the proxy's store unchanged — the same
+Everything else in this guide applies to the proxy's store unchanged: the same
 backend choice, `ttl` sizing (**at least 2× the upstream's `session_idle_timeout`**),
 `purge_expired()` scheduling, schema/permissions, and observability. Run it with
 this in mind:
@@ -142,19 +142,19 @@ this in mind:
   can replay what it already stored but cannot bridge the old stream to the
   restarted server. This is the same boundary as
   [scope](#scope-what-resumability-does-and-does-not-cover), one hop out.
-- **No extra dependency** — `httpx` and `uvicorn` already ship transitively with
+- **No extra dependency**: `httpx` and `uvicorn` already ship transitively with
   `mcp`.
 
-## 2. Reclaiming space — schedule `purge_expired()`
+## 2. Reclaiming space: schedule `purge_expired()`
 
 | Backend | Expiry | Your job |
 |---|---|---|
-| Redis | Native key TTL — Redis deletes expired keys automatically | Nothing |
-| SQLite | None — `ttl` only **hides** expired events on replay | Call `purge_expired()` on a schedule |
-| Postgres | None — same as SQLite | Call `purge_expired()` on a schedule |
+| Redis | Native key TTL: Redis deletes expired keys automatically | Nothing |
+| SQLite | None: `ttl` only **hides** expired events on replay | Call `purge_expired()` on a schedule |
+| Postgres | None: same as SQLite | Call `purge_expired()` on a schedule |
 
 For SQLite and Postgres, **if you never call `purge_expired()`, the table grows
-without bound** — expired rows are skipped on replay but never deleted. The
+without bound**: expired rows are skipped on replay but never deleted. The
 shipped `PurgeScheduler` runs it on an interval for you; start it inside your
 lifespan as an async context manager and it stops on exit:
 
@@ -188,9 +188,9 @@ left for the next run. `batch_size=None` (the default) keeps the single-statemen
 
 Reclaiming **disk**, not just rows:
 
-- **SQLite** — `DELETE` frees pages for reuse but does not shrink the file. If
+- **SQLite**: `DELETE` frees pages for reuse but does not shrink the file. If
   disk footprint matters, run `VACUUM` during a quiet window.
-- **Postgres** — `DELETE` leaves dead tuples that autovacuum reclaims over time;
+- **Postgres**: `DELETE` leaves dead tuples that autovacuum reclaims over time;
   for high churn, ensure autovacuum is tuned or schedule the purge with
   [`pg_cron`](https://github.com/citusdata/pg_cron) so cleanup runs inside the
   database with no external scheduler.
@@ -240,7 +240,7 @@ when a backend call raises (e.g. the database is unreachable):
 - **`store_event` failure** is caught by the SDK's message router and logged as
   `Error in message router`. The server process keeps running and other sessions
   are unaffected, **but that session's outbound message routing stops** until the
-  client reconnects — in-flight responses on that session may not be delivered.
+  client reconnects: in-flight responses on that session may not be delivered.
 - **`replay_events_after` failure** is caught and logged as `Error in replay
   sender`. The resume degrades (the client gets no replayed events) but the
   server keeps running.
@@ -259,10 +259,10 @@ resumes, not as a clean error.
   append `?sslmode=require` (or `verify-full`) to the DSN.
 - **Authenticate.** Redis `AUTH` via URL userinfo
   (`redis://:password@host`); a dedicated, least-privilege Postgres role.
-- **Network-isolate** the backend (private subnet / security group) — it holds
+- **Network-isolate** the backend (private subnet / security group): it holds
   serialized request/response payloads.
 - **Isolate tenants** with a distinct `key_prefix` (Redis) or `table_name`
-  (SQLite/Postgres) per logical server — see
+  (SQLite/Postgres) per logical server; see
   [multi-tenant deployments](../README.md#multi-tenant-deployments).
 
 ## 6. Scaling: workers & nodes
@@ -286,13 +286,13 @@ A few common shapes get this wrong:
   greater than 1 needs Redis or Postgres as a **shared** store. SQLite is for a
   genuine single process (single-node, edge, local dev).
 - **Sticky sessions are a fragile substitute.** Pinning a client to one pod can
-  paper over the above until that pod is replaced (deploy, scale-down, crash) —
+  paper over the above until that pod is replaced (deploy, scale-down, crash),
   exactly when resumability is supposed to help. Prefer a shared store over
   relying on stickiness.
 - **Serverless / read-only / ephemeral filesystems → Redis or Postgres only.**
   On a read-only or ephemeral disk (many serverless and container platforms),
   SQLite either fails to open the file or "succeeds" against scratch space that
-  vanishes on the next invocation — durability you don't actually have. Don't
+  vanishes on the next invocation: durability you don't actually have. Don't
   mount SQLite on `/tmp` and assume it survives. Use a managed Redis/Postgres.
 
 ### Redis monotonic-counter throughput ceiling
@@ -302,7 +302,7 @@ next event ID. That is what keeps IDs globally monotonic across workers, but it
 also means **all writes serialize through one key**. On a single Redis it is very
 fast and rarely the bottleneck; on **Redis Cluster** that key lives on one node
 and one shard, so it sets the ceiling on aggregate write throughput regardless of
-cluster size. For the vast majority of MCP servers this is a non-issue — but if
+cluster size. For the vast majority of MCP servers this is a non-issue, but if
 you are pushing very high concurrent write rates, benchmark at *your* concurrency
 (`benchmarks/benchmark.py --concurrency 500`) to find where it bends, and treat
 the counter shard as the scaling limit rather than expecting it to fan out.
@@ -311,8 +311,8 @@ the counter shard as the scaling limit rather than expecting it to fan out.
 
 `RedisEventStore` issues **two round-trips per `store_event`** (an atomic `INCR`
 for the ID, then a pipeline for the event hash and stream index), and the SDK
-calls `store_event` for every outbound message. Under high SSE fan-out — many
-concurrent streams — those connections are drawn from the pool of the
+calls `store_event` for every outbound message. Under high SSE fan-out (many
+concurrent streams), those connections are drawn from the pool of the
 `redis.asyncio` client **you** construct and pass in.
 
 That pool matters because of a difference from `asyncpg`: `redis.asyncio.from_url(...)`
@@ -359,7 +359,7 @@ payloads make a single chunk too big to hold in memory.
 ### Subscribers and connection pools (`subscribe()`)
 
 If you use the real-time [`subscribe()`](#9-real-time-streaming-with-subscribe)
-API, budget pool capacity for it on **both** backends — each active subscriber
+API, budget pool capacity for it on **both** backends; each active subscriber
 holds a connection for the lifetime of the subscription:
 
 - **Redis**: `subscribe()` uses `client.pubsub()`, which draws a dedicated
@@ -390,7 +390,7 @@ While individual event hashes and stream ZSETs expire automatically when `ttl` i
 **Strategies to manage memory and cardinality:**
 1. **Always configure a TTL:** Set a reasonable `ttl` on `RedisEventStore` so inactive streams and their events are automatically evicted by Redis.
 2. **Use `volatile-lru` or `volatile-ttl` eviction policy:** Configure Redis with an eviction policy that only targets keys with an expiration time set. **Do not use `allkeys-lru` or `allkeys-random`**, as these can evict the global `{prefix}counter` key (which has no TTL). If the counter key is evicted, the ID sequence resets, breaking stream resumability guarantees.
-3. **Configure `max_stream_length`:** Set `max_stream_length` to cap the maximum number of event IDs stored in each stream's ZSET, preventing individual busy streams from growing too large. For high-churn deployments — lots of short-lived, one-off client streams — a modest cap such as `max_stream_length=1000` bounds each stream's index while still covering any realistic resume backlog (a client more than that many events behind only replays the most recent `max_stream_length`). Pair it with a `ttl` so the trimmed events' payload hashes expire rather than lingering:
+3. **Configure `max_stream_length`:** Set `max_stream_length` to cap the maximum number of event IDs stored in each stream's ZSET, preventing individual busy streams from growing too large. For high-churn deployments (lots of short-lived, one-off client streams), a modest cap such as `max_stream_length=1000` bounds each stream's index while still covering any realistic resume backlog (a client more than that many events behind only replays the most recent `max_stream_length`). Pair it with a `ttl` so the trimmed events' payload hashes expire rather than lingering:
 
    ```python
    RedisEventStore(redis_client, ttl=3600, max_stream_length=1000)
@@ -414,7 +414,7 @@ While individual event hashes and stream ZSETs expire automatically when `ttl` i
   logging.getLogger("mcp_persist.redis").setLevel(logging.INFO)
   logging.getLogger("mcp_persist.sqlite").setLevel(logging.DEBUG)
   ```
-- **Metrics hooks:** For timing and throughput data rather than logs, pass a `MetricsCollector` to any store via `metrics=`. Its `on_store_event(stream_id, event_id, duration_ms)`, `on_replay(stream_id, events_replayed, duration_ms)`, and `on_error(operation, error)` hooks let you feed per-operation latency and counts into Prometheus, Datadog, etc. The default (no collector) takes a zero-overhead fast path. A misbehaving collector that raises is logged and ignored — it can never fail a store or replay. `LoggingMetricsCollector` ships built in for a quick `DEBUG`-level view; see [`metrics.py`](../src/mcp_persist/metrics.py).
+- **Metrics hooks:** For timing and throughput data rather than logs, pass a `MetricsCollector` to any store via `metrics=`. Its `on_store_event(stream_id, event_id, duration_ms)`, `on_replay(stream_id, events_replayed, duration_ms)`, and `on_error(operation, error)` hooks let you feed per-operation latency and counts into Prometheus, Datadog, etc. The default (no collector) takes a zero-overhead fast path. A misbehaving collector that raises is logged and ignored: it can never fail a store or replay. `LoggingMetricsCollector` ships built in for a quick `DEBUG`-level view; see [`metrics.py`](../src/mcp_persist/metrics.py).
 - **Construction warning alerts:** A `WARNING` log emitted at construction (e.g. `SQLiteEventStore created with ttl=None`) means events will accumulate indefinitely. Set up alert rules to detect this warning in production, as it signals a deploy-time misconfiguration.
 - **Tolerated Catalog Race events:** At `DEBUG` level, the engines log tolerated catalog creation races (e.g. `Tolerating concurrent DDL race on...`) which are helpful to ignore/diagnose during scale-outs.
 - **Readiness / liveness probes:** Each store exposes `await store.ping()`
@@ -424,7 +424,7 @@ While individual event hashes and stream ZSETs expire automatically when `ttl` i
   "not ready" and stop routing to a pod whose store is down.
 - **Replay gap warnings:** `replay_events_after` logs a `WARNING` containing
   `Replay gap on stream` when a client's `Last-Event-ID` is still valid but
-  events after it have expired/are missing and cannot be replayed — an
+  events after it have expired/are missing and cannot be replayed, an
   unrecoverable gap the client would otherwise never learn about. A steady stream
   of these means your `ttl` is too short for how long clients stay disconnected;
   raise `ttl` (toward ≥ 2× `session_idle_timeout`) or investigate why clients
@@ -436,7 +436,7 @@ While individual event hashes and stream ZSETs expire automatically when `ttl` i
 
 ## 8. Migrating between backends
 
-`migrate(source, dest)` copies events from one store to another — e.g. SQLite →
+`migrate(source, dest)` copies events from one store to another, e.g. SQLite →
 Postgres as a single node grows into a cluster, or Redis → Postgres for
 durability. It streams events oldest-first and re-stores them on the
 destination, preserving per-stream ordering. `list_streams()` (available on every
@@ -497,19 +497,19 @@ no extra round-trip and `subscribe()` raises. SQLite has no native push, so its
 `subscribe()` polls the table every `poll_interval` seconds (default `0.5`) and
 the flag only gates the method.
 
-**It is a best-effort, forward-only feed — not a durability mechanism:**
+**It is a best-effort, forward-only feed, not a durability mechanism:**
 
 - Only events written **after** the subscription registers are delivered. Use
   `replay_events_after` to catch up on history.
 - Redis pub/sub and Postgres `NOTIFY` are **at-most-once**: anything emitted
   while no subscriber is connected, or during a reconnect, is dropped. The
   notification publish is best-effort and a failure is logged without failing
-  the write. **`replay_events_after` remains the durable, gap-free path** — a
+  the write. **`replay_events_after` remains the durable, gap-free path**: a
   robust consumer pairs `subscribe()` for low latency with a periodic replay (or
   a replay on reconnect) for completeness.
 - **A dropped connection may not be surfaced as an error.** This is most acute
   on **Postgres**: the subscriber waits on a local notification queue, so if the
-  connection dies — e.g. the server restarts — no further notifications arrive
+  connection dies (e.g. the server restarts), no further notifications arrive
   and the `async for` simply goes quiet rather than raising. (Redis pub/sub
   reads from the socket and usually *raises* on a broken link, ending the
   generator, but a half-open connection can still stall.) Do not treat silence
@@ -530,7 +530,7 @@ For the connection-pool impact of running many subscribers, see
 ## 10. Large payloads (`compression`)
 
 If your MCP messages carry large tool results or big JSON-RPC bodies, the
-serialized payload dominates storage and — on Redis — memory. Pass
+serialized payload dominates storage and (on Redis) memory. Pass
 `compression="gzip"` to gzip-compress payloads above a size threshold before they
 are written:
 
@@ -543,7 +543,7 @@ store = PostgresEventStore(pool, ttl=3600, compression="gzip", compress_min_byte
   outweigh the saving. Compression is also discarded when it does not actually
   shrink a payload, so an incompressible body is never stored *larger*.
 - **Transparent + backward compatible.** The stored form is marker-prefixed, and
-  decompression on read is automatic and **independent of the setting** — a store
+  decompression on read is automatic and **independent of the setting**: a store
   with compression off still reads compressed payloads written by another store.
   So you can enable it on a rolling deploy (old and new payloads coexist) and
   `migrate()` across stores with mismatched settings. Existing data is untouched;
@@ -555,7 +555,7 @@ store = PostgresEventStore(pool, ttl=3600, compression="gzip", compress_min_byte
 
 ## 11. Readiness probes (`ping`)
 
-Each store exposes `await store.ping()` for liveness/readiness checks — Redis
+Each store exposes `await store.ping()` for liveness/readiness checks: Redis
 `PING`, Postgres/SQLite `SELECT 1`. It returns `True` when the backend is
 reachable and lets the driver error propagate otherwise, so a health endpoint can
 report "not ready" when the store's dependency is down:
@@ -576,7 +576,7 @@ rather than letting it accept traffic it cannot serve.
 
 ## 12. Write-behind commits (SQLite)
 
-By default `SQLiteEventStore` commits on every `store_event` — one `fsync` per
+By default `SQLiteEventStore` commits on every `store_event`: one `fsync` per
 event, which is what makes a single-node deployment durable across restarts but
 also caps write throughput. If you write events faster than the disk can sync
 them and can tolerate a small, bounded loss window on a crash, **write-behind**
@@ -593,15 +593,15 @@ async with SQLiteEventStore.create(
 
 - **What you gain / what you risk.** One `fsync` per interval instead of per
   event. Buffered events are **fully visible to `replay_events_after` and
-  `subscribe` on this store immediately** — they live in the connection's open
-  transaction — so resumability within a running process is unaffected. The
+  `subscribe` on this store immediately** (they live in the connection's open
+  transaction), so resumability within a running process is unaffected. The
   trade-off is durability: a process crash (or `kill -9`) rolls back the
   uncommitted transaction, losing up to one `commit_interval` of events. Use it
   only where a dropped tail of events on a hard crash is acceptable.
 - **Bound the window two ways.** `commit_interval` bounds loss by *time*;
   `commit_max_pending` bounds it by *count* (and keeps the open transaction from
   growing without limit under a burst) by committing inline once that many events
-  are buffered. Use either or both — whichever limit is hit first commits.
+  are buffered. Use either or both: whichever limit is hit first commits.
   `commit_max_pending` alone gives pure count-based group commit with no timer.
 - **You must close the store.** This is the one footgun: the final interval's
   buffered events are only committed on close. Use `SQLiteEventStore.create()` or
@@ -610,7 +610,7 @@ async with SQLiteEventStore.create(
 - **Single-writer only.** Write-behind holds an open write transaction between
   commits, so a *second* process writing to the same file is blocked until the
   next flush. That's consistent with SQLite already being single-writer
-  (multi-process deployments belong on Redis/Postgres — see
+  (multi-process deployments belong on Redis/Postgres; see
   [§6](#6-scaling-workers--nodes)); just don't reach for write-behind to paper
   over a topology SQLite can't serve.
 - **Off by default.** Leave `commit_interval` / `commit_max_pending` unset for the
@@ -619,7 +619,7 @@ async with SQLiteEventStore.create(
 ## Production checklist
 
 - [ ] `ttl` set to **≥ 2× `session_idle_timeout`** (never `None`)
-- [ ] `purge_expired()` scheduled (SQLite/Postgres) — e.g. via `PurgeScheduler`,
+- [ ] `purge_expired()` scheduled (SQLite/Postgres), e.g. via `PurgeScheduler`,
       with `batch_size` under high churn; `VACUUM`/autovacuum considered
 - [ ] Backend is HA / managed; connection + command timeouts set; the two SDK
       error logs alerted on; `ping()` wired into the readiness probe

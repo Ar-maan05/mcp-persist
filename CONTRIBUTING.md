@@ -13,7 +13,7 @@ package with all backend extras and all dev tooling:
 uv sync --all-extras --dev
 ```
 
-That's everything — no separate venv or `pip install` step needed. Python 3.10+
+That's everything: no separate venv or `pip install` step needed. Python 3.10+
 is required.
 
 ## Running the checks
@@ -45,13 +45,13 @@ MCP_TEST_REDIS_URL=redis://localhost:6379/0 uv run pytest tests/
 ```
 
 The suite calls `FLUSHDB` around every test, so it **refuses to run against a
-non-empty database** — always point `MCP_TEST_REDIS_URL` at an empty, throwaway
+non-empty database**: always point `MCP_TEST_REDIS_URL` at an empty, throwaway
 DB, never a real one. CI runs the suite both ways automatically.
 
 ## Testing against a real Postgres
 
 There is no fake for Postgres, so the `PostgresEventStore` tests are **skipped**
-unless `MCP_TEST_POSTGRES_URL` is set — local development without Postgres is
+unless `MCP_TEST_POSTGRES_URL` is set; local development without Postgres is
 unaffected. To run them, point it at a throwaway database:
 
 ```bash
@@ -61,7 +61,7 @@ MCP_TEST_POSTGRES_URL=postgresql://postgres@localhost:5432/postgres uv run pytes
 ```
 
 Each Postgres test drops and recreates its own table, so it doesn't wipe
-unrelated data — but still use a throwaway database. CI provides a Postgres
+unrelated data, but still use a throwaway database. CI provides a Postgres
 service container and sets this automatically.
 
 When adding behavior to a backend, please cover it with a test. The Redis tests
@@ -72,5 +72,5 @@ should pass under both `fakeredis` and a real server.
 1. Open a pull request against `main`.
 2. CI must be green (lint, format, types, and tests across all four Python
    versions, against fakeredis plus a real Redis and Postgres) before it can merge.
-3. A maintainer will review. Keep PRs focused — one logical change per PR makes
+3. A maintainer will review. Keep PRs focused: one logical change per PR makes
    review faster.

@@ -1,6 +1,6 @@
 # Examples
 
-Minimal, runnable MCP servers showing how to add `mcp-persist` resumability — the
+Minimal, runnable MCP servers showing how to add `mcp-persist` resumability: the
 `with_persistence()` plugin one-liner, plus each backend wired manually into a
 real [`StreamableHTTPSessionManager`](https://github.com/modelcontextprotocol/python-sdk).
 
@@ -10,7 +10,7 @@ same note-taking API; the plugin server is a minimal echo server.
 ## Prerequisites
 
 ```bash
-# FastMCP plugin example (SQLite) — uvicorn ships with mcp, so one install is enough
+# FastMCP plugin example (SQLite): uvicorn ships with mcp, so one install is enough
 pip install "mcp-persist[sqlite]"
 
 # SQLite example
@@ -40,7 +40,7 @@ and `MCP_TEST_POSTGRES_URL` (see [`compose.yaml`](../compose.yaml)).
 ## fastmcp_plugin_server.py
 
 The simplest entry point: a FastMCP server made resumable with a single
-`with_persistence()` call — no manual store, manager, or lifespan wiring. Uses
+`with_persistence()` call: no manual store, manager, or lifespan wiring. Uses
 SQLite (persists to `echo_events.db`) and exposes `shout` / `slow_echo` tools.
 
 ```bash
@@ -50,7 +50,7 @@ python examples/fastmcp_plugin_server.py
 ## sqlite_server.py
 
 Single-process durability with no external services. Events are persisted to
-a local `notes.db` file — the server can be restarted without losing SSE
+a local `notes.db` file: the server can be restarted without losing SSE
 stream state.
 
 ```bash

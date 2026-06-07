@@ -5,18 +5,18 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/mcp-persist.svg)](https://pypi.org/project/mcp-persist/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-When an MCP client reconnects, the server has to replay the events it missed — and with only the SDK's in-memory `EventStore`, that replay is impossible: the session lived in one process's memory, so a restart or a reconnect to a different worker loses it. **`mcp-persist` adds drop-in durable `EventStore` backends for SQLite, Redis, and PostgreSQL** that survive process restarts and scale across multi-worker deployments, keeping SSE stream resumability intact.
+When an MCP client reconnects, the server has to replay the events it missed, and with only the SDK's in-memory `EventStore`, that replay is impossible: the session lived in one process's memory, so a restart or a reconnect to a different worker loses it. **`mcp-persist` adds drop-in durable `EventStore` backends for SQLite, Redis, and PostgreSQL** that survive process restarts and scale across multi-worker deployments, keeping SSE stream resumability intact.
 
 ## Two-line setup for FastMCP: `with_persistence()`
 
 The fastest way to add resumability to a FastMCP server. Wiring it by hand means
 an event store, a `StreamableHTTPSessionManager`, a Starlette lifespan to open and
-close them, and a `Mount`. `with_persistence()` collapses all of it to two lines —
+close them, and a `Mount`. `with_persistence()` collapses all of it to two lines:
 pass your `FastMCP` instance and get back a runnable Starlette ASGI app with the
 store and session manager already wired in, opened on startup and closed on
 shutdown.
 
-**Before** — the manual wiring:
+**Before** (the manual wiring):
 
 ```python
 import contextlib
@@ -54,7 +54,7 @@ app = Starlette(lifespan=lifespan, routes=[Mount("/mcp", app=handle_mcp)])
 uvicorn.run(app, host="127.0.0.1", port=8000)
 ```
 
-**After** — `with_persistence()`:
+**After** (`with_persistence()`):
 
 ```python
 import uvicorn
@@ -71,24 +71,24 @@ Switching backend is a one-word change (`backend="redis"` / `"postgres"` with
 the matching `url`). There are three ways to supply the store, resolved in order:
 
 ```python
-# A — config kwargs; the app builds the store and owns its lifecycle:
+# A: config kwargs; the app builds the store and owns its lifecycle:
 app = with_persistence(mcp, backend="redis", url="redis://localhost:6379", ttl=3600)
 
-# B — bring your own store; you own its lifecycle (the app does NOT close it):
+# B: bring your own store; you own its lifecycle (the app does NOT close it):
 async with SQLiteEventStore.create("events.db", ttl=3600) as store:
     app = with_persistence(mcp, store=store)
     await uvicorn.Server(uvicorn.Config(app, port=8000)).serve()
 
-# C — configure from the environment (MCP_PERSIST_BACKEND / _URL / _TTL / …):
+# C: configure from the environment (MCP_PERSIST_BACKEND / _URL / _TTL / …):
 app = with_persistence(mcp)
 ```
 
 The live store is exposed on `app.state.event_store`, so you can run a
 [`PurgeScheduler`](#scheduled-cleanup-purgescheduler) alongside the server. No
-extra dependency is required — `starlette` and the session manager ship with
+extra dependency is required: `starlette` and the session manager ship with
 `mcp`. See [`examples/fastmcp_plugin_server.py`](examples/fastmcp_plugin_server.py).
 
-Under the hood — whichever setup you use — it's the same layering: a
+Under the hood, whichever setup you use, it's the same layering: a
 `StreamableHTTPSessionManager` backed by a durable `EventStore` you choose.
 
 ```
@@ -106,21 +106,21 @@ EventStore
 
 ## Resumability without touching the server: `PersistenceProxy`
 
-When you can't (or don't want to) modify the MCP server — a third-party server,
-another language, a binary you don't own — run the **proxy** in front of it. It
+When you can't (or don't want to) modify the MCP server, such as a third-party server,
+another language, or a binary you don't own, run the **proxy** in front of it. It
 forwards requests upstream and intercepts the SSE responses, persisting every
 event to a store and assigning its own event IDs. A client that disconnects
 reconnects with `Last-Event-ID`; the proxy replays the missed events from the
-store and continues live. The upstream needs **no** event store of its own — the
+store and continues live. The upstream needs **no** event store of its own: the
 proxy is the store.
 
 Point your clients at the proxy's address instead of the server's (e.g.
-`http://localhost:8000/mcp`) — nothing else on the client changes. Resumability
+`http://localhost:8000/mcp`); nothing else on the client changes. Resumability
 rides the standard SSE `Last-Event-ID` header, so any MCP client that reconnects
 after a drop gets its missed events back automatically.
 
 ```bash
-# Point at a running MCP server (no extra install needed — httpx & uvicorn
+# Point at a running MCP server (no extra install needed: httpx & uvicorn
 # already ship with mcp):
 mcp-persist-proxy --upstream http://localhost:8001 \
     --backend sqlite --url events.db --port 8000
@@ -149,13 +149,13 @@ how long stored events are kept, in seconds; it's available as `--ttl` on the CL
 too.)
 
 **What it does and does not do.** It adds resumability against a *stable
-upstream* — a server that stays up while clients come and go. It survives client
+upstream*: a server that stays up while clients come and go. It survives client
 disconnects (flaky networks, mobile, tunnels), and, with a durable store like
 SQLite or Postgres, a restart of the proxy itself. Two things it can't do: it
-can't recover from the **upstream server** restarting — a restarted server is a
+can't recover from the **upstream server** restarting: a restarted server is a
 clean break, so the proxy can replay what it already stored but can't carry the
 old connection over to the new server; and it can't replay an event that was
-never stored — if the client and the proxy both drop before an event is saved,
+never stored: if the client and the proxy both drop before an event is saved,
 it's gone. It never makes delivery less reliable than talking to the server
 directly.
 
@@ -180,8 +180,8 @@ Start from how you deploy:
 
 > **Any replica count > 1 needs a *shared* store (Redis/Postgres), not SQLite.**
 > A local SQLite file is visible only to the process that opened it, so behind a
-> load balancer — or during a rolling deploy, when a reconnecting client lands on
-> a different pod — that pod won't have the client's events and the resume
+> load balancer (or during a rolling deploy, when a reconnecting client lands on
+> a different pod) that pod won't have the client's events and the resume
 > silently returns nothing. SQLite is for a genuine single process. See
 > [deployment topologies](docs/production.md#deployment-topologies-rolling-deploys-load-balancers-serverless).
 
@@ -192,7 +192,7 @@ How they compare:
 | External service | None | Redis | PostgreSQL |
 | Multi-process / multi-worker | No (single writer) | Yes | Yes |
 | Durable across restarts | Yes (on disk) | Depends on Redis persistence config | Yes |
-| Automatic expiry | No — call `purge_expired()` | Yes (native key TTL) | No — call `purge_expired()` |
+| Automatic expiry | No (call `purge_expired()`) | Yes (native key TTL) | No (call `purge_expired()`) |
 | Best fit | Single node, edge, local dev | Load-balanced / ephemeral fan-out | Teams already running Postgres |
 
 See [Benchmarks](#benchmarks) for latency and throughput characteristics.
@@ -215,7 +215,7 @@ pip install "mcp-persist[sqlite,redis,postgres]"
 
 ## Quickstart
 
-On FastMCP, one line wires a durable store into a runnable app — see
+On FastMCP, one line wires a durable store into a runnable app; see
 [Two-line setup](#two-line-setup-for-fastmcp-with_persistence) for the full
 before/after:
 
@@ -231,7 +231,7 @@ app = with_persistence(mcp, backend="sqlite", url="events.db", ttl=3600)
 ```
 
 Not on FastMCP, or want to own the wiring yourself? Build a store and pass it to
-`StreamableHTTPSessionManager` directly — see
+`StreamableHTTPSessionManager` directly; see
 [Manual wiring](#manual-wiring-advanced-or-non-fastmcp) below.
 
 ## Manual wiring (advanced or non-FastMCP)
@@ -301,11 +301,11 @@ session_manager = StreamableHTTPSessionManager(
 ## SQLiteEventStore
 
 Stores MCP SSE events in a SQLite database so a single-process server can resume
-interrupted streams across restarts and redeploys — without running Redis or any
+interrupted streams across restarts and redeploys, without running Redis or any
 other external service. Ideal for single-node deployments, local development, and
 edge/embedded hosts.
 
-> For load-balanced or multi-worker deployments, use `RedisEventStore` instead —
+> For load-balanced or multi-worker deployments, use `RedisEventStore` instead:
 > SQLite is single-writer and not designed for shared multi-process access.
 > Multiple processes writing the same database file contend on SQLite's file
 > lock and will surface `SQLITE_BUSY` / "database is locked" errors.
@@ -315,19 +315,19 @@ edge/embedded hosts.
 One row per event:
 
 ```
-{table}.event_id    — INTEGER PRIMARY KEY AUTOINCREMENT, monotonic event IDs (never reused)
-{table}.stream_id   — TEXT, the stream the event belongs to
-{table}.payload     — TEXT, serialized JSONRPCMessage ("" for priming events)
-{table}.created_at  — REAL, unix timestamp used for TTL expiry
+{table}.event_id    - INTEGER PRIMARY KEY AUTOINCREMENT, monotonic event IDs (never reused)
+{table}.stream_id   - TEXT, the stream the event belongs to
+{table}.payload     - TEXT, serialized JSONRPCMessage ("" for priming events)
+{table}.created_at  - REAL, unix timestamp used for TTL expiry
 ```
 
-- **Monotonic IDs** via `AUTOINCREMENT` — strictly increasing, never reused, same guarantee as Redis `INCR`
-- **Indexed replay** — `WHERE stream_id = ? AND event_id > ?` over a `(stream_id, event_id)` index
-- **Durable across restarts** — WAL journaling; events survive process exit
-- **TTL support** — expired events are skipped on replay and removed by `purge_expired()`
+- **Monotonic IDs** via `AUTOINCREMENT`: strictly increasing, never reused, same guarantee as Redis `INCR`
+- **Indexed replay**: `WHERE stream_id = ? AND event_id > ?` over a `(stream_id, event_id)` index
+- **Durable across restarts**: WAL journaling; events survive process exit
+- **TTL support**: expired events are skipped on replay and removed by `purge_expired()`
 - **Multi-tenant isolation** via configurable `table_name`
-- **Priming event handling** — sentinel empty-string payloads are stored but never replayed
-- **Optional write-behind** — `commit_interval` batches commits for higher write throughput at a bounded durability window (see below)
+- **Priming event handling**: sentinel empty-string payloads are stored but never replayed
+- **Optional write-behind**: `commit_interval` batches commits for higher write throughput at a bounded durability window (see below)
 
 ### Configuration
 
@@ -348,7 +348,7 @@ replay, but to reclaim disk space call `await store.purge_expired()` periodicall
 
 ### Write-behind commits
 
-By default every `store_event` commits (one `fsync` each) — durable, but the
+By default every `store_event` commits (one `fsync` each): durable, but the
 throughput ceiling. Set `commit_interval` (seconds) to commit on a background
 timer instead, and optionally `commit_max_pending` to also commit once that many
 events are buffered:
@@ -360,7 +360,7 @@ async with SQLiteEventStore.create("events.db", ttl=3600, commit_interval=1.0) a
 
 Buffered events are still immediately visible to replay/subscribe on the same
 store; the trade-off is that a crash loses up to one `commit_interval` of
-uncommitted events. **You must close the store** so the last batch is flushed —
+uncommitted events. **You must close the store** so the last batch is flushed:
 `create()` and `async with store:` do this for you, or call `await store.aclose()`
 on shutdown. Off by default. See
 [docs/production.md](docs/production.md#12-write-behind-commits-sqlite) for the
@@ -377,24 +377,24 @@ store_b = SQLiteEventStore(conn, table_name="server_b")
 
 ## RedisEventStore
 
-Stores MCP SSE events in Redis so clients can resume interrupted streams — even across worker restarts or load-balanced deployments.
+Stores MCP SSE events in Redis so clients can resume interrupted streams, even across worker restarts or load-balanced deployments.
 
 ### How it works
 
 Redis data layout:
 
 ```
-{prefix}counter                 — atomic INCR source for monotonic event IDs (never expires)
-{prefix}event:{event_id}        — HASH: stream_id + serialized payload
-{prefix}stream:{stream_id}      — ZSET: event IDs sorted by score for O(log N) range queries
+{prefix}counter                 - atomic INCR source for monotonic event IDs (never expires)
+{prefix}event:{event_id}        - HASH: stream_id + serialized payload
+{prefix}stream:{stream_id}      - ZSET: event IDs sorted by score for O(log N) range queries
 ```
 
-- **Atomic monotonic IDs** via Redis `INCR` — collision-free across concurrent workers. The counter is never given a TTL (even when `ttl` is set), so IDs stay monotonic across idle periods; only the event and stream keys expire.
-- **Replay is O(log N + M)** — one `ZRANGEBYSCORE` range-scans the stream's sorted set, then each of the M matched events is fetched with its own `HGET`. That's one network round-trip per replayed event: fine for typical resume sizes, worth knowing for very long streams.
-- **TTL support** — automatic expiry of event/stream keys to prevent unbounded memory growth
-- **Atomic writes** — each event's hash, sorted-set entry, and TTLs are written in a single transactional pipeline, so a mid-write crash can't orphan a hash or leave a key without its expiry
+- **Atomic monotonic IDs** via Redis `INCR`: collision-free across concurrent workers. The counter is never given a TTL (even when `ttl` is set), so IDs stay monotonic across idle periods; only the event and stream keys expire.
+- **Replay is O(log N + M)**: one `ZRANGEBYSCORE` range-scans the stream's sorted set, then each of the M matched events is fetched with its own `HGET`. That's one network round-trip per replayed event: fine for typical resume sizes, worth knowing for very long streams.
+- **TTL support**: automatic expiry of event/stream keys to prevent unbounded memory growth
+- **Atomic writes**: each event's hash, sorted-set entry, and TTLs are written in a single transactional pipeline, so a mid-write crash can't orphan a hash or leave a key without its expiry
 - **Multi-tenant isolation** via configurable `key_prefix`
-- **Priming event handling** — sentinel empty-string payloads are stored but never replayed to clients
+- **Priming event handling**: sentinel empty-string payloads are stored but never replayed to clients
 
 ### Configuration
 
@@ -438,7 +438,7 @@ store_b = RedisEventStore(redis_client, key_prefix="server-b:")
 
 Stores MCP SSE events in PostgreSQL so servers can resume interrupted streams
 across restarts and redeploys. It takes an `asyncpg` connection pool, so
-concurrent request handlers share connections cleanly — a good fit for
+concurrent request handlers share connections cleanly, a good fit for
 deployments that already run Postgres and want durability without adding Redis.
 
 > For ephemeral multi-worker fan-out, `RedisEventStore` is lighter; for a pure
@@ -449,18 +449,18 @@ deployments that already run Postgres and want durability without adding Redis.
 One row per event:
 
 ```
-{table}.event_id    — BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, monotonic IDs (never reused)
-{table}.stream_id   — TEXT, the stream the event belongs to
-{table}.payload     — TEXT, serialized JSONRPCMessage ("" for priming events)
-{table}.created_at  — DOUBLE PRECISION, unix timestamp used for TTL expiry
+{table}.event_id    - BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, monotonic IDs (never reused)
+{table}.stream_id   - TEXT, the stream the event belongs to
+{table}.payload     - TEXT, serialized JSONRPCMessage ("" for priming events)
+{table}.created_at  - DOUBLE PRECISION, unix timestamp used for TTL expiry
 ```
 
-- **Monotonic IDs** via an `IDENTITY` column — strictly increasing, never reused, same guarantee as Redis `INCR`
-- **Indexed replay** — `WHERE stream_id = $1 AND event_id > $2` over a `(stream_id, event_id)` index
-- **Pooled & concurrent** — accepts an `asyncpg.Pool`, so many handlers can store/replay without contending on one connection
-- **TTL support** — expired events are skipped on replay and removed by `purge_expired()`
+- **Monotonic IDs** via an `IDENTITY` column: strictly increasing, never reused, same guarantee as Redis `INCR`
+- **Indexed replay**: `WHERE stream_id = $1 AND event_id > $2` over a `(stream_id, event_id)` index
+- **Pooled & concurrent**: accepts an `asyncpg.Pool`, so many handlers can store/replay without contending on one connection
+- **TTL support**: expired events are skipped on replay and removed by `purge_expired()`
 - **Multi-tenant isolation** via configurable `table_name`
-- **Priming event handling** — sentinel empty-string payloads are stored but never replayed
+- **Priming event handling**: sentinel empty-string payloads are stored but never replayed
 
 ### Configuration
 
@@ -494,7 +494,7 @@ Each store also accepts a connection it owns directly, opened and closed for you
 `SQLiteEventStore.create()`, `RedisEventStore.create()`, and
 `PostgresEventStore.create()` are async context managers that take a connection
 string, build the underlying driver client (and call `initialize()` where
-needed), yield a ready store, and close the connection on exit — including when
+needed), yield a ready store, and close the connection on exit, including when
 the body raises:
 
 ```python
@@ -533,12 +533,12 @@ async for event_id, message in store.subscribe("stream-id"):
   delivery is push-based; SQLite has no native notification and falls back to
   polling (`subscribe(stream_id, poll_interval=0.5)`).
 - **Connection cost:** Redis and Postgres subscribers each hold a dedicated
-  connection for their lifetime — size your pool for the expected number of
+  connection for their lifetime; size your pool for the expected number of
   concurrent subscribers. See [docs/production.md](docs/production.md) for sizing.
 
 ## Cross-backend migration: `migrate()`
 
-Copy events from one store to another — e.g. SQLite → Postgres as a single-node
+Copy events from one store to another, e.g. SQLite → Postgres as a single-node
 deployment grows, or Redis → Postgres for durability:
 
 ```python
@@ -554,9 +554,9 @@ a failing stream is logged and recorded in `failed_streams`, not fatal. Pass
 `stream_id=` to migrate one stream, `batch_size=` and `on_progress=` to drive a
 progress bar.
 
-> **Caveats — read before migrating production data:** event IDs are *not*
+> **Caveats (read before migrating production data):** event IDs are *not*
 > preserved (the destination assigns fresh ones), timestamps reset (TTL clock
-> restarts), and resumability tokens are therefore invalidated — clients holding
+> restarts), and resumability tokens are therefore invalidated: clients holding
 > a `Last-Event-ID` from the source cannot resume against the destination. The
 > copy is also not consistent under concurrent writes, so stop writes to the
 > source first. See [docs/production.md](docs/production.md) for the full
@@ -576,7 +576,7 @@ store = RedisEventStore(redis_client, ttl=3600, metrics=LoggingMetricsCollector(
 ```
 
 To emit to Prometheus, Datadog, or anything else, pass any object with three
-synchronous methods — `on_store_event(stream_id, event_id, duration_ms)`,
+synchronous methods: `on_store_event(stream_id, event_id, duration_ms)`,
 `on_replay(stream_id, events_replayed, duration_ms)`, and
 `on_error(operation, error)`. It does not need to subclass `MetricsCollector`
 (it's a `Protocol`). A collector that raises is logged and ignored rather than
@@ -586,7 +586,7 @@ allowed to fail the underlying operation.
 
 When MCP messages carry large tool results or big JSON-RPC bodies, pass
 `compression="gzip"` to gzip-compress payloads above `compress_min_bytes`
-(default `1024`) before they are stored — cutting storage and, on Redis, memory:
+(default `1024`) before they are stored, cutting storage and, on Redis, memory:
 
 ```python
 store = PostgresEventStore(pool, ttl=3600, compression="gzip", compress_min_bytes=1024)
@@ -645,7 +645,7 @@ report "not ready" when the store's dependency is down. See
 
 ## Examples
 
-The [`examples/`](examples/) directory contains minimal, runnable MCP servers —
+The [`examples/`](examples/) directory contains minimal, runnable MCP servers:
 the `with_persistence()` one-liner, plus each backend wired manually into a real
 [`StreamableHTTPSessionManager`](https://github.com/modelcontextprotocol/python-sdk):
 
@@ -705,7 +705,7 @@ Measured with `--events 5000 --concurrency 500`:
 
 What the shape of these results reflects (and should hold across environments):
 
-- **SQLite has the lowest latency _and_ the highest throughput** — it runs
+- **SQLite has the lowest latency _and_ the highest throughput**: it runs
   in-process with no network hop, so every `store_event` skips a round-trip
   entirely. The catch is that it's single-writer: that throughput doesn't scale
   across processes, which is why multi-worker deployments still reach for Redis
@@ -716,7 +716,7 @@ What the shape of these results reflects (and should hold across environments):
   but every write serializes through the single `INCR` counter (see the write
   ceiling note below), while Postgres has much higher per-call latency but its
   pooled connections run many stores concurrently.
-- **Replay**: SQLite and Postgres fetch a stream's events in one indexed query, while the Redis backend issues a `zrangebyscore` followed by a single pipelined execution to fetch payloads concurrently — keeping the entire replay latency bounded to exactly two network round-trips.
+- **Replay**: SQLite and Postgres fetch a stream's events in one indexed query, while the Redis backend issues a `zrangebyscore` followed by a single pipelined execution to fetch payloads concurrently, keeping the entire replay latency bounded to exactly two network round-trips.
 
 ## Architecture & Guarantees
 
