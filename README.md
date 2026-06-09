@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Ar-maan05/mcp-persist/actions/workflows/ci.yml/badge.svg)](https://github.com/Ar-maan05/mcp-persist/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/mcp-persist.svg)](https://pypi.org/project/mcp-persist/)
-[![Downloads](https://static.pepy.tech/badge/mcp-persist/month)](https://pepy.tech/project/mcp-persist)
+[![Downloads](https://static.pepy.tech/badge/mcp-persist)](https://pepy.tech/project/mcp-persist)
 [![Python versions](https://img.shields.io/pypi/pyversions/mcp-persist.svg)](https://pypi.org/project/mcp-persist/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
