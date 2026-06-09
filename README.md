@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/Ar-maan05/mcp-persist/actions/workflows/ci.yml/badge.svg)](https://github.com/Ar-maan05/mcp-persist/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/mcp-persist.svg)](https://pypi.org/project/mcp-persist/)
+[![Downloads](https://static.pepy.tech/badge/mcp-persist/month)](https://pepy.tech/project/mcp-persist)
 [![Python versions](https://img.shields.io/pypi/pyversions/mcp-persist.svg)](https://pypi.org/project/mcp-persist/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -113,6 +114,10 @@ event to a store and assigning its own event IDs. A client that disconnects
 reconnects with `Last-Event-ID`; the proxy replays the missed events from the
 store and continues live. The upstream needs **no** event store of its own: the
 proxy is the store.
+
+> **Running a TypeScript (or any non-Python) MCP server?** The proxy speaks plain
+> HTTP, so it adds resumability in front of it without touching the server. See
+> [docs/typescript.md](docs/typescript.md) for a step-by-step guide.
 
 Point your clients at the proxy's address instead of the server's (e.g.
 `http://localhost:8000/mcp`); nothing else on the client changes. Resumability

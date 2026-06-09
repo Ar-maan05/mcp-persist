@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
@@ -43,6 +44,14 @@ class PurgeScheduler:
                      ``TypeError`` — Redis expires keys natively, so a scheduler
                      would do nothing.
         interval:    Seconds between purges. Must be positive.
+        jitter:      Maximum extra seconds added to each sleep, drawn uniformly
+                     from ``[0, jitter]`` and re-rolled every cycle. Must be
+                     non-negative; ``0.0`` (the default) keeps the loop exactly
+                     periodic. Use it to de-synchronise replicas that start
+                     together so they don't all purge a shared backend in the
+                     same instant (a "thundering herd"). A good rule of thumb is
+                     10–20% of ``interval`` — e.g. ``interval=300, jitter=30``
+                     spreads replicas across a 30s window.
         batch_size:  Forwarded to ``purge_expired(batch_size=...)`` when set, so a
                      large purge deletes in bounded chunks instead of one long
                      locking ``DELETE``. ``None`` (the default) uses the store's
@@ -60,6 +69,7 @@ class PurgeScheduler:
         store: Any,  # _Purgeable at runtime
         interval: float,
         *,
+        jitter: float = 0.0,
         batch_size: int | None = None,
         log: logging.Logger | None = None,
     ) -> None:
@@ -70,11 +80,14 @@ class PurgeScheduler:
             )
         if interval <= 0:
             raise ValueError(f"interval must be a positive number of seconds, got {interval!r}")
+        if jitter < 0:
+            raise ValueError(f"jitter must be a non-negative number of seconds, got {jitter!r}")
         if batch_size is not None and batch_size < 1:
             raise ValueError(f"batch_size must be a positive integer or None, got {batch_size!r}")
 
         self._store = store
         self._interval = interval
+        self._jitter = jitter
         self._batch_size = batch_size
         self._log = log if log is not None else logging.getLogger("mcp_persist.scheduler")
         self._task: asyncio.Task[None] | None = None
@@ -99,7 +112,10 @@ class PurgeScheduler:
 
     async def _run(self) -> None:
         while True:
-            await asyncio.sleep(self._interval)
+            delay = self._interval
+            if self._jitter:
+                delay += random.uniform(0, self._jitter)
+            await asyncio.sleep(delay)
             try:
                 if self._batch_size is None:
                     removed = await self._store.purge_expired()

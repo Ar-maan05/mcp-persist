@@ -5,13 +5,16 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.8.0] - 2026-06-09
 
 ### Added
+- **`PurgeScheduler` jitter** (`jitter=`): an optional non-negative number of seconds added to each purge cycle, drawn fresh from `[0, jitter]` every iteration, so replicas that start together from the same rolling deploy stop purging a shared backend in lockstep (a "thundering herd"). A good rule of thumb is 10 to 20 percent of `interval` (e.g. `interval=300, jitter=30` spreads replicas across a 30s window). Validated non-negative at construction. Defaults to `0.0`, keeping the loop exactly periodic, so existing behavior is unchanged. Documented in the production guide under [reclaiming space](docs/production.md#2-reclaiming-space-schedule-purge_expired).
+- **TypeScript / non-Python proxy guide** ([`docs/typescript.md`](docs/typescript.md)): a step-by-step guide to putting `mcp-persist-proxy` in front of an MCP server written in another language. The proxy speaks plain HTTP, so it adds SSE resumability without importing anything into the upstream process. Covers both CLI modes (point at a running server, or launch it as a subprocess), the Streamable HTTP transport requirement, backend choice and `ttl` sizing, and the shared-store rule for multiple proxy replicas. Linked from the README proxy section.
 - **`examples/resume_demo.py`**: a self-contained, recordable terminal demo of resumability in a single command (`python examples/resume_demo.py`). It runs a real FastMCP + `SQLiteEventStore` server in a background thread, starts a streaming tool call, yanks the connection mid-stream to simulate a client/network crash, then reconnects with `Last-Event-ID` and watches the server replay exactly the missed events before delivering the tool's result. Nothing is mocked: events round-trip through SQLite (`resume_demo.db`) and the client speaks the Streamable HTTP wire protocol, parsing the SSE stream with mcp-persist's own `SSEParser`. Needs only the `[sqlite]` extra (uvicorn + httpx already ship with `mcp`).
 
 ### Changed
 - README now reflects the current test suite size (300+ async tests across all three backends), replacing the stale earlier count.
+- README now carries a PyPI downloads badge ([pepy.tech](https://pepy.tech/project/mcp-persist)) alongside the existing CI, version, Python, and license badges.
 
 ## [1.7.0] - 2026-06-05
 
@@ -294,7 +297,7 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore`, a Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.7.0...HEAD
+[1.8.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.4.0...v1.5.0

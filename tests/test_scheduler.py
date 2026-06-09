@@ -124,6 +124,21 @@ def test_scheduler_invalid_batch_size_raises():
         PurgeScheduler(FakeStore(), interval=1.0, batch_size=0)
 
 
+def test_scheduler_invalid_jitter_raises():
+    with pytest.raises(ValueError):
+        PurgeScheduler(FakeStore(), interval=1.0, jitter=-0.5)
+
+
+@pytest.mark.anyio
+async def test_scheduler_fires_with_jitter():
+    # A small interval plus a small jitter window: the loop must still fire
+    # repeatedly, exercising the jittered-sleep path.
+    store = FakeStore()
+    async with PurgeScheduler(store, interval=0.02, jitter=0.02):
+        await asyncio.sleep(0.2)
+    assert store.calls >= 2
+
+
 @pytest.mark.anyio
 async def test_scheduler_purges_real_sqlite_store():
     conn = await aiosqlite.connect(":memory:")

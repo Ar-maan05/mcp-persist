@@ -186,6 +186,21 @@ The expiry cutoff is captured once per call, so rows that expire mid-purge are
 left for the next run. `batch_size=None` (the default) keeps the single-statement
 `DELETE`, which is fine for low-to-moderate churn.
 
+**Spreading purges across replicas (`jitter`).** When several instances start
+from the same rolling deploy, their purge loops fire in lockstep and hit a shared
+Postgres at the same instant on every interval (a "thundering herd"). Pass
+`jitter=` to add a random delay, drawn fresh each cycle from `[0, jitter]`
+seconds, so the replicas decorrelate:
+
+```python
+PurgeScheduler(store, interval=300, jitter=30)  # each cycle sleeps 300 to 330s
+```
+
+A good rule of thumb is 10 to 20 percent of `interval`, so `interval=300` pairs
+with `jitter` around 30 to 60. `jitter=0.0` (the default) keeps the loop exactly
+periodic. This only matters for the shared backends (Postgres, and SQLite on a
+shared volume); a single node has nothing to contend with.
+
 Reclaiming **disk**, not just rows:
 
 - **SQLite**: `DELETE` frees pages for reuse but does not shrink the file. If
