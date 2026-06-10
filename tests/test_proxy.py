@@ -404,6 +404,61 @@ async def test_post_disconnect_then_reconnect_replays_remainder(make):
 
 
 @pytest.mark.anyio
+async def test_get_reconnect_cross_session_replay_blocked(make):
+    # Event ids are global and sequential, so a client can guess another session's
+    # id. The proxy must not replay a stream whose id doesn't belong to the
+    # requesting session, or it leaks one session's history to another.
+    up = ControlledUpstream()
+    up.feed(up.post_queue, "a", "b", "c")
+    proxy = make(up)
+
+    # Victim stores a,b,c via a POST SSE stream.
+    p = Client(proxy, "POST", headers={"mcp-session-id": "VICTIM"}, body=b'{"jsonrpc":"2.0","id":9,"method":"x"}')
+    _, post_headers = await p.start()
+    victim_session = post_headers["mcp-session-id"]
+    events = await p.read_all()
+    await p.finish()
+    first_id = events[0].original_id
+    assert first_id is not None
+
+    # Drop the live buffers so the GET reconnect falls through to store replay.
+    proxy._buffers.clear()
+
+    # Attacker: a *different* session reconnects with the victim's event id. The
+    # fresh upstream GET ends immediately, so anything received came from replay.
+    up.get_queue.put_nowait(None)
+    attacker = Client(proxy, "GET", headers={"mcp-session-id": "ATTACKER", "last-event-id": first_id})
+    await attacker.start()
+    leaked = await attacker.read_all()
+    await attacker.finish()
+    assert leaked == []  # cross-session replay blocked: none of VICTIM's events leak
+
+    # Control: the legitimate owner (same session) still gets its replay, proving
+    # the events were stored and the block is the ownership check, not an empty store.
+    proxy._buffers.clear()
+    up.get_queue.put_nowait(None)
+    owner = Client(proxy, "GET", headers={"mcp-session-id": victim_session, "last-event-id": first_id})
+    await owner.start()
+    replayed = await owner.read_all()
+    await owner.finish()
+    assert [e.data for e in replayed] == [payload("b"), payload("c")]
+
+
+@pytest.mark.anyio
+async def test_post_body_too_large_returns_413(make):
+    up = ControlledUpstream()
+    proxy = make(up)
+    proxy._max_request_body_bytes = 16  # tiny cap so a normal JSON-RPC body trips it
+
+    c = Client(proxy, "POST", body=b'{"jsonrpc":"2.0","id":1,"method":"way-too-long"}')
+    status, _ = await c.start()
+    assert status == 413
+    await c.read_json()  # drain the error body
+    await c.finish()
+    assert up.post_count == 0  # rejected before it was ever forwarded upstream
+
+
+@pytest.mark.anyio
 async def test_non_mcp_path_passthrough(make):
     up = ControlledUpstream()
     proxy = make(up)

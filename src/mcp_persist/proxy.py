@@ -48,12 +48,18 @@ from mcp_persist.sqlite import SQLiteEventStore
 if TYPE_CHECKING:
     from contextlib import AbstractAsyncContextManager
 
-    from mcp.server.streamable_http import EventId, EventStore
+    from mcp.server.streamable_http import EventId, EventMessage, EventStore
 
 logger = logging.getLogger(__name__)
 
 # Mirrors the SDK's standalone-GET stream key (streamable_http.GET_STREAM_KEY).
 GET_STREAM_KEY = "_GET_stream"
+
+# Largest request body the proxy buffers before forwarding upstream. The proxy
+# must read a request fully (to re-send it with a computed Content-Length), so an
+# unbounded body would let a single large POST exhaust memory. Configurable per
+# proxy via ``max_request_body_bytes``; a body over the limit gets a 413.
+DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB
 
 # Hop-by-hop headers (RFC 7230 §6.1) plus framing headers httpx/the ASGI server
 # must compute themselves — never forwarded verbatim in either direction.
@@ -90,13 +96,17 @@ class PersistenceProxy:
         buffer_grace_ttl: float = 60.0,
         buffer_maxlen: int = DEFAULT_DEQUE_MAXLEN,
         timeout: float = 300.0,
+        max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
     ) -> None:
+        if max_request_body_bytes < 1:
+            raise ValueError(f"max_request_body_bytes must be a positive integer, got {max_request_body_bytes!r}")
         self._upstream_base = upstream.rstrip("/")
         self._mcp_path = mcp_path
         self._upstream_url = self._upstream_base + mcp_path
         self._store = store
         self._buffer_grace_ttl = buffer_grace_ttl
         self._buffer_maxlen = buffer_maxlen
+        self._max_request_body_bytes = max_request_body_bytes
         # No read timeout: SSE streams are idle for long stretches. Follow
         # redirects so an upstream's trailing-slash redirect (/mcp -> /mcp/) is
         # resolved here rather than handed to the client, which would otherwise
@@ -117,6 +127,7 @@ class PersistenceProxy:
         mcp_path: str = "/mcp",
         buffer_grace_ttl: float = 60.0,
         timeout: float = 300.0,
+        max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
     ) -> AsyncIterator[PersistenceProxy]:
         """Build a proxy, resolving the store the same way as ``with_persistence``.
 
@@ -127,14 +138,20 @@ class PersistenceProxy:
         ctx, owned = _resolve_store(store, backend=backend, url=url, ttl=ttl)
         client = httpx.AsyncClient(timeout=httpx.Timeout(timeout, read=None), follow_redirects=True)
         proxy: PersistenceProxy | None = None
+        kwargs: dict[str, Any] = {
+            "mcp_path": mcp_path,
+            "client": client,
+            "buffer_grace_ttl": buffer_grace_ttl,
+            "max_request_body_bytes": max_request_body_bytes,
+        }
         try:
             if ctx is not None:
                 async with ctx as resolved:
-                    proxy = cls(upstream, resolved, mcp_path=mcp_path, client=client, buffer_grace_ttl=buffer_grace_ttl)
+                    proxy = cls(upstream, resolved, **kwargs)
                     yield proxy
             else:
                 assert owned is not None
-                proxy = cls(upstream, owned, mcp_path=mcp_path, client=client, buffer_grace_ttl=buffer_grace_ttl)
+                proxy = cls(upstream, owned, **kwargs)
                 yield proxy
         finally:
             if proxy is not None:
@@ -179,7 +196,11 @@ class PersistenceProxy:
     # ── POST ─────────────────────────────────────────────────────────────────
 
     async def _handle_post(self, scope: Scope, receive: Receive, send: Send) -> None:
-        body = await _read_body(receive)
+        try:
+            body = await _read_body(receive, self._max_request_body_bytes)
+        except _RequestBodyTooLarge as exc:
+            await _send_413(send, exc.limit)
+            return
         request_id = _extract_request_id(body)
 
         request = self._client.build_request(
@@ -244,7 +265,10 @@ class PersistenceProxy:
     async def _replay_then_resume_get(
         self, session_id: str, last_event_id: EventId, scope: Scope
     ) -> AsyncGenerator[tuple[EventId, str], None]:
-        async for item in _store_replay(self._store, last_event_id):
+        # Replay is gated on session ownership (see _store_replay): a Last-Event-ID
+        # pointing at another session's stream replays nothing, but we still open a
+        # fresh GET so the client resumes live notifications for its own session.
+        async for item in _store_replay(self._store, last_event_id, session_id=session_id):
             yield item
         buf = await self._open_get_buffer(session_id, scope)
         async for item in buf.consume_from(after=None):
@@ -264,7 +288,11 @@ class PersistenceProxy:
     # ── passthrough (non-MCP paths, DELETE, etc.) ─────────────────────────────
 
     async def _passthrough(self, scope: Scope, receive: Receive, send: Send) -> None:
-        body = await _read_body(receive)
+        try:
+            body = await _read_body(receive, self._max_request_body_bytes)
+        except _RequestBodyTooLarge as exc:
+            await _send_413(send, exc.limit)
+            return
         url = self._upstream_base + scope["path"]
         if scope.get("query_string"):
             url += "?" + scope["query_string"].decode("latin-1")
@@ -299,20 +327,70 @@ class PersistenceProxy:
 # ── module-level helpers ─────────────────────────────────────────────────────
 
 
-async def _store_replay(store: EventStore, after: EventId) -> AsyncGenerator[tuple[EventId, str], None]:
-    """Pure store replay (no live upstream), via a done buffer with an empty window."""
-    buf = StreamBuffer(f"replay:{uuid.uuid4().hex}", store)
-    buf.done = True
-    async for item in buf.consume_from(after):
+def _session_owns(stream_id: str, session_id: str) -> bool:
+    """Whether ``stream_id`` belongs to ``session_id``.
+
+    The proxy names every stream ``f"{session_id}:{stream_key}"`` (see
+    :meth:`PersistenceProxy._handle_post` and ``GET_STREAM_KEY``), so a stream is
+    owned by the session exactly when it carries that prefix.
+    """
+    return stream_id.startswith(f"{session_id}:")
+
+
+async def _store_replay(
+    store: EventStore, after: EventId, *, session_id: str
+) -> AsyncGenerator[tuple[EventId, str], None]:
+    """Replay an event id's stream from the store, gated on session ownership.
+
+    ``replay_events_after`` resolves the owning stream from the global, sequential,
+    client-supplied event id — not from the session. Without this gate a client
+    could enumerate event ids and read other sessions' history. We collect the
+    replay (the store batches internally; this holds only the gap, exactly as the
+    previous done-buffer path did), confirm the resolved stream belongs to
+    ``session_id``, and only then emit it. A foreign or unknown id yields nothing.
+    """
+    collected: list[tuple[EventId, str]] = []
+
+    async def _collect(event: EventMessage) -> None:
+        assert event.event_id is not None
+        data = event.message.model_dump_json(by_alias=True, exclude_none=True)
+        collected.append((event.event_id, data))
+
+    owning_stream = await store.replay_events_after(after, _collect)
+    if owning_stream is None or not _session_owns(owning_stream, session_id):
+        if owning_stream is not None:
+            logger.warning(
+                "blocked cross-session replay: Last-Event-ID %s belongs to stream %s, not session %s",
+                after,
+                owning_stream,
+                session_id,
+            )
+        return
+    for item in collected:
         yield item
 
 
-async def _read_body(receive: Receive) -> bytes:
+class _RequestBodyTooLarge(Exception):
+    """Raised by :func:`_read_body` when the request body exceeds the cap."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"request body exceeds {limit}-byte limit")
+        self.limit = limit
+
+
+async def _read_body(receive: Receive, max_bytes: int) -> bytes:
     chunks: list[bytes] = []
+    total = 0
     while True:
         message = await receive()
         if message["type"] == "http.request":
-            chunks.append(message.get("body", b""))
+            chunk = message.get("body", b"")
+            total += len(chunk)
+            # Enforce mid-read so a streamed oversized body is rejected as it
+            # arrives, not after the whole thing is already resident in memory.
+            if total > max_bytes:
+                raise _RequestBodyTooLarge(max_bytes)
+            chunks.append(chunk)
             if not message.get("more_body", False):
                 break
         elif message["type"] == "http.disconnect":  # pragma: no cover - client gone before body sent
@@ -374,6 +452,21 @@ async def _forward_response(response: httpx.Response, send: Send) -> None:
             "type": "http.response.start",
             "status": response.status_code,
             "headers": _response_headers(response, len(body)),
+        }
+    )
+    await send({"type": "http.response.body", "body": body, "more_body": False})
+
+
+async def _send_413(send: Send, limit: int) -> None:
+    body = f"request body exceeds the {limit}-byte limit".encode()
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [
+                (b"content-type", b"text/plain; charset=utf-8"),
+                (b"content-length", str(len(body)).encode()),
+            ],
         }
     )
     await send({"type": "http.response.body", "body": body, "more_body": False})

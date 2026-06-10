@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import base64
+import gzip
+
 import pytest
 
-from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
+from mcp_persist.compression import (
+    MAX_DECOMPRESSED_BYTES,
+    compress_payload,
+    decompress_payload,
+    validate_compression,
+)
 
 
 def test_roundtrip_large_payload():
@@ -50,3 +58,21 @@ def test_validate_compression_accepts_none_and_gzip():
 def test_validate_compression_rejects_unknown():
     with pytest.raises(ValueError):
         validate_compression("zstd")
+
+
+def test_decompression_bomb_rejected():
+    # A payload that inflates far past the cap must be refused rather than fully
+    # materialized in memory. ~200 MiB of zeros gzips to a few hundred KiB.
+    bomb = b"\x00" * (2 * MAX_DECOMPRESSED_BYTES)
+    stored = "gz:" + base64.b64encode(gzip.compress(bomb)).decode("ascii")
+    with pytest.raises(ValueError, match="decompression bomb"):
+        decompress_payload(stored)
+
+
+def test_payload_at_cap_still_decompresses():
+    # A payload whose decompressed size is within the cap round-trips normally;
+    # the guard only trips on genuinely oversized output.
+    payload = '{"data":"' + "a" * 100_000 + '"}'
+    encoded = compress_payload(payload, codec="gzip", min_bytes=100)
+    assert encoded.startswith("gz:")
+    assert decompress_payload(encoded) == payload

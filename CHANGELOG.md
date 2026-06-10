@@ -5,6 +5,13 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.1] - 2026-06-10
+
+### Security
+- **Proxy no longer replays another session's events from a guessed `Last-Event-ID`.** `PersistenceProxy` assigns sequential, trivially enumerable event IDs, and its GET reconnect path resolved the stream to replay from the **global** event ID without checking that the stream belonged to the requesting session. A client could send `GET /mcp` with `Last-Event-ID: <n>` (and any/no `mcp-session-id`) and receive the buffered history of whatever session owned event `n` — a cross-session information disclosure. Replay is now gated on session ownership: the proxy names every stream `f"{session_id}:..."`, and a `Last-Event-ID` whose resolved stream does not carry the requesting session's prefix replays nothing (the client still resumes live notifications for its own session). The same ownership check was added to `StreamBuffer.consume_from`'s cold-replay path, so a live GET buffer can't be steered into replaying a foreign stream either. A blocked attempt is logged at `WARNING`.
+- **Decompression is now bounded (decompression-bomb guard).** `decompress_payload` inflated `gz:`-marked payloads with an unbounded `gzip.decompress`. A crafted payload (reachable by anything with direct write access to the backing store — a shared Redis/Postgres, a restored dump) could expand to gigabytes and OOM a worker on replay. Inflation now runs incrementally against a 100 MiB output cap (`compression.MAX_DECOMPRESSED_BYTES`) and raises `ValueError` past it; callers already skip an undecodable event, so a bomb costs one skipped event rather than the process. Legitimate JSON-RPC payloads are orders of magnitude under the cap and are unaffected.
+- **Proxy bounds request-body buffering.** The proxy must read each request fully before forwarding it (to recompute `Content-Length`), so an unbounded body let a single large POST exhaust memory. `PersistenceProxy` (and `PersistenceProxy.create`) now take `max_request_body_bytes` (default 10 MiB); a body over the limit is rejected with `413 Request Entity Too Large` and never fully buffered.
+
 ## [1.8.0] - 2026-06-09
 
 ### Added

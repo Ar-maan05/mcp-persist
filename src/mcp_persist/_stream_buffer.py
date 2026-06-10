@@ -171,13 +171,28 @@ class StreamBuffer:
                     data = event.message.model_dump_json(by_alias=True, exclude_none=True)
                     replayed.append((event.event_id, data))  # noqa: B023 - consumed before the next loop iteration
 
-                await self.store.replay_events_after(cursor, _collect)
-                if replayed:
+                # replay_events_after resolves the owning stream from the global,
+                # client-supplied event id — not from self.stream_id. A cursor
+                # pointing at *another* stream's event would otherwise replay that
+                # stream's history here (event ids are sequential and trivially
+                # enumerable). Only emit a replay that belongs to this buffer's
+                # stream; a foreign cursor replays nothing and falls through to the
+                # live window, where the consumer still sees only its own events.
+                owning_stream = await self.store.replay_events_after(cursor, _collect)
+                if owning_stream is not None and owning_stream != self.stream_id:
+                    logger.warning(
+                        "blocked cross-stream replay on %s: Last-Event-ID %s belongs to stream %s",
+                        self.stream_id,
+                        cursor,
+                        owning_stream,
+                    )
+                elif replayed:
                     for event_id, data in replayed:
                         yield event_id, data
                         cursor = event_id
                     continue
-                # Store is caught up; fall through to the live window / park.
+                # Store is caught up (or the replay was foreign); fall through to
+                # the live window / park.
 
             # HOT: every event after the cursor is in the deque. Iterate a
             # snapshot so a concurrent append can't disturb iteration. From the

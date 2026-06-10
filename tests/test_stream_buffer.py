@@ -203,6 +203,35 @@ async def test_priming_event_excluded_from_cold_replay(store):
 
 
 @pytest.mark.anyio
+async def test_cold_replay_blocks_foreign_stream(store):
+    # A cursor pointing at *another* stream's event must not replay that stream:
+    # replay_events_after resolves the stream from the global, enumerable event id,
+    # so without the ownership guard a consumer of buffer B could read buffer A's
+    # history by guessing A's event id.
+    victim = StreamBuffer("s:victim", store)
+    foreign_id = await ingest(victim, 1)
+    await ingest(victim, 2)
+
+    attacker = StreamBuffer("s:attacker", store)
+    attacker.done = True  # empty window; a cold cursor would otherwise hit the store
+    got = await asyncio.wait_for(collect(attacker.consume_from(foreign_id)), 5)
+    assert got == []  # foreign replay blocked; nothing leaked
+
+
+@pytest.mark.anyio
+async def test_cold_replay_allows_own_stream(store):
+    # The ownership guard must not regress same-stream gap replay: an evicted
+    # cursor on this buffer's own stream still replays from the store.
+    buf = StreamBuffer("s:1", store, maxlen=1)
+    e1 = await ingest(buf, 1)
+    await ingest(buf, 2)  # maxlen=1 -> event 1 lives only in the store
+    buf.done = True
+
+    got = await asyncio.wait_for(collect(buf.consume_from(e1)), 5)
+    assert got == [payload(2)]  # own-stream replay still works
+
+
+@pytest.mark.anyio
 async def test_non_numeric_last_event_id_resumes_from_live_tail(store):
     buf = StreamBuffer("s:1", store)
     await ingest(buf, 1)
