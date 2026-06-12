@@ -34,7 +34,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import AbstractAsyncContextManager, contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NoReturn
 
 from mcp_persist.config import _PREFIX, _optional_int
 from mcp_persist.postgres import PostgresEventStore
@@ -578,7 +578,7 @@ def main() -> None:
     _die(f"unknown command {args.command!r}")  # pragma: no cover - argparse rejects first
 
 
-def _die(message: str) -> None:
+def _die(message: str) -> NoReturn:
     print(f"mcp-persist: error: {message}", file=sys.stderr)
     raise SystemExit(2)
 
