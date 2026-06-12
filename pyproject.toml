@@ -1,6 +1,6 @@
 [project]
 name = "mcp-persist"
-version = "1.8.1"
+version = "1.8.2"
 description = "Production-grade persistence backends for the MCP Python SDK"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,6 +32,7 @@ postgres = ["asyncpg>=0.30.0"]
 
 [project.scripts]
 mcp-persist-proxy = "mcp_persist._cli:main"
+mcp-persist = "mcp_persist._admin:main"
 
 [project.urls]
 Homepage = "https://github.com/Ar-maan05/mcp-persist"

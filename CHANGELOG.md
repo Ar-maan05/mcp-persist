@@ -5,6 +5,12 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.2] - 2026-06-12
+
+### Added
+- **New `mcp-persist` admin CLI with a `doctor` subcommand**, a pass/fail diagnostic. It checks the things that usually explain a broken or silently growing store: the Python runtime against the supported floor, whether the chosen backend's driver extra is installed (with the exact `pip install 'mcp-persist[...]'` hint when it is not), live connectivity via the store's existing `ping()` (reporting the backend version on success), and retention config that lets events accumulate without bound (an unset `ttl` on Redis, `max_stream_length` set without a `ttl`, or any non-expiring SQLite/Postgres store whose `purge_expired()` would be a no-op). Config is resolved from `--backend`/`--url`/`--ttl`/`--table` or the `MCP_PERSIST_*` env vars, identical to the proxy and `event_store_from_env`. The runtime, driver, and retention checks run from resolved config even when the backend is down (which is when you reach for the doctor); an unreachable store is reported as a failed `connectivity` check, not a crash. Output is a checklist by default or `--json` for CI/readiness gates; the command exits non-zero only on a failed check, so warnings surface without breaking an exit-code gate. The existing `mcp-persist-proxy` entry point is unchanged.
+- **`mcp-persist stats` subcommand**: reports the event count and event ID range (`min`/`max`) per stream, store-wide totals, the latest assigned event ID, and a latency probe timed against the backend's native `PING` / `SELECT 1`. It reads the store directly with a single cheap pass (a pipelined `ZCARD` + `ZRANGE` on Redis; one `GROUP BY stream_id` plus `MAX(event_id)` on SQLite/Postgres), never iterating or decoding payloads, so it is safe to run against a live deployment. `--stream-id` narrows the report to one stream (showing a zero row when that stream is absent); output is a table by default or `--json` for scripting and dashboards. An unreachable store prints a single error line and exits non-zero rather than a traceback. `last id` is the never-expired counter on Redis or the highest stored ID on SQLite/Postgres (which can trail the sequence after a purge).
+
 ## [1.8.1] - 2026-06-10
 
 ### Security
