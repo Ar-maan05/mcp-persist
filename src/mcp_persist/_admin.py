@@ -290,9 +290,7 @@ async def diagnose(
     if checks[-1].status == "pass":
         checks.append(await _check_connectivity(cfg, open_store))
     else:
-        checks.append(
-            Check("connectivity", "fail", f"skipped: the {cfg.backend} driver is not installed")
-        )
+        checks.append(Check("connectivity", "fail", f"skipped: the {cfg.backend} driver is not installed"))
     checks.extend(_check_retention(cfg))
     return checks
 
@@ -435,9 +433,7 @@ async def _sql_stats(store: object, stream_id: str | None, *, backend: str) -> t
             (last_event_id,) = await cur.fetchone()
 
     include_empty = stream_id is not None
-    stats = [
-        StreamStat(sid, count, lo, hi) for (sid, count, lo, hi) in rows if count or include_empty
-    ]
+    stats = [StreamStat(sid, count, lo, hi) for (sid, count, lo, hi) in rows if count or include_empty]
     return stats, last_event_id
 
 
@@ -471,10 +467,7 @@ def _render_stats(cfg: StoreConfig, report: StatsReport) -> str:
     lines = [f"mcp-persist stats: {cfg.backend} ({cfg.url})", ""]
     if report.streams:
         headers = ("stream", "events", "min", "max")
-        rows = [
-            (s.stream_id, str(s.events), _fmt_id(s.min_event_id), _fmt_id(s.max_event_id))
-            for s in report.streams
-        ]
+        rows = [(s.stream_id, str(s.events), _fmt_id(s.min_event_id), _fmt_id(s.max_event_id)) for s in report.streams]
         widths = [max(len(headers[i]), *(len(r[i]) for r in rows)) for i in range(4)]
         # stream left-aligned; the numeric columns right-aligned.
         aligns = ("l", "r", "r", "r")

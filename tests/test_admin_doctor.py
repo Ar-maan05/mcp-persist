@@ -139,6 +139,7 @@ async def test_diagnose_connectivity_failure_is_reported_not_raised():
 async def test_diagnose_skips_connectivity_when_driver_missing(monkeypatch):
     monkeypatch.setattr(_admin.importlib.util, "find_spec", lambda name: None)
     cfg = StoreConfig(backend="postgres", url="postgres://h", ttl=60)
+
     # open_store must never be called when the driver is absent.
     def _boom():
         raise AssertionError("open_store called despite missing driver")
