@@ -5,12 +5,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.8.3] - 2026-06-13
 
 ### Changed
 - **README restructured and slimmed (851 → ~300 lines).** The README is now a quick tour (pitch, `with_persistence()` quickstart, proxy, backend-selection tables, programmatic-feature overview, and a headline benchmark), with the full reference moved into `docs/` and surfaced through a new Documentation index. No documentation was removed; everything was relocated and cross-linked.
 
 ### Added
+- **`mcp-persist-proxy --check`**: a pre-flight that probes the upstream and exits without starting the proxy. It reports a two-level pass/fail checklist (reachable, then a minimal MCP `initialize` POST confirming the endpoint speaks Streamable HTTP), catching a down upstream or a wrong `--path` before clients ever connect. A wrong path (HTTP 404/405) fails with a hint; a reachable but non-MCP response warns without failing. It requires `--upstream` (mode 1) and opens no event store, so it never touches Redis or Postgres. Exits non-zero on a failed check.
+- **`on_proxy_replay` metrics hook**: `PersistenceProxy` now accepts a `metrics=` collector and fires an optional `on_proxy_replay(stream_id, session_id, events_replayed, blocked, duration_ms)` hook on every reconnect-triggered replay, across both the cold-store path and the live-buffer gap path. Unlike the store-level `on_replay` (which counts what the query returned), this reports what was delivered to the client after the cross-session ownership gate, and sets `blocked=True` for a `Last-Event-ID` that resolved to another session's stream (a signal for clients enumerating event IDs). The hook is feature-detected, so existing three-method collectors are unaffected; `NoOpMetricsCollector` and `LoggingMetricsCollector` both implement it.
 - **`docs/backends.md`**: manual wiring, per-backend configuration, write-behind commits, multi-tenant isolation, and the `create()` connection lifecycle (moved out of the README).
 - **`docs/cli.md`**: full `doctor` and `stats` reference, with sample output, `--json`, and exit-code semantics.
 - **`docs/api.md`**: programmatic feature reference for `subscribe`, `migrate`, metrics, compression, `PurgeScheduler`, `event_store_from_env`, and `ping`.
@@ -322,7 +324,7 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore`, a Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
-[Unreleased]: https://github.com/Ar-maan05/mcp-persist/compare/v1.8.2...HEAD
+[1.8.3]: https://github.com/Ar-maan05/mcp-persist/compare/v1.8.2...v1.8.3
 [1.8.2]: https://github.com/Ar-maan05/mcp-persist/compare/v1.8.1...v1.8.2
 [1.8.1]: https://github.com/Ar-maan05/mcp-persist/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.7.0...v1.8.0

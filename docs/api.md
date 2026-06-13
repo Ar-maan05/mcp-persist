@@ -79,6 +79,37 @@ synchronous methods: `on_store_event(stream_id, event_id, duration_ms)`,
 (it's a `Protocol`). A collector that raises is logged and ignored rather than
 allowed to fail the underlying operation.
 
+### Proxy replay metric: `on_proxy_replay`
+
+`PersistenceProxy` accepts the same collector via `metrics=` and recognizes one
+**optional** extra method:
+
+```python
+def on_proxy_replay(self, stream_id, session_id, events_replayed, blocked, duration_ms):
+    ...
+```
+
+It fires whenever a client reconnect triggers a replay, and is distinct from
+`on_replay`: where `on_replay` counts what the store query returned,
+`on_proxy_replay` reports what was actually delivered to the client *after* the
+proxy's cross-session ownership gate, plus `blocked`, set `True` when a
+`Last-Event-ID` resolved to another session's stream and was refused (so
+`events_replayed` is `0`). Tracking the `blocked` rate surfaces clients
+enumerating event IDs, and the `events_replayed` distribution shows how large
+typical reconnect gaps are. The method is feature-detected, so an existing
+three-method collector keeps working unchanged; `NoOpMetricsCollector` and
+`LoggingMetricsCollector` both implement it.
+
+```python
+from mcp_persist import PersistenceProxy, LoggingMetricsCollector
+
+async with PersistenceProxy.create(
+    "http://localhost:8001", backend="sqlite", url="events.db", ttl=3600,
+    metrics=LoggingMetricsCollector(),
+) as proxy:
+    ...
+```
+
 ## Large payloads: `compression`
 
 When MCP messages carry large tool results or big JSON-RPC bodies, pass

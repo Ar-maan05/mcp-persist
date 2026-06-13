@@ -93,6 +93,98 @@ async def test_wait_until_ready_times_out(monkeypatch):
         await _cli._wait_until_ready("http://up", timeout=0.3)
 
 
+def test_parse_args_check_flag():
+    args, _ = _cli._parse_args(["--upstream", "http://host:1", "--check"])
+    assert args.check is True
+    args, _ = _cli._parse_args(["--upstream", "http://host:1"])
+    assert args.check is False
+
+
+def test_main_check_requires_upstream(monkeypatch, capsys):
+    monkeypatch.setattr(_cli.sys, "argv", ["mcp-persist-proxy", "--check"])
+    with pytest.raises(SystemExit) as excinfo:
+        _cli.main()
+    assert excinfo.value.code == 2
+    assert "--check requires --upstream" in capsys.readouterr().err
+
+
+def _check_client(handler) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.anyio
+async def test_check_upstream_ok_sse(capsys):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/mcp"
+        return httpx.Response(200, headers={"content-type": "text/event-stream"})
+
+    async with _check_client(handler) as client:
+        ok = await _cli._check_upstream("http://up:8001", "/mcp", client=client)
+    out = capsys.readouterr().out
+    assert ok is True
+    assert "[ ok ] reachable" in out
+    assert "Streamable HTTP (text/event-stream)" in out
+    assert "ready to proxy" in out
+
+
+@pytest.mark.anyio
+async def test_check_upstream_ok_jsonrpc(capsys):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            json={"jsonrpc": "2.0", "id": "x", "result": {}},
+        )
+
+    async with _check_client(handler) as client:
+        ok = await _cli._check_upstream("http://up:8001", "/mcp", client=client)
+    out = capsys.readouterr().out
+    assert ok is True
+    assert "Streamable HTTP (JSON-RPC response)" in out
+
+
+@pytest.mark.anyio
+async def test_check_upstream_wrong_path_fails(capsys):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)
+
+    async with _check_client(handler) as client:
+        ok = await _cli._check_upstream("http://up:8001", "/wrong", client=client)
+    out = capsys.readouterr().out
+    assert ok is False
+    assert "[fail] streamable-http" in out
+    assert "check --path" in out
+    assert "check failed" in out
+
+
+@pytest.mark.anyio
+async def test_check_upstream_reachable_but_not_mcp_warns(capsys):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/html"}, text="<html>hi</html>")
+
+    async with _check_client(handler) as client:
+        ok = await _cli._check_upstream("http://up:8001", "/mcp", client=client)
+    out = capsys.readouterr().out
+    # A warning does not fail the check.
+    assert ok is True
+    assert "[warn] streamable-http" in out
+    assert "did not look like MCP" in out
+
+
+@pytest.mark.anyio
+async def test_check_upstream_unreachable_fails(capsys):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    async with _check_client(handler) as client:
+        ok = await _cli._check_upstream("http://down:9999", "/mcp", client=client)
+    out = capsys.readouterr().out
+    assert ok is False
+    assert "[fail] reachable" in out
+    assert "could not connect" in out
+    assert "not reachable" in out
+
+
 class _FakeProc:
     def __init__(self, *, returncode: int | None = None, hang: bool = False) -> None:
         self.returncode = returncode

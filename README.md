@@ -133,10 +133,10 @@ directly.
 
 ## Command-line tools
 
-Two diagnostic commands for operating a live store. Both resolve their target
-from `--backend`/`--url` flags or the `MCP_PERSIST_*` env vars. Full reference,
-sample output, JSON schema, and exit-code semantics in
-**[docs/cli.md](docs/cli.md)**.
+Diagnostic commands for operating a live store, plus an upstream pre-flight for
+the proxy. The store commands resolve their target from `--backend`/`--url` flags
+or the `MCP_PERSIST_*` env vars. Full reference, sample output, JSON schema, and
+exit-code semantics in **[docs/cli.md](docs/cli.md)**.
 
 ```bash
 # Pass/fail health checklist (runtime, driver, connectivity, retention):
@@ -144,6 +144,9 @@ mcp-persist doctor --backend sqlite --url events.db --ttl 3600
 
 # Per-stream event inventory + latency probe:
 mcp-persist stats --backend sqlite --url events.db
+
+# Verify an upstream is reachable and speaks Streamable HTTP, then exit:
+mcp-persist-proxy --upstream http://localhost:8001 --check
 ```
 
 ## Backends & choosing one
@@ -208,7 +211,7 @@ Full API and examples in **[docs/api.md](docs/api.md)**.
 - **`subscribe()`**: push new events to an in-process consumer as they're written (Redis pub/sub, Postgres `LISTEN`/`NOTIFY`, SQLite polling).
 - **`migrate()`**: copy events between backends (e.g. SQLite → Postgres as you grow), preserving per-stream ordering.
 - **`compression="gzip"`**: transparently gzip large payloads above a threshold; decompression on read is automatic and config-independent.
-- **Metrics**: pass a `metrics=` collector (a `Protocol`, or the built-in `LoggingMetricsCollector`) to emit to Prometheus/Datadog/etc.; zero overhead when unused.
+- **Metrics**: pass a `metrics=` collector (a `Protocol`, or the built-in `LoggingMetricsCollector`) to emit to Prometheus/Datadog/etc.; zero overhead when unused. The proxy adds an optional `on_proxy_replay` hook for reconnect/replay rates and blocked cross-session attempts.
 - **`PurgeScheduler`**: run `purge_expired()` on an interval for SQLite/Postgres (Redis expires natively).
 - **`event_store_from_env()`**: pick the backend at deploy time from `MCP_PERSIST_*` env vars, no branching in code.
 - **`ping()`**: backend liveness/readiness probe for health endpoints.

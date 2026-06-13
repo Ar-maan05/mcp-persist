@@ -29,7 +29,7 @@ from mcp_persist import (
     RedisEventStore,
     SQLiteEventStore,
 )
-from mcp_persist.metrics import safe_call
+from mcp_persist.metrics import dispatch_proxy_replay, safe_call
 
 SAMPLE_MSG = JSONRPCRequest(jsonrpc="2.0", id="1", method="tools/list")
 
@@ -256,3 +256,45 @@ async def test_redis_store_and_replay_fire_metrics():
             await client.aclose()
         except AttributeError:
             await client.close()
+
+
+# ── Proxy replay hook (optional, feature-detected) ─────────────────────────────
+
+
+def test_dispatch_proxy_replay_calls_hook_when_present():
+    calls: list[tuple] = []
+
+    class WithHook:
+        def on_proxy_replay(self, stream_id, session_id, events_replayed, blocked, duration_ms) -> None:
+            calls.append((stream_id, session_id, events_replayed, blocked, duration_ms))
+
+    dispatch_proxy_replay(WithHook(), "s:1", "s", 3, False, 1.5)
+    assert calls == [("s:1", "s", 3, False, 1.5)]
+
+
+def test_dispatch_proxy_replay_noops_on_three_method_collector():
+    # A collector that predates the proxy hook (only the three Protocol methods)
+    # must not break: feature detection finds no on_proxy_replay and does nothing.
+    collector = RecordingCollector()
+    assert not hasattr(collector, "on_proxy_replay")
+    dispatch_proxy_replay(collector, "s:1", "s", 1, False, 0.1)  # no raise
+
+
+def test_dispatch_proxy_replay_noops_on_none():
+    dispatch_proxy_replay(None, "s:1", "s", 1, False, 0.1)  # no raise
+
+
+def test_dispatch_proxy_replay_swallows_raising_hook():
+    class Boom:
+        def on_proxy_replay(self, *args) -> None:
+            raise RuntimeError("metrics boom")
+
+    dispatch_proxy_replay(Boom(), "s:1", "s", 1, False, 0.1)  # logged + ignored, no raise
+
+
+def test_builtin_collectors_implement_proxy_replay(caplog):
+    NoOpMetricsCollector().on_proxy_replay("s:1", "s", 2, False, 0.5)  # no raise
+    with caplog.at_level(logging.DEBUG, logger="mcp_persist.metrics"):
+        LoggingMetricsCollector().on_proxy_replay("s:1", "s", 2, True, 0.5)
+    assert "proxy_replay" in caplog.text
+    assert "blocked=True" in caplog.text

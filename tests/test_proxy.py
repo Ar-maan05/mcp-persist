@@ -27,7 +27,7 @@ from mcp.types import JSONRPCNotification
 
 from mcp_persist import SQLiteEventStore
 from mcp_persist._sse_parser import SSEFrame, SSEParser
-from mcp_persist.proxy import PersistenceProxy
+from mcp_persist.proxy import PersistenceProxy, _store_replay
 
 TABLE = "test_proxy_events"
 
@@ -469,3 +469,47 @@ async def test_non_mcp_path_passthrough(make):
     assert json.loads(await c.read_json()) == {"ok": True}
     await c.finish()
     assert up.requests[0][0] == "GET"
+
+
+# ── proxy replay metrics: _store_replay (cold reconnect, no live buffer) ───────
+
+
+SAMPLE_NOTIFICATION = JSONRPCNotification(jsonrpc="2.0", method="notifications/message")
+
+
+class ProxyReplayRecorder:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def on_proxy_replay(self, stream_id, session_id, events_replayed, blocked, duration_ms) -> None:
+        self.calls.append((stream_id, session_id, events_replayed, blocked, duration_ms))
+
+
+@pytest.mark.anyio
+async def test_store_replay_fires_proxy_metric_when_owned(store):
+    anchor = await store.store_event("sess-1:s", None)  # priming
+    await store.store_event("sess-1:s", SAMPLE_NOTIFICATION)
+    rec = ProxyReplayRecorder()
+
+    out = [item async for item in _store_replay(store, anchor, session_id="sess-1", metrics=rec)]
+
+    assert len(out) == 1  # priming excluded from replay
+    assert len(rec.calls) == 1
+    stream_id, session_id, events, blocked, duration_ms = rec.calls[0]
+    assert (stream_id, session_id, events, blocked) == ("sess-1:s", "sess-1", 1, False)
+    assert duration_ms >= 0
+
+
+@pytest.mark.anyio
+async def test_store_replay_records_blocked_for_foreign_session(store):
+    anchor = await store.store_event("sess-1:s", None)
+    await store.store_event("sess-1:s", SAMPLE_NOTIFICATION)
+    rec = ProxyReplayRecorder()
+
+    # A different session resuming from sess-1's event id must get nothing.
+    out = [item async for item in _store_replay(store, anchor, session_id="sess-2", metrics=rec)]
+
+    assert out == []
+    assert len(rec.calls) == 1
+    stream_id, session_id, events, blocked, _duration_ms = rec.calls[0]
+    assert (stream_id, session_id, events, blocked) == ("sess-1:s", "sess-2", 0, True)

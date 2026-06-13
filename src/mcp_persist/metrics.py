@@ -26,6 +26,20 @@ as a batteries-included collector that logs one line per operation at ``DEBUG``.
 
 Hook calls are isolated: a collector that raises is logged and ignored rather
 than allowed to turn a successful store or replay into a failure.
+
+Proxy-specific hook
+-------------------
+
+:class:`~mcp_persist.PersistenceProxy` recognises one **optional** extra method,
+``on_proxy_replay(stream_id, session_id, events_replayed, blocked, duration_ms)``,
+fired whenever a client reconnect triggers a replay. It is distinct from
+``on_replay``: ``on_replay`` counts what the store query returned, while
+``on_proxy_replay`` reports what was actually delivered to the client *after* the
+proxy's cross-session ownership gate, plus ``blocked`` (a reconnect whose
+``Last-Event-ID`` resolved to another session's stream and was refused). The
+method is optional and feature-detected, so a three-method collector keeps
+working unchanged; :class:`NoOpMetricsCollector` and
+:class:`LoggingMetricsCollector` both implement it.
 """
 
 from __future__ import annotations
@@ -87,6 +101,11 @@ class NoOpMetricsCollector:
     def on_error(self, operation: str, error: Exception) -> None:
         return None
 
+    def on_proxy_replay(
+        self, stream_id: str | None, session_id: str, events_replayed: int, blocked: bool, duration_ms: float
+    ) -> None:
+        return None
+
 
 class LoggingMetricsCollector:
     """Collector that logs one line per operation at ``DEBUG``.
@@ -108,6 +127,37 @@ class LoggingMetricsCollector:
 
     def on_error(self, operation: str, error: Exception) -> None:
         self._log.debug("error in %s: %r", operation, error)
+
+    def on_proxy_replay(
+        self, stream_id: str | None, session_id: str, events_replayed: int, blocked: bool, duration_ms: float
+    ) -> None:
+        self._log.debug(
+            "proxy_replay stream=%s session=%s events=%d blocked=%s in %.2fms",
+            stream_id,
+            session_id,
+            events_replayed,
+            blocked,
+            duration_ms,
+        )
+
+
+def dispatch_proxy_replay(
+    metrics: object,
+    stream_id: str | None,
+    session_id: str,
+    events_replayed: int,
+    blocked: bool,
+    duration_ms: float,
+) -> None:
+    """Fire the optional ``on_proxy_replay`` hook if the collector defines one.
+
+    The proxy hook is not part of the :class:`MetricsCollector` Protocol (which
+    stays at three methods so existing collectors keep working), so it is
+    feature-detected here and dispatched through :func:`safe_call`.
+    """
+    hook = getattr(metrics, "on_proxy_replay", None)
+    if hook is not None:
+        safe_call(hook, stream_id, session_id, events_replayed, blocked, duration_ms)
 
 
 def safe_call(hook: object, *args: object) -> None:

@@ -19,6 +19,7 @@ import asyncio
 import logging
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator
+from time import perf_counter
 from typing import Protocol
 
 from mcp.server.streamable_http import EventId, EventMessage, EventStore
@@ -26,6 +27,7 @@ from mcp.types import JSONRPCMessage
 from pydantic import TypeAdapter
 
 from mcp_persist._sse_parser import SSEFrame, SSEParser
+from mcp_persist.metrics import dispatch_proxy_replay
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +54,14 @@ class SSEByteStream(Protocol):
 class StreamBuffer:
     """Consumes one upstream SSE stream; stores, buffers, and fans out events."""
 
-    def __init__(self, stream_id: str, store: EventStore, *, maxlen: int = DEFAULT_DEQUE_MAXLEN) -> None:
+    def __init__(
+        self, stream_id: str, store: EventStore, *, maxlen: int = DEFAULT_DEQUE_MAXLEN, metrics: object | None = None
+    ) -> None:
         self.stream_id = stream_id
         self.store = store
+        # Optional proxy-level metrics collector; an ``on_proxy_replay`` hook on it
+        # (if any) fires when this buffer serves a cold replay. None disables it.
+        self._metrics = metrics
         self.done = False
         self._deque: deque[tuple[EventId, str]] = deque(maxlen=maxlen)
         self._waiters: list[asyncio.Future[None]] = []
@@ -178,15 +185,25 @@ class StreamBuffer:
                 # enumerable). Only emit a replay that belongs to this buffer's
                 # stream; a foreign cursor replays nothing and falls through to the
                 # live window, where the consumer still sees only its own events.
+                started = perf_counter()
                 owning_stream = await self.store.replay_events_after(cursor, _collect)
-                if owning_stream is not None and owning_stream != self.stream_id:
+                blocked = owning_stream is not None and owning_stream != self.stream_id
+                if blocked:
                     logger.warning(
                         "blocked cross-stream replay on %s: Last-Event-ID %s belongs to stream %s",
                         self.stream_id,
                         cursor,
                         owning_stream,
                     )
-                elif replayed:
+                dispatch_proxy_replay(
+                    self._metrics,
+                    self.stream_id,
+                    self.stream_id.split(":", 1)[0],
+                    0 if blocked else len(replayed),
+                    blocked,
+                    (perf_counter() - started) * 1000,
+                )
+                if not blocked and replayed:
                     for event_id, data in replayed:
                         yield event_id, data
                         cursor = event_id

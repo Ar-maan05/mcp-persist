@@ -35,12 +35,14 @@ import logging
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from mcp_persist._stream_buffer import DEFAULT_DEQUE_MAXLEN, StreamBuffer
 from mcp_persist.config import event_store_from_env
+from mcp_persist.metrics import dispatch_proxy_replay
 from mcp_persist.postgres import PostgresEventStore
 from mcp_persist.redis import RedisEventStore
 from mcp_persist.sqlite import SQLiteEventStore
@@ -97,6 +99,7 @@ class PersistenceProxy:
         buffer_maxlen: int = DEFAULT_DEQUE_MAXLEN,
         timeout: float = 300.0,
         max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
+        metrics: object | None = None,
     ) -> None:
         if max_request_body_bytes < 1:
             raise ValueError(f"max_request_body_bytes must be a positive integer, got {max_request_body_bytes!r}")
@@ -107,6 +110,9 @@ class PersistenceProxy:
         self._buffer_grace_ttl = buffer_grace_ttl
         self._buffer_maxlen = buffer_maxlen
         self._max_request_body_bytes = max_request_body_bytes
+        # Optional metrics collector. An ``on_proxy_replay`` hook on it (if any)
+        # fires on every reconnect-triggered replay; None disables it.
+        self._metrics = metrics
         # No read timeout: SSE streams are idle for long stretches. Follow
         # redirects so an upstream's trailing-slash redirect (/mcp -> /mcp/) is
         # resolved here rather than handed to the client, which would otherwise
@@ -128,12 +134,14 @@ class PersistenceProxy:
         buffer_grace_ttl: float = 60.0,
         timeout: float = 300.0,
         max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
+        metrics: object | None = None,
     ) -> AsyncIterator[PersistenceProxy]:
         """Build a proxy, resolving the store the same way as ``with_persistence``.
 
         The store is chosen by the first that is set: ``store=`` (caller-owned,
         not closed here), ``backend=``+``url=`` (built and closed on exit), or
-        neither (``MCP_PERSIST_*`` environment variables).
+        neither (``MCP_PERSIST_*`` environment variables). ``metrics=`` is an
+        optional collector whose ``on_proxy_replay`` hook fires on each replay.
         """
         ctx, owned = _resolve_store(store, backend=backend, url=url, ttl=ttl)
         client = httpx.AsyncClient(timeout=httpx.Timeout(timeout, read=None), follow_redirects=True)
@@ -143,6 +151,7 @@ class PersistenceProxy:
             "client": client,
             "buffer_grace_ttl": buffer_grace_ttl,
             "max_request_body_bytes": max_request_body_bytes,
+            "metrics": metrics,
         }
         try:
             if ctx is not None:
@@ -222,7 +231,7 @@ class PersistenceProxy:
         stream_key = request_id if request_id is not None else uuid.uuid4().hex
         stream_id = f"{session_id}:{stream_key}"
 
-        buf = StreamBuffer(stream_id, self._store, maxlen=self._buffer_maxlen)
+        buf = StreamBuffer(stream_id, self._store, maxlen=self._buffer_maxlen, metrics=self._metrics)
         self._register_buffer(stream_id, buf)
         buf.start(response)  # the buffer now owns the response; do not aclose it here
 
@@ -268,7 +277,7 @@ class PersistenceProxy:
         # Replay is gated on session ownership (see _store_replay): a Last-Event-ID
         # pointing at another session's stream replays nothing, but we still open a
         # fresh GET so the client resumes live notifications for its own session.
-        async for item in _store_replay(self._store, last_event_id, session_id=session_id):
+        async for item in _store_replay(self._store, last_event_id, session_id=session_id, metrics=self._metrics):
             yield item
         buf = await self._open_get_buffer(session_id, scope)
         async for item in buf.consume_from(after=None):
@@ -280,7 +289,7 @@ class PersistenceProxy:
             "GET", self._upstream_url, headers=_forward_headers(scope["headers"], strip={"last-event-id"})
         )
         response = await self._client.send(request, stream=True)  # the buffer owns this response
-        buf = StreamBuffer(get_stream_id, self._store, maxlen=self._buffer_maxlen)
+        buf = StreamBuffer(get_stream_id, self._store, maxlen=self._buffer_maxlen, metrics=self._metrics)
         self._register_buffer(get_stream_id, buf)
         buf.start(response)
         return buf
@@ -338,12 +347,12 @@ def _session_owns(stream_id: str, session_id: str) -> bool:
 
 
 async def _store_replay(
-    store: EventStore, after: EventId, *, session_id: str
+    store: EventStore, after: EventId, *, session_id: str, metrics: object | None = None
 ) -> AsyncGenerator[tuple[EventId, str], None]:
     """Replay an event id's stream from the store, gated on session ownership.
 
     ``replay_events_after`` resolves the owning stream from the global, sequential,
-    client-supplied event id — not from the session. Without this gate a client
+    client-supplied event id, not from the session. Without this gate a client
     could enumerate event ids and read other sessions' history. We collect the
     replay (the store batches internally; this holds only the gap, exactly as the
     previous done-buffer path did), confirm the resolved stream belongs to
@@ -356,15 +365,26 @@ async def _store_replay(
         data = event.message.model_dump_json(by_alias=True, exclude_none=True)
         collected.append((event.event_id, data))
 
+    started = perf_counter()
     owning_stream = await store.replay_events_after(after, _collect)
-    if owning_stream is None or not _session_owns(owning_stream, session_id):
-        if owning_stream is not None:
-            logger.warning(
-                "blocked cross-session replay: Last-Event-ID %s belongs to stream %s, not session %s",
-                after,
-                owning_stream,
-                session_id,
-            )
+    owned = owning_stream is not None and _session_owns(owning_stream, session_id)
+    blocked = owning_stream is not None and not owned
+    if blocked:
+        logger.warning(
+            "blocked cross-session replay: Last-Event-ID %s belongs to stream %s, not session %s",
+            after,
+            owning_stream,
+            session_id,
+        )
+    dispatch_proxy_replay(
+        metrics,
+        owning_stream,
+        session_id,
+        len(collected) if owned else 0,
+        blocked,
+        (perf_counter() - started) * 1000,
+    )
+    if not owned:
         return
     for item in collected:
         yield item

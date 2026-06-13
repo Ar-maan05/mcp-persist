@@ -352,3 +352,69 @@ async def test_start_twice_raises(store):
     buf._task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await buf._task
+
+
+# ── proxy replay metrics (on_proxy_replay) ───────────────────────────────────
+
+
+class ProxyReplayRecorder:
+    """Captures on_proxy_replay calls; deliberately has only that one hook."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def on_proxy_replay(self, stream_id, session_id, events_replayed, blocked, duration_ms) -> None:
+        self.calls.append((stream_id, session_id, events_replayed, blocked, duration_ms))
+
+
+@pytest.mark.anyio
+async def test_proxy_replay_metric_fires_on_cold_replay(store):
+    # maxlen=2 evicts events 1,2 from the live window but they remain in the store,
+    # so a consumer resuming after event 1 must replay 2,3,4 cold.
+    rec = ProxyReplayRecorder()
+    buf = StreamBuffer("sess-1:s", store, maxlen=2, metrics=rec)
+    e1 = await ingest(buf, 1)
+    await ingest(buf, 2)
+    await ingest(buf, 3)
+    await ingest(buf, 4)
+    buf.done = True
+
+    out = await collect(buf.consume_from(after=e1))
+
+    assert out == [payload(2), payload(3), payload(4)]
+    assert len(rec.calls) == 1
+    stream_id, session_id, events, blocked, duration_ms = rec.calls[0]
+    assert (stream_id, session_id, events, blocked) == ("sess-1:s", "sess-1", 3, False)
+    assert duration_ms >= 0
+
+
+@pytest.mark.anyio
+async def test_proxy_replay_metric_marks_blocked_cross_stream(store):
+    # Store holds another stream's events; a buffer for a different stream that
+    # resumes from a foreign event id must replay nothing and record blocked=True.
+    foreign = StreamBuffer("sess-1:s", store, maxlen=1024)
+    e1 = await ingest(foreign, 1)
+    await ingest(foreign, 2)
+
+    rec = ProxyReplayRecorder()
+    buf = StreamBuffer("sess-2:other", store, maxlen=1024, metrics=rec)
+    buf.done = True
+
+    out = await collect(buf.consume_from(after=e1))
+
+    assert out == []
+    assert len(rec.calls) == 1
+    stream_id, session_id, events, blocked, _duration_ms = rec.calls[0]
+    assert (stream_id, session_id, events, blocked) == ("sess-2:other", "sess-2", 0, True)
+
+
+@pytest.mark.anyio
+async def test_no_metrics_collector_is_inert(store):
+    # The default (no metrics=) must not raise on the cold path.
+    buf = StreamBuffer("sess-1:s", store, maxlen=2)
+    e1 = await ingest(buf, 1)
+    await ingest(buf, 2)
+    await ingest(buf, 3)
+    buf.done = True
+    out = await collect(buf.consume_from(after=e1))
+    assert out == [payload(2), payload(3)]
