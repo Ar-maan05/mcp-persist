@@ -67,6 +67,22 @@ async def make(store):
         await proxy.close_all()
 
 
+@pytest.fixture
+async def make_cors(store):
+    """Like ``make`` but builds proxies with CORS enabled for an origin (default *)."""
+    proxies: list[PersistenceProxy] = []
+
+    def _make(upstream: ControlledUpstream, origin: str = "*") -> PersistenceProxy:
+        client = httpx.AsyncClient(transport=upstream, base_url="http://up", follow_redirects=True)
+        proxy = PersistenceProxy("http://up", store, client=client, buffer_grace_ttl=60.0, cors=origin)
+        proxies.append(proxy)
+        return proxy
+
+    yield _make
+    for proxy in proxies:
+        await proxy.close_all()
+
+
 # ── controllable upstream (custom httpx transport) ───────────────────────────
 
 
@@ -513,3 +529,82 @@ async def test_store_replay_records_blocked_for_foreign_session(store):
     assert len(rec.calls) == 1
     stream_id, session_id, events, blocked, _duration_ms = rec.calls[0]
     assert (stream_id, session_id, events, blocked) == ("sess-1:s", "sess-2", 0, True)
+
+
+# ── CORS (browser clients hit the proxy directly) ────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_cors_preflight_answered_without_upstream(make_cors):
+    # An OPTIONS preflight is answered by the proxy itself, never forwarded.
+    up = ControlledUpstream()
+    proxy = make_cors(up)
+
+    c = Client(
+        proxy,
+        "OPTIONS",
+        headers={
+            "origin": "http://localhost:8080",
+            "access-control-request-method": "POST",
+            "access-control-request-headers": "content-type,mcp-session-id",
+        },
+    )
+    status, headers = await c.start()
+    assert status == 204
+    assert headers["access-control-allow-origin"] == "*"
+    assert "POST" in headers["access-control-allow-methods"]
+    assert headers["access-control-allow-headers"] == "content-type,mcp-session-id"  # reflected
+    assert await c.read_json() == b""  # empty body
+    await c.finish()
+    assert up.requests == []  # preflight never reached the upstream
+
+
+@pytest.mark.anyio
+async def test_cors_on_sse_response(make_cors):
+    up = ControlledUpstream()
+    up.feed(up.post_queue, "a")
+    proxy = make_cors(up)
+
+    c = Client(
+        proxy, "POST", headers={"origin": "http://localhost:8080"}, body=b'{"jsonrpc":"2.0","id":7,"method":"x"}'
+    )
+    status, headers = await c.start()
+    assert status == 200
+    assert headers["content-type"].startswith("text/event-stream")
+    assert headers["access-control-allow-origin"] == "*"
+    assert headers["access-control-expose-headers"] == "mcp-session-id"  # browser JS can read the session id
+    await c.read_all()
+    await c.finish()
+
+
+@pytest.mark.anyio
+async def test_cors_on_json_response_replaces_upstream_origin(make_cors):
+    # The upstream already sets its own ACAO; the proxy must not emit two values.
+    up = ControlledUpstream()
+    up.post_json = b'{"jsonrpc":"2.0","id":1,"result":{}}'
+    proxy = make_cors(up, origin="http://localhost:8080")
+
+    c = Client(
+        proxy,
+        "POST",
+        headers={"origin": "http://localhost:8080", "content-type": "application/json"},
+        body=b'{"jsonrpc":"2.0","id":1,"method":"x"}',
+    )
+    status, headers = await c.start()
+    assert status == 200
+    assert headers["access-control-allow-origin"] == "http://localhost:8080"
+    await c.read_json()
+    await c.finish()
+
+
+@pytest.mark.anyio
+async def test_no_cors_headers_when_disabled(make):
+    up = ControlledUpstream()
+    up.feed(up.post_queue, "a")
+    proxy = make(up)  # cors=None
+
+    c = Client(proxy, "POST", body=b'{"jsonrpc":"2.0","id":7,"method":"x"}')
+    _status, headers = await c.start()
+    assert "access-control-allow-origin" not in headers
+    await c.read_all()
+    await c.finish()

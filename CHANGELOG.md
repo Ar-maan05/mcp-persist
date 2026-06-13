@@ -5,6 +5,11 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.4] - 2026-06-13
+
+### Added
+- **`mcp-persist-proxy --cors`**: CORS support for browser-based MCP clients. A web UI talks to the proxy through `fetch`, which requires CORS; without it the browser blocks the response because the proxy synthesizes its own headers for the SSE streams it serves (the initialize POST and the standalone GET) and never sent `Access-Control-Allow-Origin`, so the client failed with "Failed to fetch" even though the upstream had CORS of its own. With `--cors` the proxy answers the preflight (`OPTIONS`) itself (so it works even when the upstream sends no CORS headers), stamps `Access-Control-Allow-Origin` on every response it sends (SSE, JSON, passthrough, and 413), and exposes `mcp-session-id` so the client's JavaScript can read the session id. `--cors` allows any origin (`*`) by default; pass an explicit origin (`--cors https://app.example`) to restrict it, in which case any `Access-Control-*` the upstream set is dropped so the browser never sees two `Access-Control-Allow-Origin` values. The equivalent `cors=` keyword is available on `PersistenceProxy` and `PersistenceProxy.create`. CORS handling is off by default, so existing deployments are unaffected.
+
 ## [1.8.3] - 2026-06-13
 
 ### Changed
@@ -324,6 +329,7 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore`, a Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
+[1.8.4]: https://github.com/Ar-maan05/mcp-persist/compare/v1.8.3...v1.8.4
 [1.8.3]: https://github.com/Ar-maan05/mcp-persist/compare/v1.8.2...v1.8.3
 [1.8.2]: https://github.com/Ar-maan05/mcp-persist/compare/v1.8.1...v1.8.2
 [1.8.1]: https://github.com/Ar-maan05/mcp-persist/compare/v1.8.0...v1.8.1

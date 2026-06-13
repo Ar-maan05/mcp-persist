@@ -100,6 +100,7 @@ class PersistenceProxy:
         timeout: float = 300.0,
         max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
         metrics: object | None = None,
+        cors: str | None = None,
     ) -> None:
         if max_request_body_bytes < 1:
             raise ValueError(f"max_request_body_bytes must be a positive integer, got {max_request_body_bytes!r}")
@@ -110,6 +111,12 @@ class PersistenceProxy:
         self._buffer_grace_ttl = buffer_grace_ttl
         self._buffer_maxlen = buffer_maxlen
         self._max_request_body_bytes = max_request_body_bytes
+        # Allowed CORS origin (e.g. "*" or "https://app.example"). When set, the
+        # proxy answers OPTIONS preflights itself and stamps Access-Control-* on
+        # every response it sends — browser MCP clients (a web UI) hit the proxy
+        # directly, so its synthesized SSE responses need CORS or the browser
+        # blocks them. None disables all CORS handling (the default).
+        self._cors = cors
         # Optional metrics collector. An ``on_proxy_replay`` hook on it (if any)
         # fires on every reconnect-triggered replay; None disables it.
         self._metrics = metrics
@@ -135,6 +142,7 @@ class PersistenceProxy:
         timeout: float = 300.0,
         max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
         metrics: object | None = None,
+        cors: str | None = None,
     ) -> AsyncIterator[PersistenceProxy]:
         """Build a proxy, resolving the store the same way as ``with_persistence``.
 
@@ -142,6 +150,7 @@ class PersistenceProxy:
         not closed here), ``backend=``+``url=`` (built and closed on exit), or
         neither (``MCP_PERSIST_*`` environment variables). ``metrics=`` is an
         optional collector whose ``on_proxy_replay`` hook fires on each replay.
+        ``cors=`` is an allowed origin (e.g. ``"*"``) that turns on CORS handling.
         """
         ctx, owned = _resolve_store(store, backend=backend, url=url, ttl=ttl)
         client = httpx.AsyncClient(timeout=httpx.Timeout(timeout, read=None), follow_redirects=True)
@@ -152,6 +161,7 @@ class PersistenceProxy:
             "buffer_grace_ttl": buffer_grace_ttl,
             "max_request_body_bytes": max_request_body_bytes,
             "metrics": metrics,
+            "cors": cors,
         }
         try:
             if ctx is not None:
@@ -185,7 +195,11 @@ class PersistenceProxy:
         if scope["type"] != "http":  # pragma: no cover - websockets etc. unsupported
             return
         path, method = scope["path"], scope["method"]
-        if path == self._mcp_path and method == "POST":
+        if self._cors is not None and method == "OPTIONS":
+            # Answer the browser's CORS preflight here rather than forwarding it,
+            # so CORS works even when the upstream has no CORS of its own.
+            await _send_preflight(send, self._cors, scope)
+        elif path == self._mcp_path and method == "POST":
             await self._handle_post(scope, receive, send)
         elif path == self._mcp_path and method == "GET":
             await self._handle_get(scope, receive, send)
@@ -208,7 +222,7 @@ class PersistenceProxy:
         try:
             body = await _read_body(receive, self._max_request_body_bytes)
         except _RequestBodyTooLarge as exc:
-            await _send_413(send, exc.limit)
+            await _send_413(send, exc.limit, cors=self._cors)
             return
         request_id = _extract_request_id(body)
 
@@ -220,7 +234,7 @@ class PersistenceProxy:
         if "text/event-stream" not in response.headers.get("content-type", "").lower():
             # Plain JSON (or error) response: forward verbatim, store nothing.
             try:
-                await _forward_response(response, send)
+                await _forward_response(response, send, cors=self._cors)
             finally:
                 await response.aclose()
             return
@@ -235,7 +249,7 @@ class PersistenceProxy:
         self._register_buffer(stream_id, buf)
         buf.start(response)  # the buffer now owns the response; do not aclose it here
 
-        await _send_sse_start(send, session_id)
+        await _send_sse_start(send, session_id, cors=self._cors)
         await _stream_to_client(buf.consume_from(after=None), receive, send)
 
     # ── GET ──────────────────────────────────────────────────────────────────
@@ -263,7 +277,7 @@ class PersistenceProxy:
             else:
                 gen = self._fresh_get(session_id, scope)
 
-        await _send_sse_start(send, session_id)
+        await _send_sse_start(send, session_id, cors=self._cors)
         await _stream_to_client(gen, receive, send)
 
     async def _fresh_get(self, session_id: str, scope: Scope) -> AsyncGenerator[tuple[EventId, str], None]:
@@ -300,7 +314,7 @@ class PersistenceProxy:
         try:
             body = await _read_body(receive, self._max_request_body_bytes)
         except _RequestBodyTooLarge as exc:
-            await _send_413(send, exc.limit)
+            await _send_413(send, exc.limit, cors=self._cors)
             return
         url = self._upstream_base + scope["path"]
         if scope.get("query_string"):
@@ -310,7 +324,7 @@ class PersistenceProxy:
         )
         response = await self._client.send(request, stream=True)
         try:
-            await _forward_response(response, send)
+            await _forward_response(response, send, cors=self._cors)
         finally:
             await response.aclose()
 
@@ -455,44 +469,62 @@ def _extract_request_id(body: bytes) -> str | None:
     return None
 
 
-def _response_headers(response: httpx.Response, body_len: int) -> list[tuple[bytes, bytes]]:
+# Response headers the proxy adds to expose the MCP session id to browser JS: a
+# CORS response only surfaces non-simple headers the client lists here, and the
+# MCP client reads ``mcp-session-id`` off the initialize response.
+_CORS_EXPOSE_HEADERS = b"mcp-session-id"
+
+
+def _cors_headers(origin: str) -> list[tuple[bytes, bytes]]:
+    """Access-Control headers stamped on every proxy response when CORS is on."""
+    return [
+        (b"access-control-allow-origin", origin.encode("latin-1")),
+        (b"access-control-expose-headers", _CORS_EXPOSE_HEADERS),
+    ]
+
+
+def _response_headers(response: httpx.Response, body_len: int, *, cors: str | None = None) -> list[tuple[bytes, bytes]]:
     headers: list[tuple[bytes, bytes]] = []
     for key, value in response.headers.multi_items():
-        if key.lower() in _SKIP_HEADERS:
+        lower = key.lower()
+        if lower in _SKIP_HEADERS:
             continue
-        headers.append((key.lower().encode("latin-1"), value.encode("latin-1")))
+        # When the proxy stamps its own CORS, drop any the upstream set — two
+        # Access-Control-Allow-Origin values make the browser reject the response.
+        if cors is not None and lower.startswith("access-control-"):
+            continue
+        headers.append((lower.encode("latin-1"), value.encode("latin-1")))
     headers.append((b"content-length", str(body_len).encode()))
+    if cors is not None:
+        headers.extend(_cors_headers(cors))
     return headers
 
 
-async def _forward_response(response: httpx.Response, send: Send) -> None:
+async def _forward_response(response: httpx.Response, send: Send, *, cors: str | None = None) -> None:
     body = await response.aread()
     await send(
         {
             "type": "http.response.start",
             "status": response.status_code,
-            "headers": _response_headers(response, len(body)),
+            "headers": _response_headers(response, len(body), cors=cors),
         }
     )
     await send({"type": "http.response.body", "body": body, "more_body": False})
 
 
-async def _send_413(send: Send, limit: int) -> None:
+async def _send_413(send: Send, limit: int, *, cors: str | None = None) -> None:
     body = f"request body exceeds the {limit}-byte limit".encode()
-    await send(
-        {
-            "type": "http.response.start",
-            "status": 413,
-            "headers": [
-                (b"content-type", b"text/plain; charset=utf-8"),
-                (b"content-length", str(len(body)).encode()),
-            ],
-        }
-    )
+    headers: list[tuple[bytes, bytes]] = [
+        (b"content-type", b"text/plain; charset=utf-8"),
+        (b"content-length", str(len(body)).encode()),
+    ]
+    if cors is not None:
+        headers.extend(_cors_headers(cors))
+    await send({"type": "http.response.start", "status": 413, "headers": headers})
     await send({"type": "http.response.body", "body": body, "more_body": False})
 
 
-async def _send_sse_start(send: Send, session_id: str | None) -> None:
+async def _send_sse_start(send: Send, session_id: str | None, *, cors: str | None = None) -> None:
     headers: list[tuple[bytes, bytes]] = [
         (b"content-type", b"text/event-stream"),
         (b"cache-control", b"no-cache, no-transform"),
@@ -500,7 +532,29 @@ async def _send_sse_start(send: Send, session_id: str | None) -> None:
     ]
     if session_id:
         headers.append((b"mcp-session-id", session_id.encode("latin-1")))
+    if cors is not None:
+        headers.extend(_cors_headers(cors))
     await send({"type": "http.response.start", "status": 200, "headers": headers})
+
+
+async def _send_preflight(send: Send, origin: str, scope: Scope) -> None:
+    """Answer a CORS preflight (OPTIONS) with 204 and the negotiated permissions.
+
+    The allowed methods cover the MCP verbs the proxy serves; the allowed headers
+    reflect what the browser asked for (``Access-Control-Request-Headers``) and
+    fall back to ``*``, so any client header (``content-type``, ``mcp-session-id``,
+    ``last-event-id``, ``accept``) passes without enumerating them.
+    """
+    requested = _header(scope, b"access-control-request-headers")
+    headers: list[tuple[bytes, bytes]] = [
+        (b"access-control-allow-origin", origin.encode("latin-1")),
+        (b"access-control-allow-methods", b"GET, POST, DELETE, OPTIONS"),
+        (b"access-control-allow-headers", (requested or "*").encode("latin-1")),
+        (b"access-control-max-age", b"86400"),
+        (b"content-length", b"0"),
+    ]
+    await send({"type": "http.response.start", "status": 204, "headers": headers})
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
 def _sse_frame(event_id: EventId, data: str) -> bytes:

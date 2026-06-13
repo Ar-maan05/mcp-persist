@@ -131,6 +131,19 @@ never stored: if the client and the proxy both drop before an event is saved,
 it's gone. It never makes delivery less reliable than talking to the server
 directly.
 
+**Browser clients (CORS).** A browser-based MCP client (a web UI) talks to the
+proxy through `fetch`, so it needs CORS. Pass `--cors` to let the proxy answer
+the preflight itself and stamp `Access-Control-Allow-Origin` on every response
+(including the SSE streams it synthesizes, which is where a browser otherwise
+fails with "Failed to fetch"). It also exposes `mcp-session-id` so the client's
+JavaScript can read the session id. `--cors` allows any origin (`*`); pass an
+explicit origin to restrict it (`--cors https://app.example`):
+
+```bash
+mcp-persist-proxy --upstream http://localhost:8001 \
+    --backend sqlite --url events.db --port 8000 --cors
+```
+
 ## Command-line tools
 
 Diagnostic commands for operating a live store, plus an upstream pre-flight for

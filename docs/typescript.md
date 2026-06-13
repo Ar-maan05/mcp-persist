@@ -64,6 +64,25 @@ mcp-persist-proxy --backend redis --url redis://localhost:6379 --ttl 3600 \
 The `--path` flag (default `/mcp`) sets the MCP endpoint path the proxy exposes
 and forwards to.
 
+## Browser clients: enable CORS
+
+If your MCP client runs in a browser (a web UI calling the proxy with `fetch`),
+add `--cors`. Without it the browser blocks the response: the proxy synthesizes
+its own headers for the SSE streams and would not send `Access-Control-Allow-Origin`,
+so the client fails with "Failed to fetch" right after the initialize request.
+With `--cors` the proxy answers the CORS preflight (`OPTIONS`) itself and stamps
+`Access-Control-Allow-Origin` on every response, and exposes `mcp-session-id` so
+the client's JavaScript can read the session id:
+
+```bash
+mcp-persist-proxy --upstream http://localhost:8001 \
+    --backend sqlite --url events.db --port 8000 --cors
+```
+
+`--cors` allows any origin (`*`); pass an explicit origin to restrict it
+(`--cors https://app.example`). The proxy answers the preflight directly, so this
+works even when the upstream server sends no CORS headers of its own.
+
 ## Choosing a backend and sizing `ttl`
 
 - **One proxy process:** SQLite is fine. It needs no separate service.

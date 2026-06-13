@@ -110,6 +110,15 @@ def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         action="store_true",
         help="probe --upstream and exit (verify reachability + Streamable HTTP) without starting the proxy",
     )
+    parser.add_argument(
+        "--cors",
+        nargs="?",
+        const="*",
+        default=None,
+        metavar="ORIGIN",
+        help="enable CORS for browser clients: answer preflights and add "
+        "Access-Control-Allow-Origin to responses (origin defaults to *)",
+    )
     return parser.parse_args(proxy_argv), command
 
 
@@ -128,7 +137,7 @@ async def _run(args: argparse.Namespace, command: list[str]) -> None:
 
 async def _serve(args: argparse.Namespace, upstream: str) -> None:
     async with PersistenceProxy.create(
-        upstream, backend=args.backend, url=args.url, ttl=args.ttl, mcp_path=args.path
+        upstream, backend=args.backend, url=args.url, ttl=args.ttl, mcp_path=args.path, cors=args.cors
     ) as proxy:
         config = uvicorn.Config(proxy, host=args.host, port=args.port, log_level="info")
         await uvicorn.Server(config).serve()
