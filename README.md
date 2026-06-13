@@ -8,7 +8,7 @@
 
 When an MCP client reconnects, the server has to replay the events it missed, and with only the SDK's in-memory `EventStore`, that replay is impossible: the session lived in one process's memory, so a restart or a reconnect to a different worker loses it. **`mcp-persist` adds drop-in durable `EventStore` backends for SQLite, Redis, and PostgreSQL** that survive process restarts and scale across multi-worker deployments, keeping SSE stream resumability intact.
 
-> 📚 This README is the quick tour. Full reference lives in **[`docs/`](#-documentation)** — backends, CLI, the programmatic API, architecture, benchmarks, and the production guide.
+> 📚 This README is the quick tour. Full reference lives in **[`docs/`](#-documentation)**: backends, CLI, the programmatic API, architecture, benchmarks, and the production guide.
 
 ## Quickstart: `with_persistence()`
 
@@ -69,7 +69,7 @@ EventStore
 ```
 
 > **Not on FastMCP, or want to own the wiring yourself?** Build a store and pass
-> it to `StreamableHTTPSessionManager` directly — see
+> it to `StreamableHTTPSessionManager` directly; see
 > [Manual wiring](docs/backends.md#manual-wiring-advanced-or-non-fastmcp).
 
 ## Resumability without touching the server: `PersistenceProxy`
@@ -205,21 +205,21 @@ pip install "mcp-persist[sqlite,redis,postgres]"
 Beyond drop-in resumability, every store exposes a small set of building blocks.
 Full API and examples in **[docs/api.md](docs/api.md)**.
 
-- **`subscribe()`** — push new events to an in-process consumer as they're written (Redis pub/sub, Postgres `LISTEN`/`NOTIFY`, SQLite polling).
-- **`migrate()`** — copy events between backends (e.g. SQLite → Postgres as you grow), preserving per-stream ordering.
-- **`compression="gzip"`** — transparently gzip large payloads above a threshold; decompression on read is automatic and config-independent.
-- **Metrics** — pass a `metrics=` collector (a `Protocol`, or the built-in `LoggingMetricsCollector`) to emit to Prometheus/Datadog/etc.; zero overhead when unused.
-- **`PurgeScheduler`** — run `purge_expired()` on an interval for SQLite/Postgres (Redis expires natively).
-- **`event_store_from_env()`** — pick the backend at deploy time from `MCP_PERSIST_*` env vars, no branching in code.
-- **`ping()`** — backend liveness/readiness probe for health endpoints.
+- **`subscribe()`**: push new events to an in-process consumer as they're written (Redis pub/sub, Postgres `LISTEN`/`NOTIFY`, SQLite polling).
+- **`migrate()`**: copy events between backends (e.g. SQLite → Postgres as you grow), preserving per-stream ordering.
+- **`compression="gzip"`**: transparently gzip large payloads above a threshold; decompression on read is automatic and config-independent.
+- **Metrics**: pass a `metrics=` collector (a `Protocol`, or the built-in `LoggingMetricsCollector`) to emit to Prometheus/Datadog/etc.; zero overhead when unused.
+- **`PurgeScheduler`**: run `purge_expired()` on an interval for SQLite/Postgres (Redis expires natively).
+- **`event_store_from_env()`**: pick the backend at deploy time from `MCP_PERSIST_*` env vars, no branching in code.
+- **`ping()`**: backend liveness/readiness probe for health endpoints.
 
 ## Architecture & guarantees
 
-- **Ordering** — event IDs are monotonically increasing; replay order is preserved **per-stream**.
-- **Concurrency** — duplicate IDs are structurally impossible (`AUTOINCREMENT` / `IDENTITY` / `INCR`); Redis and Postgres take concurrent writes, SQLite is single-writer.
-- **Durability** — SQLite uses WAL, Postgres is ACID, Redis depends on its persistence config (use AOF for strong durability).
+- **Ordering**: event IDs are monotonically increasing; replay order is preserved **per-stream**.
+- **Concurrency**: duplicate IDs are structurally impossible (`AUTOINCREMENT` / `IDENTITY` / `INCR`); Redis and Postgres take concurrent writes, SQLite is single-writer.
+- **Durability**: SQLite uses WAL, Postgres is ACID, Redis depends on its persistence config (use AOF for strong durability).
 
-Full treatment — including the Redis write-ceiling caveat — in
+Full treatment, including the Redis write-ceiling caveat, in
 **[docs/architecture.md](docs/architecture.md)**.
 
 ## Examples
@@ -244,7 +244,7 @@ snippet.
 ## Benchmarks
 
 Measured at `--events 5000 --concurrency 500` (AMD Ryzen AI 7 350, local Redis 8 /
-Postgres 18 — indicative, not authoritative):
+Postgres 18; indicative, not authoritative):
 
 | Backend | store throughput | replay 1,000 |
 |---|---|---|

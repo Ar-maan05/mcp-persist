@@ -4,8 +4,8 @@
 resolve their target the same way as the proxy: explicit `--backend`/`--url`
 flags, or the `MCP_PERSIST_*` environment variables when no flags are given.
 
-- [`mcp-persist doctor`](#mcp-persist-doctor) — pass/fail health checklist
-- [`mcp-persist stats`](#mcp-persist-stats) — per-stream event inventory
+- [`mcp-persist doctor`](#mcp-persist-doctor): pass/fail health checklist
+- [`mcp-persist stats`](#mcp-persist-stats): per-stream event inventory
 
 ## `mcp-persist doctor`
 
