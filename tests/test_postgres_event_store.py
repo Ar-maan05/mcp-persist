@@ -727,7 +727,7 @@ async def test_uncompressed_store_reads_compressed_payload(pg_pool, clean_table)
 
 def test_invalid_compression_codec_raises():
     with pytest.raises(ValueError):
-        PostgresEventStore(object(), compression="zstd")
+        PostgresEventStore(object(), compression="lz4")
 
 
 @pytest.mark.anyio
