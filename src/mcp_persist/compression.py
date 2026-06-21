@@ -31,9 +31,10 @@ import zlib
 # Marker prefixing a gzip+base64-encoded payload. See the module docstring for
 # why this can never collide with a real (uncompressed) payload.
 _GZIP_PREFIX = "gz:"
+_ZSTD_PREFIX = "zs:"
 
 # Compression codecs accepted by the ``compression=`` store argument.
-SUPPORTED_COMPRESSION = ("gzip",)
+SUPPORTED_COMPRESSION = ("gzip", "zstd")
 
 # Hard ceiling on the *decompressed* size of a single payload, enforced while
 # inflating so a decompression bomb can never be fully materialized. A real
@@ -52,13 +53,23 @@ def validate_compression(codec: str | None) -> None:
     """Raise ``ValueError`` unless ``codec`` is ``None`` or a supported codec."""
     if codec is not None and codec not in SUPPORTED_COMPRESSION:
         raise ValueError(f"compression must be None or one of {SUPPORTED_COMPRESSION}, got {codec!r}")
+    if codec == "zstd" and not _zstd_available():
+        raise ValueError('compression="zstd" requires the zstd extra: pip install "mcp-persist[zstd]"')
 
 
-def compress_payload(payload: str, *, codec: str | None, min_bytes: int) -> str:
+def _zstd_available() -> bool:
+    try:
+        import zstandard  # type: ignore[import-not-found]  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def compress_payload(payload: str, *, codec: str | None, min_bytes: int, compress_level: int | None = None) -> str:
     """Return ``payload`` compressed when ``codec`` is set and it is worthwhile.
 
-    Compresses only when ``codec == "gzip"``, ``payload`` is non-empty, its UTF-8
-    size is at least ``min_bytes``, and the gzip+base64 result is strictly smaller
+    Compresses only when ``codec`` is set, ``payload`` is non-empty, its UTF-8
+    size is at least ``min_bytes``, and the encoded result is strictly smaller
     than the original. Otherwise ``payload`` is returned unchanged (and stored
     plain). The empty string (priming events) always passes through untouched.
     """
@@ -67,9 +78,15 @@ def compress_payload(payload: str, *, codec: str | None, min_bytes: int) -> str:
     raw = payload.encode("utf-8")
     if len(raw) < min_bytes:
         return payload
-    encoded = _GZIP_PREFIX + base64.b64encode(gzip.compress(raw)).decode("ascii")
-    # base64 adds ~33% overhead; only keep the compressed form if it still wins,
-    # so an incompressible payload is never made larger.
+    if codec == "gzip":
+        encoded = _GZIP_PREFIX + base64.b64encode(gzip.compress(raw)).decode("ascii")
+    elif codec == "zstd":
+        import zstandard  # type: ignore[import-not-found]
+
+        level = 3 if compress_level is None else compress_level
+        encoded = _ZSTD_PREFIX + base64.b64encode(zstandard.ZstdCompressor(level=level).compress(raw)).decode("ascii")
+    else:
+        raise ValueError(f"unsupported compression codec {codec!r}")
     if len(encoded) >= len(payload):
         return payload
     return encoded
@@ -78,18 +95,32 @@ def compress_payload(payload: str, *, codec: str | None, min_bytes: int) -> str:
 def decompress_payload(stored: str) -> str:
     """Inverse of :func:`compress_payload`; plain payloads pass through unchanged.
 
-    Decoding is driven entirely by the :data:`_GZIP_PREFIX` marker, so this is
-    safe to call on any stored payload regardless of whether the reading store
-    has compression enabled. Inflation is bounded by
-    :data:`MAX_DECOMPRESSED_BYTES`; a payload that would expand past the cap
-    raises ``ValueError`` (a decompression-bomb guard) instead of being fully
-    materialized. Callers already treat any decode failure as a corrupt event and
-    skip it, so a bomb costs one skipped event, not the worker.
+    Decoding is driven entirely by marker prefixes, so this is safe to call on
+    any stored payload regardless of whether the reading store has compression
+    enabled. Inflation is bounded by :data:`MAX_DECOMPRESSED_BYTES`.
     """
     if stored.startswith(_GZIP_PREFIX):
         raw = base64.b64decode(stored[len(_GZIP_PREFIX) :])
         return _gunzip_bounded(raw, MAX_DECOMPRESSED_BYTES)
+    if stored.startswith(_ZSTD_PREFIX):
+        raw = base64.b64decode(stored[len(_ZSTD_PREFIX) :])
+        return _zstd_decompress_bounded(raw, MAX_DECOMPRESSED_BYTES)
     return stored
+
+
+def _zstd_decompress_bounded(raw: bytes, max_bytes: int) -> str:
+    import zstandard  # type: ignore[import-not-found]
+
+    # max_output_size caps the allocation so a bomb is rejected rather than fully
+    # materialized. It is a parameter of decompress(), not the constructor. A
+    # frame without an embedded content size needs this bound to stay one-shot;
+    # requesting max_bytes + 1 lets a payload exactly on the cap through while
+    # still detecting anything larger.
+    decompressor = zstandard.ZstdDecompressor()
+    out = decompressor.decompress(raw, max_output_size=max_bytes + 1)
+    if len(out) > max_bytes:
+        raise ValueError(f"refusing to decompress payload over {max_bytes}-byte cap (possible decompression bomb)")
+    return out.decode("utf-8")
 
 
 def _gunzip_bounded(raw: bytes, max_bytes: int) -> str:

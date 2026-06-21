@@ -34,12 +34,14 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import AbstractAsyncContextManager, contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, NoReturn
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 
 from mcp_persist.config import _PREFIX, _optional_int
+from mcp_persist.migration import MigrationResult, migrate
 from mcp_persist.postgres import PostgresEventStore
 from mcp_persist.redis import RedisEventStore
 from mcp_persist.sqlite import SQLiteEventStore
+from mcp_persist.stored import count_expired
 
 if TYPE_CHECKING:
     from mcp.server.streamable_http import EventStore
@@ -534,6 +536,19 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     _store_flags(stats)
     stats.add_argument("--stream-id", help="restrict the report to a single stream")
 
+    purge = sub.add_parser("purge", help="delete expired events from the configured store")
+    _store_flags(purge)
+    purge.add_argument("--batch-size", type=int, help="delete in chunks of N rows")
+    purge.add_argument("--dry-run", action="store_true", help="count expired rows without deleting")
+
+    migrate_p = sub.add_parser("migrate", help="copy events from one store to another")
+    migrate_p.add_argument("--from-backend", choices=("sqlite", "redis", "postgres"), required=True)
+    migrate_p.add_argument("--from-url", required=True)
+    migrate_p.add_argument("--to-backend", choices=("sqlite", "redis", "postgres"), required=True)
+    migrate_p.add_argument("--to-url", required=True)
+    migrate_p.add_argument("--batch-size", type=int, default=500)
+    migrate_p.add_argument("--json", action="store_true")
+
     return parser.parse_args(argv)
 
 
@@ -569,12 +584,94 @@ def _run_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _purge_store(cfg: StoreConfig, *, batch_size: int | None, dry_run: bool) -> int:
+    with _quiet_package_log():
+        async with _build_store(cfg) as store:
+            if dry_run:
+                return await count_expired(store)
+            if batch_size is not None:
+                return await store.purge_expired(batch_size=batch_size)  # type: ignore[attr-defined]
+            return await store.purge_expired()  # type: ignore[attr-defined]
+
+
+def _run_purge(args: argparse.Namespace) -> int:
+    try:
+        cfg = _resolve_config(args)
+    except ValueError as exc:
+        _die(str(exc))
+    try:
+        removed = asyncio.run(_purge_store(cfg, batch_size=args.batch_size, dry_run=args.dry_run))
+    except Exception as exc:
+        print(f"mcp-persist: error: purge failed for {cfg.backend} at {cfg.url}: {exc}", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        print(f"would purge {removed} expired event(s)")
+    elif args.json:
+        print(json.dumps({"purged": removed, "dry_run": False}))
+    else:
+        print(f"purged {removed} expired event(s)")
+    return 0
+
+
+async def _migrate_stores(
+    source_cfg: StoreConfig,
+    dest_cfg: StoreConfig,
+    *,
+    batch_size: int,
+    on_progress: Callable[[str, int], None] | None,
+) -> MigrationResult:
+    with _quiet_package_log():
+        async with _build_store(source_cfg) as source, _build_store(dest_cfg) as dest:
+            # migrate() narrows to its _MigrationSource/_MigrationDest protocols;
+            # the concrete backends satisfy them structurally (list_streams /
+            # _iter_stream_events / store_event), which EventStore doesn't declare.
+            return await migrate(cast(Any, source), cast(Any, dest), batch_size=batch_size, on_progress=on_progress)
+
+
+def _run_migrate(args: argparse.Namespace) -> int:
+    source = StoreConfig(backend=args.from_backend, url=args.from_url)
+    dest = StoreConfig(backend=args.to_backend, url=args.to_url)
+
+    def progress(sid: str, n: int) -> None:
+        if not args.json:
+            print(f"{sid}: {n} event(s)", flush=True)
+
+    try:
+        result = asyncio.run(
+            _migrate_stores(source, dest, batch_size=args.batch_size, on_progress=progress if not args.json else None)
+        )
+    except Exception as exc:
+        print(f"mcp-persist: error: migrate failed: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "streams_migrated": result.streams_migrated,
+                    "events_migrated": result.events_migrated,
+                    "failed_streams": result.failed_streams,
+                }
+            )
+        )
+    else:
+        print(
+            f"migrated {result.events_migrated} event(s) across {result.streams_migrated} stream(s); "
+            f"failed: {len(result.failed_streams)}"
+        )
+    return 1 if result.failed_streams else 0
+
+
 def main() -> None:
     args = _parse_args(sys.argv[1:])
     if args.command == "doctor":
         raise SystemExit(_run_doctor(args))
     if args.command == "stats":
         raise SystemExit(_run_stats(args))
+    if args.command == "purge":
+        raise SystemExit(_run_purge(args))
+    if args.command == "migrate":
+        raise SystemExit(_run_migrate(args))
     _die(f"unknown command {args.command!r}")  # pragma: no cover - argparse rejects first
 
 

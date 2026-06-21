@@ -34,7 +34,7 @@ import hashlib
 import logging
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -50,6 +50,7 @@ from pydantic import TypeAdapter
 
 from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
+from mcp_persist.stored import StoredEvent
 
 if TYPE_CHECKING:
     from mcp_persist.metrics import MetricsCollector
@@ -152,6 +153,7 @@ class PostgresEventStore(EventStore):
         pool: Any,  # asyncpg.Pool at runtime
         *,
         table_name: str = "mcp_events",
+        tenant_id: str | None = None,
         ttl: int | None = None,
         timeout: float | None = None,
         replay_batch_size: int = _DEFAULT_REPLAY_BATCH_SIZE,
@@ -177,6 +179,8 @@ class PostgresEventStore(EventStore):
         bare = parts[-1]
         self._stream_index = f'"{bare}_stream_idx"'
         self._created_index = f'"{bare}_created_idx"'
+        self._tenant_index = f'"{bare}_tenant_stream_idx"'
+        self._tenant_id = tenant_id
         self._ttl = ttl
         self._timeout = timeout
         self._replay_batch_size = replay_batch_size
@@ -186,6 +190,7 @@ class PostgresEventStore(EventStore):
         self._compress_min_bytes = compress_min_bytes
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self._tenant_column_ready = False
 
         if ttl is None:
             logger.warning(
@@ -205,6 +210,7 @@ class PostgresEventStore(EventStore):
         dsn: str,
         *,
         table_name: str = "mcp_events",
+        tenant_id: str | None = None,
         ttl: int | None = None,
         timeout: float | None = None,
         replay_batch_size: int = _DEFAULT_REPLAY_BATCH_SIZE,
@@ -236,6 +242,7 @@ class PostgresEventStore(EventStore):
         store = cls(
             pool,
             table_name=table_name,
+            tenant_id=tenant_id,
             ttl=ttl,
             timeout=timeout,
             replay_batch_size=replay_batch_size,
@@ -286,13 +293,44 @@ class PostgresEventStore(EventStore):
                 "event_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
                 "stream_id TEXT NOT NULL, "
                 "payload TEXT NOT NULL, "
-                "created_at DOUBLE PRECISION NOT NULL)"
+                "created_at DOUBLE PRECISION NOT NULL, "
+                "tenant_id TEXT)"
             )
             await self._execute_ddl(
                 f"CREATE INDEX IF NOT EXISTS {self._stream_index} ON {self._table} (stream_id, event_id)"
             )
             await self._execute_ddl(f"CREATE INDEX IF NOT EXISTS {self._created_index} ON {self._table} (created_at)")
+            # Bring a table created by an older version (no tenant_id column) up to
+            # date. Idempotent ADD COLUMN IF NOT EXISTS; cheap to run once at init.
+            await self._ensure_tenant_column()
             self._initialized = True
+
+    async def _ensure_tenant_column(self) -> None:
+        """Add the ``tenant_id`` column + index to a pre-1.9 table (idempotent).
+
+        Fresh tables already declare ``tenant_id``; this only does work the first
+        time a store opens a table created by an older version. Cached so it runs
+        at most once per store.
+        """
+        if self._tenant_column_ready:
+            return
+        await self._execute_ddl(f"ALTER TABLE {self._table} ADD COLUMN IF NOT EXISTS tenant_id TEXT")
+        await self._execute_ddl(
+            f"CREATE INDEX IF NOT EXISTS {self._tenant_index} ON {self._table} (tenant_id, stream_id, event_id)"
+        )
+        self._tenant_column_ready = True
+
+    def _tenant_clause(self, params: list[Any]) -> str:
+        """Append the tenant param (if any) and return the matching SQL fragment.
+
+        A store bound to a tenant scopes every read and write to its own rows; an
+        unbound store (``tenant_id=None``) is unscoped. Mutates ``params`` so the
+        ``$N`` placeholder lines up with asyncpg's positional numbering.
+        """
+        if self._tenant_id is None:
+            return ""
+        params.append(self._tenant_id)
+        return f" AND tenant_id = ${len(params)}"
 
     # EventStore interface
 
@@ -328,10 +366,12 @@ class PostgresEventStore(EventStore):
             payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
 
         event_id = await self._pool.fetchval(
-            f"INSERT INTO {self._table} (stream_id, payload, created_at) VALUES ($1, $2, $3) RETURNING event_id",
+            f"INSERT INTO {self._table} (stream_id, payload, created_at, tenant_id) "
+            "VALUES ($1, $2, $3, $4) RETURNING event_id",
             stream_id,
             payload,
             time.time(),
+            self._tenant_id,
             timeout=self._timeout,
         )
 
@@ -344,6 +384,49 @@ class PostgresEventStore(EventStore):
             await self._publish_notification(stream_id, event_id_str)
 
         return event_id_str
+
+    async def _allocate_event_ids(self, n: int) -> list[EventId]:
+        if n < 1:
+            raise ValueError(f"n must be a positive integer, got {n!r}")
+        if not self._initialized:
+            await self.initialize()
+        bare = self._table.split(".")[-1].strip('"')
+        rows = await self._pool.fetch(
+            "SELECT nextval(pg_get_serial_sequence($1, 'event_id'))::bigint AS id FROM generate_series(1, $2)",
+            bare,
+            n,
+            timeout=self._timeout,
+        )
+        return [str(record["id"]) for record in rows]
+
+    async def _store_event_with_id(
+        self,
+        stream_id: StreamId,
+        message: JSONRPCMessage | None,
+        event_id: EventId,
+    ) -> None:
+        if not self._initialized:
+            await self.initialize()
+        if message is None:
+            payload = ""
+        else:
+            payload = message.model_dump_json(by_alias=True, exclude_none=True)
+            payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
+        await self._pool.execute(
+            f"INSERT INTO {self._table} (event_id, stream_id, payload, created_at, tenant_id) "
+            "OVERRIDING SYSTEM VALUE VALUES ($1, $2, $3, $4, $5) "
+            "ON CONFLICT (event_id) DO UPDATE SET "
+            "stream_id = EXCLUDED.stream_id, payload = EXCLUDED.payload, created_at = EXCLUDED.created_at, "
+            "tenant_id = EXCLUDED.tenant_id",
+            int(event_id),
+            stream_id,
+            payload,
+            time.time(),
+            self._tenant_id,
+            timeout=self._timeout,
+        )
+        if self._enable_streaming and message is not None:
+            await self._publish_notification(stream_id, event_id)
 
     async def replay_events_after(
         self,
@@ -384,9 +467,11 @@ class PostgresEventStore(EventStore):
         except (TypeError, ValueError):
             return None
 
+        anchor_params: list[Any] = [anchor_id]
+        anchor_tenant = self._tenant_clause(anchor_params)
         row = await self._pool.fetchrow(
-            f"SELECT stream_id FROM {self._table} WHERE event_id = $1",
-            anchor_id,
+            f"SELECT stream_id FROM {self._table} WHERE event_id = $1{anchor_tenant}",
+            *anchor_params,
             timeout=self._timeout,
         )
 
@@ -408,12 +493,12 @@ class PostgresEventStore(EventStore):
             # skipped below, so the resuming client misses them with no other
             # signal. Priming events (empty payload) are never replayed, so an
             # expired one is not a gap and is excluded here.
+            gap_params: list[Any] = [stream_id, anchor_id, min_created]
+            gap_tenant = self._tenant_clause(gap_params)
             gap = await self._pool.fetchval(
                 f"SELECT 1 FROM {self._table} "
-                "WHERE stream_id = $1 AND event_id > $2 AND created_at < $3 AND payload <> '' LIMIT 1",
-                stream_id,
-                anchor_id,
-                min_created,
+                f"WHERE stream_id = $1 AND event_id > $2 AND created_at < $3 AND payload <> ''{gap_tenant} LIMIT 1",
+                *gap_params,
                 timeout=self._timeout,
             )
             if gap is not None:
@@ -427,23 +512,24 @@ class PostgresEventStore(EventStore):
 
         while True:
             if min_created is not None:
+                fetch_params: list[Any] = [stream_id, cursor_id, min_created]
+                tenant_sql = self._tenant_clause(fetch_params)
+                fetch_params.append(self._replay_batch_size)
                 rows = await self._pool.fetch(
                     f"SELECT event_id, payload FROM {self._table} "
-                    "WHERE stream_id = $1 AND event_id > $2 AND created_at >= $3 "
-                    "ORDER BY event_id LIMIT $4",
-                    stream_id,
-                    cursor_id,
-                    min_created,
-                    self._replay_batch_size,
+                    f"WHERE stream_id = $1 AND event_id > $2 AND created_at >= $3{tenant_sql} "
+                    f"ORDER BY event_id LIMIT ${len(fetch_params)}",
+                    *fetch_params,
                     timeout=self._timeout,
                 )
             else:
+                fetch_params = [stream_id, cursor_id]
+                tenant_sql = self._tenant_clause(fetch_params)
+                fetch_params.append(self._replay_batch_size)
                 rows = await self._pool.fetch(
                     f"SELECT event_id, payload FROM {self._table} "
-                    "WHERE stream_id = $1 AND event_id > $2 ORDER BY event_id LIMIT $3",
-                    stream_id,
-                    cursor_id,
-                    self._replay_batch_size,
+                    f"WHERE stream_id = $1 AND event_id > $2{tenant_sql} ORDER BY event_id LIMIT ${len(fetch_params)}",
+                    *fetch_params,
                     timeout=self._timeout,
                 )
 
@@ -491,6 +577,127 @@ class PostgresEventStore(EventStore):
         await self._pool.fetchval("SELECT 1", timeout=self._timeout)
         return True
 
+    async def select_expired(
+        self,
+        *,
+        cutoff: float,
+        batch_size: int,
+    ) -> AsyncIterator[StoredEvent]:
+        """Yield up to ``batch_size`` expired events without deleting them."""
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+        if not self._initialized:
+            await self.initialize()
+
+        params: list[Any] = [cutoff]
+        tenant_sql = self._tenant_clause(params)
+        params.append(batch_size)
+        rows = await self._pool.fetch(
+            f"SELECT stream_id, event_id, payload, created_at FROM {self._table} "
+            f"WHERE created_at < $1{tenant_sql} ORDER BY event_id LIMIT ${len(params)}",
+            *params,
+            timeout=self._timeout,
+        )
+        for record in rows:
+            yield StoredEvent(
+                stream_id=record["stream_id"],
+                event_id=str(record["event_id"]),
+                payload=record["payload"],
+                created_at=record["created_at"],
+            )
+
+    async def count_expired(self) -> int:
+        """Return the number of events older than ``ttl`` without deleting them."""
+        if self._ttl is None:
+            return 0
+        if not self._initialized:
+            await self.initialize()
+        cutoff = time.time() - self._ttl
+        params: list[Any] = [cutoff]
+        tenant_sql = self._tenant_clause(params)
+        count = await self._pool.fetchval(
+            f"SELECT COUNT(*) FROM {self._table} WHERE created_at < $1{tenant_sql}",
+            *params,
+            timeout=self._timeout,
+        )
+        return int(count)
+
+    async def delete_events(self, events: Sequence[StoredEvent]) -> int:
+        """Delete the given events by ``event_id`` and return the number removed."""
+        if not events:
+            return 0
+        if not self._initialized:
+            await self.initialize()
+        ids = [int(event.event_id) for event in events]
+        result = await self._pool.execute(
+            f"DELETE FROM {self._table} WHERE event_id = ANY($1::bigint[])",
+            ids,
+            timeout=self._timeout,
+        )
+        return int(result.split()[-1])
+
+    async def _store_event_raw(
+        self,
+        stream_id: StreamId,
+        event_id: EventId,
+        payload: str,
+        created_at: float,
+    ) -> None:
+        """Insert an event with an explicit ``event_id`` (upsert on conflict).
+
+        Used by tiered archival to copy a hot event into a cold store while
+        preserving its ID. A tenant-bound cold store tags the row with its tenant.
+        """
+        if not self._initialized:
+            await self.initialize()
+        await self._pool.execute(
+            f"INSERT INTO {self._table} (event_id, stream_id, payload, created_at, tenant_id) "
+            "OVERRIDING SYSTEM VALUE VALUES ($1, $2, $3, $4, $5) "
+            "ON CONFLICT (event_id) DO UPDATE SET "
+            "stream_id = EXCLUDED.stream_id, "
+            "payload = EXCLUDED.payload, "
+            "created_at = EXCLUDED.created_at, "
+            "tenant_id = EXCLUDED.tenant_id",
+            int(event_id),
+            stream_id,
+            payload,
+            created_at,
+            self._tenant_id,
+            timeout=self._timeout,
+        )
+
+    async def _event_exists(self, event_id: EventId) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        try:
+            anchor_id = int(event_id)
+        except (TypeError, ValueError):
+            return False
+        params: list[Any] = [anchor_id]
+        tenant_sql = self._tenant_clause(params)
+        row = await self._pool.fetchval(
+            f"SELECT 1 FROM {self._table} WHERE event_id = $1{tenant_sql} LIMIT 1",
+            *params,
+            timeout=self._timeout,
+        )
+        return row is not None
+
+    async def _stream_id_for_event(self, event_id: EventId) -> StreamId | None:
+        if not self._initialized:
+            await self.initialize()
+        try:
+            anchor_id = int(event_id)
+        except (TypeError, ValueError):
+            return None
+        params: list[Any] = [anchor_id]
+        tenant_sql = self._tenant_clause(params)
+        row = await self._pool.fetchrow(
+            f"SELECT stream_id FROM {self._table} WHERE event_id = $1{tenant_sql}",
+            *params,
+            timeout=self._timeout,
+        )
+        return row["stream_id"] if row is not None else None
+
     async def purge_expired(self, *, batch_size: int | None = None) -> int:
         """Delete events older than ``ttl`` and return the number removed.
 
@@ -524,20 +731,25 @@ class PostgresEventStore(EventStore):
         # The created_at index added in initialize() keeps this an index scan
         # instead of a full table scan.
         if batch_size is None:
+            params: list[Any] = [cutoff]
+            tenant_sql = self._tenant_clause(params)
             result = await self._pool.execute(
-                f"DELETE FROM {self._table} WHERE created_at < $1",
-                cutoff,
+                f"DELETE FROM {self._table} WHERE created_at < $1{tenant_sql}",
+                *params,
                 timeout=self._timeout,
             )
             return int(result.split()[-1])
 
         total = 0
         while True:
+            params = [cutoff]
+            tenant_sql = self._tenant_clause(params)
+            params.append(batch_size)
             result = await self._pool.execute(
                 f"DELETE FROM {self._table} WHERE ctid IN "
-                f"(SELECT ctid FROM {self._table} WHERE created_at < $1 ORDER BY created_at LIMIT $2)",
-                cutoff,
-                batch_size,
+                f"(SELECT ctid FROM {self._table} WHERE created_at < $1{tenant_sql} "
+                f"ORDER BY created_at LIMIT ${len(params)})",
+                *params,
                 timeout=self._timeout,
             )
             removed = int(result.split()[-1])
@@ -556,8 +768,12 @@ class PostgresEventStore(EventStore):
         if not self._initialized:
             await self.initialize()
 
+        params: list[Any] = []
+        tenant_sql = self._tenant_clause(params)
+        where = f" WHERE {tenant_sql[5:]}" if tenant_sql else ""
         rows = await self._pool.fetch(
-            f"SELECT DISTINCT stream_id FROM {self._table}",
+            f"SELECT DISTINCT stream_id FROM {self._table}{where}",
+            *params,
             timeout=self._timeout,
         )
         for record in rows:
@@ -582,12 +798,13 @@ class PostgresEventStore(EventStore):
         cursor_id = 0
 
         while True:
+            params: list[Any] = [stream_id, cursor_id]
+            tenant_sql = self._tenant_clause(params)
+            params.append(self._replay_batch_size)
             rows = await self._pool.fetch(
                 f"SELECT event_id, payload FROM {self._table} "
-                "WHERE stream_id = $1 AND event_id > $2 ORDER BY event_id LIMIT $3",
-                stream_id,
-                cursor_id,
-                self._replay_batch_size,
+                f"WHERE stream_id = $1 AND event_id > $2{tenant_sql} ORDER BY event_id LIMIT ${len(params)}",
+                *params,
                 timeout=self._timeout,
             )
 

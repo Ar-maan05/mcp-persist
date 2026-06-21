@@ -115,6 +115,7 @@ class RedisEventStore(EventStore):
         redis: Any,  # redis.asyncio.Redis at runtime
         *,
         key_prefix: str = "mcp:",
+        tenant_id: str | None = None,
         ttl: int | None = None,
         max_stream_length: int | None = None,
         metrics: MetricsCollector | None = None,
@@ -129,7 +130,8 @@ class RedisEventStore(EventStore):
             raise ValueError(f"compress_min_bytes must be a non-negative integer, got {compress_min_bytes!r}")
 
         self._redis = redis
-        self._prefix = key_prefix
+        self._tenant_id = tenant_id
+        self._prefix = f"{key_prefix}{tenant_id}:" if tenant_id else key_prefix
         self._ttl = ttl
         self._max_stream_length = max_stream_length
         self._metrics: MetricsCollector = metrics if metrics is not None else NoOpMetricsCollector()
@@ -310,6 +312,86 @@ class RedisEventStore(EventStore):
             await self._publish_notification(stream_id, event_id)
 
         return event_id
+
+    async def _allocate_event_ids(self, n: int) -> list[EventId]:
+        if n < 1:
+            raise ValueError(f"n must be a positive integer, got {n!r}")
+        end = await self._redis.incrby(self._counter_key(), n)
+        start = end - n + 1
+        return [str(i) for i in range(start, end + 1)]
+
+    async def _store_event_with_id(
+        self,
+        stream_id: StreamId,
+        message: JSONRPCMessage | None,
+        event_id: EventId,
+    ) -> None:
+        event_id_int = int(event_id)
+        if message is None:
+            payload = ""
+        else:
+            payload = message.model_dump_json(by_alias=True, exclude_none=True)
+            payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
+
+        async with self._redis.pipeline(transaction=False) as pipe:
+            pipe.hset(
+                self._event_key(event_id),
+                mapping={"stream_id": stream_id, "payload": payload},
+            )
+            pipe.zadd(self._stream_key(stream_id), {event_id: event_id_int})
+            if self._max_stream_length is not None:
+                pipe.zremrangebyrank(self._stream_key(stream_id), 0, -(self._max_stream_length + 1))
+            if self._ttl is not None:
+                pipe.expire(self._event_key(event_id), self._ttl)
+                pipe.expire(self._stream_key(stream_id), self._ttl)
+            await pipe.execute()
+
+        if self._enable_streaming and message is not None:
+            await self._publish_notification(stream_id, event_id)
+
+    async def _store_event_raw(
+        self,
+        stream_id: StreamId,
+        event_id: EventId,
+        payload: str,
+        created_at: float,
+    ) -> None:
+        """Insert an event with an explicit ``event_id`` (idempotent overwrite).
+
+        Bumps the global counter when ``event_id`` exceeds it so later
+        :meth:`store_event` calls stay monotonic. When used as a cold archive
+        store, set ``ttl=None`` so archived events are not re-expired by Redis.
+        """
+        event_id_int = int(event_id)
+        current = await self._redis.get(self._counter_key())
+        if current is None or int(current) < event_id_int:
+            await self._redis.set(self._counter_key(), event_id_int)
+
+        async with self._redis.pipeline(transaction=False) as pipe:
+            pipe.hset(
+                self._event_key(event_id),
+                mapping={
+                    "stream_id": stream_id,
+                    "payload": payload,
+                },
+            )
+            pipe.zadd(
+                self._stream_key(stream_id),
+                {event_id: event_id_int},
+            )
+            if self._ttl is not None:
+                pipe.expire(self._event_key(event_id), self._ttl)
+                pipe.expire(self._stream_key(stream_id), self._ttl)
+            await pipe.execute()
+
+    async def _event_exists(self, event_id: EventId) -> bool:
+        return await self._redis.exists(self._event_key(event_id)) > 0
+
+    async def _stream_id_for_event(self, event_id: EventId) -> StreamId | None:
+        stream_id_raw = await self._redis.hget(self._event_key(event_id), "stream_id")
+        if stream_id_raw is None:
+            return None
+        return cast(StreamId, self._decode(stream_id_raw))
 
     async def replay_events_after(
         self,

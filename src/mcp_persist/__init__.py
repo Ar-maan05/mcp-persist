@@ -28,6 +28,7 @@ events (see :mod:`mcp_persist.proxy`).
 
 from importlib.metadata import PackageNotFoundError, version
 
+from mcp_persist.batching import BatchingEventStore
 from mcp_persist.config import event_store_from_env
 from mcp_persist.fastmcp import with_persistence
 from mcp_persist.metrics import (
@@ -39,8 +40,10 @@ from mcp_persist.migration import MigrationResult, migrate
 from mcp_persist.postgres import PostgresEventStore
 from mcp_persist.proxy import PersistenceProxy
 from mcp_persist.redis import RedisEventStore
-from mcp_persist.scheduler import PurgeScheduler
+from mcp_persist.scheduler import ArchiveScheduler, PurgeScheduler
 from mcp_persist.sqlite import SQLiteEventStore
+from mcp_persist.stored import StoredEvent, archive_expired_batch, count_expired
+from mcp_persist.tiered import ChainedEventStore
 
 try:
     __version__ = version("mcp-persist")
@@ -48,6 +51,9 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree wi
     __version__ = "0.0.0+unknown"
 
 __all__ = [
+    "ArchiveScheduler",
+    "BatchingEventStore",
+    "ChainedEventStore",
     "LoggingMetricsCollector",
     "MetricsCollector",
     "MigrationResult",
@@ -57,7 +63,10 @@ __all__ = [
     "PurgeScheduler",
     "RedisEventStore",
     "SQLiteEventStore",
+    "StoredEvent",
     "__version__",
+    "archive_expired_batch",
+    "count_expired",
     "event_store_from_env",
     "migrate",
     "with_persistence",

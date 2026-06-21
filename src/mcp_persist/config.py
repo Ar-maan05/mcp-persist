@@ -20,7 +20,10 @@ Variables:
 ``MCP_PERSIST_TABLE_NAME``          table name (SQLite / Postgres, optional)
 ``MCP_PERSIST_KEY_PREFIX``          key prefix (Redis, optional)
 ``MCP_PERSIST_MAX_STREAM_LENGTH``   per-stream cap (Redis, optional integer)
-==================================  ==========================================
+``MCP_PERSIST_TENANT_ID``           tenant namespace bound at construction (optional)
+``MCP_PERSIST_COMPRESSION``         ``gzip`` | ``zstd`` payload codec (optional)
+``MCP_PERSIST_BATCH_MAX_EVENTS``    batching wrapper flush size (optional integer)
+``MCP_PERSIST_BATCH_MAX_LATENCY_MS`` batching wrapper flush latency (optional integer)
 
 ``MCP_PERSIST_URL`` maps to the first positional argument of each backend's
 :meth:`create` (``path`` for SQLite, ``url`` for Redis, ``dsn`` for Postgres), so
@@ -33,6 +36,8 @@ import os
 from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING
 
+from mcp_persist.batching import BatchingEventStore
+from mcp_persist.compression import validate_compression
 from mcp_persist.postgres import PostgresEventStore
 from mcp_persist.redis import RedisEventStore
 from mcp_persist.sqlite import SQLiteEventStore
@@ -78,12 +83,29 @@ def event_store_from_env(env: Mapping[str, str] | None = None) -> AbstractAsyncC
     backend = _require(env, f"{_PREFIX}BACKEND").strip().lower()
     url = _require(env, f"{_PREFIX}URL")
     ttl = _optional_int(env, f"{_PREFIX}TTL")
+    tenant_id = env.get(f"{_PREFIX}TENANT_ID") or None
+    compression = env.get(f"{_PREFIX}COMPRESSION") or None
+    if compression:
+        validate_compression(compression)
+    batch_max_events = _optional_int(env, f"{_PREFIX}BATCH_MAX_EVENTS")
+    batch_max_latency_ms = env.get(f"{_PREFIX}BATCH_MAX_LATENCY_MS")
+    batch_latency = float(batch_max_latency_ms) if batch_max_latency_ms else None
 
     if backend == "sqlite":
+        if batch_max_events is not None or batch_latency is not None:
+            raise ValueError(
+                "batching is not supported on the sqlite backend: SQLite's own write-behind "
+                "(commit_interval / commit_max_pending) already batches the fsync that dominates "
+                "its write cost. Drop MCP_PERSIST_BATCH_* or use the redis/postgres backend."
+            )
         kwargs: dict[str, object] = {"ttl": ttl}
         table = env.get(f"{_PREFIX}TABLE_NAME")
         if table:
             kwargs["table_name"] = table
+        if tenant_id:
+            kwargs["tenant_id"] = tenant_id
+        if compression:
+            kwargs["compression"] = compression
         return SQLiteEventStore.create(url, **kwargs)  # type: ignore[arg-type]
 
     if backend == "redis":
@@ -91,16 +113,50 @@ def event_store_from_env(env: Mapping[str, str] | None = None) -> AbstractAsyncC
         prefix = env.get(f"{_PREFIX}KEY_PREFIX")
         if prefix:
             kwargs["key_prefix"] = prefix
+        if tenant_id:
+            kwargs["tenant_id"] = tenant_id
+        if compression:
+            kwargs["compression"] = compression
         max_stream_length = _optional_int(env, f"{_PREFIX}MAX_STREAM_LENGTH")
         if max_stream_length is not None:
             kwargs["max_stream_length"] = max_stream_length
-        return RedisEventStore.create(url, **kwargs)  # type: ignore[arg-type]
+        cm = RedisEventStore.create(url, **kwargs)  # type: ignore[arg-type]
+        return _maybe_batch(cm, batch_max_events, batch_latency)
 
     if backend == "postgres":
         kwargs = {"ttl": ttl}
         table = env.get(f"{_PREFIX}TABLE_NAME")
         if table:
             kwargs["table_name"] = table
-        return PostgresEventStore.create(url, **kwargs)  # type: ignore[arg-type]
+        if tenant_id:
+            kwargs["tenant_id"] = tenant_id
+        if compression:
+            kwargs["compression"] = compression
+        cm = PostgresEventStore.create(url, **kwargs)  # type: ignore[arg-type]
+        return _maybe_batch(cm, batch_max_events, batch_latency)
 
     raise ValueError(f"{_PREFIX}BACKEND must be one of {_BACKENDS}, got {backend!r}")
+
+
+def _maybe_batch(
+    inner_cm: AbstractAsyncContextManager[EventStore],
+    flush_max_events: int | None,
+    flush_max_latency_ms: float | None,
+) -> AbstractAsyncContextManager[EventStore]:
+    if flush_max_events is None and flush_max_latency_ms is None:
+        return inner_cm
+    from contextlib import asynccontextmanager
+
+    events = flush_max_events if flush_max_events is not None else 64
+    latency = flush_max_latency_ms if flush_max_latency_ms is not None else 50.0
+
+    @asynccontextmanager
+    async def wrapped():
+        async with inner_cm as store:
+            batching = BatchingEventStore(store, flush_max_events=events, flush_max_latency_ms=latency)
+            try:
+                yield batching  # type: ignore[misc]
+            finally:
+                await batching.aclose()
+
+    return wrapped()  # type: ignore[return-value]

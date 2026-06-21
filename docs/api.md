@@ -112,19 +112,107 @@ async with PersistenceProxy.create(
 
 ## Large payloads: `compression`
 
-When MCP messages carry large tool results or big JSON-RPC bodies, pass
-`compression="gzip"` to gzip-compress payloads above `compress_min_bytes`
-(default `1024`) before they are stored, cutting storage and, on Redis, memory:
+When MCP messages carry large tool results or big JSON-RPC bodies, pass a
+`compression` codec to compress payloads above `compress_min_bytes` (default
+`1024`) before they are stored, cutting storage and, on Redis, memory:
 
 ```python
-store = PostgresEventStore(pool, ttl=3600, compression="gzip", compress_min_bytes=1024)
+store = PostgresEventStore(pool, ttl=3600, compression="zstd", compress_min_bytes=1024)
 ```
 
-Decompression on read is automatic and **independent of the setting**: a store
-with compression off still reads payloads written compressed, so you can enable
-it on a rolling deploy and `migrate()` across stores with mismatched settings.
-Small or incompressible payloads are stored plain (never made larger), and
-existing data is unaffected. Available on all three backends.
+Two codecs are supported:
+
+- `"gzip"`: always available (stdlib), no extra dependency.
+- `"zstd"`: better ratio and speed for JSON-RPC payloads; needs the `zstd` extra
+  (`pip install "mcp-persist[zstd]"`). Requesting it without the extra installed
+  raises a clear `ValueError` at construction.
+
+Each compressed payload is marker-prefixed (`gz:` or `zs:`), and decompression on
+read is keyed entirely off that marker, so it is **independent of the store's own
+setting**: a store with compression off (or set to the other codec) still reads
+what another store wrote. That keeps a rolling deploy and `migrate()` across
+mismatched settings safe, and lets you switch `gzip` to `zstd` without touching
+existing data. Small or incompressible payloads are stored plain (never made
+larger). Available on all three backends. Decompression is bounded by a 100 MiB
+cap, so a crafted payload is rejected rather than materialized (a decompression
+bomb guard).
+
+## High-throughput writes: `BatchingEventStore`
+
+When a deployment routes a lot of concurrent agentic traffic, the per-event round
+trip to Redis or Postgres becomes the bottleneck before anything else does.
+`BatchingEventStore` wraps a Redis or Postgres store and buffers writes, flushing
+on whichever limit is hit first: a size threshold (`flush_max_events`, default
+`64`) or a latency ceiling (`flush_max_latency_ms`, default `50`):
+
+```python
+from mcp_persist import BatchingEventStore, PostgresEventStore
+
+inner = PostgresEventStore(pool, ttl=3600)
+store = BatchingEventStore(inner, flush_max_events=64, flush_max_latency_ms=50)
+# ... use as any EventStore ...
+await store.aclose()  # flushes the tail
+```
+
+The wrapper still returns each event's `EventId` **synchronously** by
+pre-allocating ID blocks from the inner store (Redis `INCRBY`, a Postgres sequence
+batch), so resumability tokens are handed out immediately; only durability is
+deferred to the flush window. The latency ceiling bounds that window, so the
+worst case for a process crash before a flush is that a client replays from one
+event earlier. `replay_events_after()` flushes pending writes first, so a
+reconnecting client never misses a buffered event.
+
+SQLite is intentionally rejected (a `TypeError` at construction): its own
+write-behind (`commit_interval` / `commit_max_pending`) already batches the fsync
+that dominates SQLite's write cost, so a second batching layer would add nothing.
+Configure batching from the environment with `MCP_PERSIST_BATCH_MAX_EVENTS` and
+`MCP_PERSIST_BATCH_MAX_LATENCY_MS` (on redis/postgres only).
+
+## OpenTelemetry export: `OTelMetricsCollector`
+
+`OTelMetricsCollector` implements the `MetricsCollector` interface on top of
+OpenTelemetry instruments, so the persistence layer's timings and counts
+correlate with the rest of a production stack's tracing instead of living in
+isolation. It needs the `otel` extra (`pip install "mcp-persist[otel]"`):
+
+```python
+from opentelemetry import metrics
+from mcp_persist import RedisEventStore
+from mcp_persist.otel import OTelMetricsCollector
+
+meter = metrics.get_meter("mcp-persist")
+store = RedisEventStore(client, ttl=3600, metrics=OTelMetricsCollector(meter, backend="redis"))
+```
+
+It records `mcp_persist.store.duration_ms` and `mcp_persist.replay.duration_ms`
+histograms plus `mcp_persist.errors` and `mcp_persist.proxy.replay` counters, all
+tagged with `backend` (and `tenant_id` when you pass one). The hooks record
+in-process and never block, matching the synchronous `MetricsCollector` contract.
+
+## Tiered storage: `ArchiveScheduler` and `ChainedEventStore`
+
+Instead of deleting expired events, you can archive them: move events past their
+ttl out of a fast hot store (Redis, or a small SQLite/Postgres) into cold storage
+(a larger Postgres, an S3-backed table, a `ttl=None` store) while keeping recent
+events hot for fast resumption. See [tiered-storage.md](tiered-storage.md) for the
+full design; in brief:
+
+```python
+from mcp_persist import ArchiveScheduler, ChainedEventStore
+
+# Background archival: move expired batches hot -> cold on an interval.
+async with ArchiveScheduler(hot, cold, interval=300, batch_size=500):
+    ...
+
+# Resume across both tiers: writes go to hot, replay falls back to cold on a miss.
+store = ChainedEventStore(hot=hot, cold=cold)
+```
+
+`ArchiveScheduler` archives then deletes each batch (a crash can duplicate into
+cold, which is upsert-safe, but never loses data before it is archived) and drains
+the whole expired backlog each cycle. The lower-level `archive_expired_batch()`
+and `count_expired()` helpers are exported for custom loops. Cold stores preserve
+the original `event_id`, so resumability tokens stay valid across the tiers.
 
 ## Scheduled cleanup: `PurgeScheduler`
 
@@ -158,10 +246,23 @@ async with event_store_from_env() as store:
 ```
 
 Reads `MCP_PERSIST_BACKEND` (`sqlite`/`redis`/`postgres`) and `MCP_PERSIST_URL`,
-plus optional `MCP_PERSIST_TTL`, `MCP_PERSIST_TABLE_NAME` (SQLite/Postgres), and
-`MCP_PERSIST_KEY_PREFIX` / `MCP_PERSIST_MAX_STREAM_LENGTH` (Redis). Returns the
-chosen backend's `create()` context manager, so the connection is opened on entry
-and closed on exit.
+plus optional:
+
+| Variable | Applies to | Effect |
+| --- | --- | --- |
+| `MCP_PERSIST_TTL` | all | event ttl in seconds |
+| `MCP_PERSIST_TABLE_NAME` | sqlite, postgres | table name |
+| `MCP_PERSIST_KEY_PREFIX` | redis | key prefix |
+| `MCP_PERSIST_MAX_STREAM_LENGTH` | redis | per-stream cap |
+| `MCP_PERSIST_TENANT_ID` | all | bind the store to one tenant (see [multi-tenancy.md](multi-tenancy.md)) |
+| `MCP_PERSIST_COMPRESSION` | all | `gzip` or `zstd` payload codec |
+| `MCP_PERSIST_BATCH_MAX_EVENTS` | redis, postgres | wrap in `BatchingEventStore` with this flush size |
+| `MCP_PERSIST_BATCH_MAX_LATENCY_MS` | redis, postgres | batching flush latency ceiling |
+
+Returns the chosen backend's `create()` context manager (wrapped in a
+`BatchingEventStore` when a `MCP_PERSIST_BATCH_*` is set), so the connection is
+opened on entry and closed on exit. Setting a `MCP_PERSIST_BATCH_*` with
+`backend=sqlite` raises `ValueError` (SQLite uses write-behind instead).
 
 ## Readiness probes: `ping()`
 

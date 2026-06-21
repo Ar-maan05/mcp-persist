@@ -154,6 +154,10 @@ store_a = SQLiteEventStore(conn, table_name="server_a")
 store_b = SQLiteEventStore(conn, table_name="server_b")
 ```
 
+To isolate customers within a single shared table instead, bind each store to a
+`tenant_id`; reads, purges, and metrics are then scoped per tenant. See
+[multi-tenancy.md](multi-tenancy.md).
+
 ## RedisEventStore
 
 Stores MCP SSE events in Redis so clients can resume interrupted streams, even across worker restarts or load-balanced deployments.
@@ -213,6 +217,10 @@ store_a = RedisEventStore(redis_client, key_prefix="server-a:")
 store_b = RedisEventStore(redis_client, key_prefix="server-b:")
 ```
 
+To isolate customers within a single shared prefix instead, bind each store to a
+`tenant_id` (folded into the key prefix automatically). See
+[multi-tenancy.md](multi-tenancy.md).
+
 ## PostgresEventStore
 
 Stores MCP SSE events in PostgreSQL so servers can resume interrupted streams
@@ -266,6 +274,10 @@ If multiple MCP servers share a database, use different table names:
 store_a = PostgresEventStore(pool, table_name="server_a")
 store_b = PostgresEventStore(pool, table_name="server_b")
 ```
+
+To isolate customers within a single shared table instead, bind each store to a
+`tenant_id`; reads, purges, and metrics are then scoped per tenant. See
+[multi-tenancy.md](multi-tenancy.md).
 
 ## Connection lifecycle: `create()`
 

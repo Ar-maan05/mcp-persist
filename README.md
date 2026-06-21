@@ -158,6 +158,13 @@ mcp-persist doctor --backend sqlite --url events.db --ttl 3600
 # Per-stream event inventory + latency probe:
 mcp-persist stats --backend sqlite --url events.db
 
+# Force a purge of expired events (or --dry-run to count first):
+mcp-persist purge --backend sqlite --url events.db --ttl 3600
+
+# Copy every stream from one backend to another:
+mcp-persist migrate --from-backend sqlite --from-url events.db \
+    --to-backend postgres --to-url postgresql://localhost/app
+
 # Verify an upstream is reachable and speaks Streamable HTTP, then exit:
 mcp-persist-proxy --upstream http://localhost:8001 --check
 ```
@@ -214,6 +221,10 @@ pip install "mcp-persist[postgres]"
 
 # Multiple backends
 pip install "mcp-persist[sqlite,redis,postgres]"
+
+# Optional extras: zstd compression, OpenTelemetry metrics export
+pip install "mcp-persist[zstd]"
+pip install "mcp-persist[otel]"
 ```
 
 ## Programmatic features at a glance
@@ -223,8 +234,11 @@ Full API and examples in **[docs/api.md](docs/api.md)**.
 
 - **`subscribe()`**: push new events to an in-process consumer as they're written (Redis pub/sub, Postgres `LISTEN`/`NOTIFY`, SQLite polling).
 - **`migrate()`**: copy events between backends (e.g. SQLite → Postgres as you grow), preserving per-stream ordering.
-- **`compression="gzip"`**: transparently gzip large payloads above a threshold; decompression on read is automatic and config-independent.
-- **Metrics**: pass a `metrics=` collector (a `Protocol`, or the built-in `LoggingMetricsCollector`) to emit to Prometheus/Datadog/etc.; zero overhead when unused. The proxy adds an optional `on_proxy_replay` hook for reconnect/replay rates and blocked cross-session attempts.
+- **`compression="gzip"` / `"zstd"`**: transparently compress large payloads above a threshold; decompression on read is automatic and config-independent. `zstd` (via the `zstd` extra) gives a better ratio for JSON-RPC.
+- **Multi-tenancy**: bind a store to a `tenant_id` to isolate event streams per customer inside one shared backend (scoped reads, purge, and metrics). See [docs/multi-tenancy.md](docs/multi-tenancy.md).
+- **`BatchingEventStore`**: buffer writes for high-throughput Redis/Postgres deployments, flushing on a size or latency ceiling while still returning event IDs synchronously. See [docs/api.md](docs/api.md).
+- **Tiered storage**: archive expired events into cold storage instead of deleting them (`ArchiveScheduler`), and resume across both tiers (`ChainedEventStore`). See [docs/tiered-storage.md](docs/tiered-storage.md).
+- **Metrics**: pass a `metrics=` collector (a `Protocol`, the built-in `LoggingMetricsCollector`, or `OTelMetricsCollector` for OpenTelemetry) to emit to Prometheus/Datadog/etc.; zero overhead when unused. The proxy adds an optional `on_proxy_replay` hook for reconnect/replay rates and blocked cross-session attempts.
 - **`PurgeScheduler`**: run `purge_expired()` on an interval for SQLite/Postgres (Redis expires natively).
 - **`event_store_from_env()`**: pick the backend at deploy time from `MCP_PERSIST_*` env vars, no branching in code.
 - **`ping()`**: backend liveness/readiness probe for health endpoints.
@@ -277,8 +291,10 @@ Full methodology, environment spec, percentiles, and analysis in
 | Guide | What's in it |
 |---|---|
 | [docs/backends.md](docs/backends.md) | Manual wiring, per-backend config, write-behind commits, multi-tenant isolation, `create()` lifecycle |
-| [docs/cli.md](docs/cli.md) | `doctor` & `stats` full reference: sample output, `--json`, exit codes |
-| [docs/api.md](docs/api.md) | `subscribe`, `migrate`, metrics, compression, `PurgeScheduler`, env config, `ping` |
+| [docs/cli.md](docs/cli.md) | `doctor`, `stats`, `purge` & `migrate` full reference: sample output, `--json`, exit codes |
+| [docs/api.md](docs/api.md) | `subscribe`, `migrate`, metrics + OpenTelemetry, compression, batching, tiered storage, `PurgeScheduler`, env config, `ping` |
+| [docs/multi-tenancy.md](docs/multi-tenancy.md) | Per-tenant isolation: binding `tenant_id`, scoped reads/purge/metrics, how each backend isolates |
+| [docs/tiered-storage.md](docs/tiered-storage.md) | Archiving expired events to cold storage: `ArchiveScheduler`, `ChainedEventStore`, resume across tiers |
 | [docs/architecture.md](docs/architecture.md) | Event ordering, concurrency & write semantics, consistency & durability |
 | [docs/benchmarks.md](docs/benchmarks.md) | Benchmark methodology, environment spec, full result tables |
 | [docs/production.md](docs/production.md) | Deployment topologies, sizing, failure modes, TLS/credentials, checklist |

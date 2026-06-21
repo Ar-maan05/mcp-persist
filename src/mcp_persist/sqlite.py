@@ -31,7 +31,7 @@ import logging
 import re
 import sqlite3
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
@@ -48,6 +48,7 @@ from pydantic import TypeAdapter
 
 from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
+from mcp_persist.stored import StoredEvent
 
 if TYPE_CHECKING:
     from mcp_persist.metrics import MetricsCollector
@@ -143,6 +144,7 @@ class SQLiteEventStore(EventStore):
         conn: Any,  # aiosqlite.Connection at runtime
         *,
         table_name: str = "mcp_events",
+        tenant_id: str | None = None,
         ttl: int | None = None,
         timeout: float | None = None,
         metrics: MetricsCollector | None = None,
@@ -175,6 +177,8 @@ class SQLiteEventStore(EventStore):
         self._stream_index = f'{schema_prefix}"{bare}_stream_idx"'
         self._created_index = f'{schema_prefix}"{bare}_created_idx"'
         self._ttl = ttl
+        self._tenant_id = tenant_id
+        self._tenant_column_ready = False
         self._timeout = timeout
         self._metrics: MetricsCollector = metrics if metrics is not None else NoOpMetricsCollector()
         self._enable_streaming = enable_streaming
@@ -206,6 +210,7 @@ class SQLiteEventStore(EventStore):
         path: str,
         *,
         table_name: str = "mcp_events",
+        tenant_id: str | None = None,
         ttl: int | None = None,
         timeout: float | None = None,
         commit_interval: float | None = None,
@@ -240,6 +245,7 @@ class SQLiteEventStore(EventStore):
         store = cls(
             conn,
             table_name=table_name,
+            tenant_id=tenant_id,
             ttl=ttl,
             timeout=timeout,
             commit_interval=commit_interval,
@@ -283,6 +289,10 @@ class SQLiteEventStore(EventStore):
                     if row:
                         if self._timeout is not None:
                             await self._conn.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
+                        # A tenant-bound store needs the tenant_id column even on a
+                        # table created by an older version; migrate it once here.
+                        if self._tenant_id is not None:
+                            await self._ensure_tenant_column()
                         self._initialized = True
                         return
             except Exception:
@@ -298,7 +308,8 @@ class SQLiteEventStore(EventStore):
                     "event_id INTEGER PRIMARY KEY AUTOINCREMENT, "
                     "stream_id TEXT NOT NULL, "
                     "payload TEXT NOT NULL, "
-                    "created_at REAL NOT NULL)"
+                    "created_at REAL NOT NULL, "
+                    "tenant_id TEXT)"
                 )
                 await self._conn.execute(
                     f"CREATE INDEX IF NOT EXISTS {self._stream_index} ON {self._index_target} (stream_id, event_id)"
@@ -307,6 +318,9 @@ class SQLiteEventStore(EventStore):
                     f"CREATE INDEX IF NOT EXISTS {self._created_index} ON {self._index_target} (created_at)"
                 )
                 await self._conn.commit()
+                # Bring a table created by an older version (no tenant_id column)
+                # up to date. Idempotent and cheap: one pragma read at startup.
+                await self._ensure_tenant_column()
             except sqlite3.OperationalError as exc:
                 # IF NOT EXISTS handles the normal case; another connection winning a
                 # concurrent create can still surface "already exists" or a locking error.
@@ -317,6 +331,41 @@ class SQLiteEventStore(EventStore):
                 logger.debug("Tolerating concurrent DDL race on %s: %s", self._table, exc)
 
             self._initialized = True
+
+    def _tenant_filter_sql(self) -> tuple[str, tuple[Any, ...]]:
+        """Return an ``AND tenant_id = ?`` clause (and its param) scoping a query.
+
+        A store bound to a tenant scopes every read and write to its own rows; an
+        unbound store (``tenant_id=None``) is unscoped and sees every tenant's
+        events, so it returns an empty clause.
+        """
+        if self._tenant_id is None:
+            return "", ()
+        return " AND tenant_id = ?", (self._tenant_id,)
+
+    async def _ensure_tenant_column(self) -> None:
+        """Add the ``tenant_id`` column + index to a pre-1.9 table (idempotent).
+
+        Fresh tables already declare ``tenant_id`` in ``CREATE TABLE``; this only
+        does work the first time a tenant-bound store opens a table created by an
+        older version. The result is cached so it runs at most once per store.
+        """
+        if self._tenant_column_ready:
+            return
+        table_parts = self._table.split(".")
+        bare = table_parts[-1].strip('"')
+        schema_prefix = f"{table_parts[0]}." if len(table_parts) == 2 else ""
+        query = f"SELECT 1 FROM {schema_prefix}pragma_table_info('{bare}') WHERE name='tenant_id'"
+        async with self._conn.execute(query) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            await self._conn.execute(f"ALTER TABLE {self._table} ADD COLUMN tenant_id TEXT")
+        await self._conn.execute(
+            f'CREATE INDEX IF NOT EXISTS {schema_prefix}"{bare}_tenant_stream_idx" '
+            f"ON {self._index_target} (tenant_id, stream_id, event_id)"
+        )
+        await self._conn.commit()
+        self._tenant_column_ready = True
 
     # EventStore interface
 
@@ -351,11 +400,20 @@ class SQLiteEventStore(EventStore):
             payload = message.model_dump_json(by_alias=True, exclude_none=True)
             payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
 
+        cols = "(stream_id, payload, created_at"
+        vals = "(?, ?, ?"
+        params: list[Any] = [stream_id, payload, time.time()]
+        if self._tenant_id is not None:
+            cols += ", tenant_id"
+            vals += ", ?"
+            params.append(self._tenant_id)
+        cols += ")"
+        vals += ")"
+
         if self._commit_interval is None and self._commit_max_pending is None:
-            # Default: durable commit-per-event (one fsync each).
             async with self._conn.execute(
-                f"INSERT INTO {self._table} (stream_id, payload, created_at) VALUES (?, ?, ?)",
-                (stream_id, payload, time.time()),
+                f"INSERT INTO {self._table} {cols} VALUES {vals}",
+                params,
             ) as cursor:
                 await self._conn.commit()
                 return str(cursor.lastrowid)
@@ -367,8 +425,8 @@ class SQLiteEventStore(EventStore):
         self._ensure_flusher()
         async with self._commit_lock:
             async with self._conn.execute(
-                f"INSERT INTO {self._table} (stream_id, payload, created_at) VALUES (?, ?, ?)",
-                (stream_id, payload, time.time()),
+                f"INSERT INTO {self._table} {cols} VALUES {vals}",
+                params,
             ) as cursor:
                 event_id = str(cursor.lastrowid)
             self._pending += 1
@@ -376,6 +434,13 @@ class SQLiteEventStore(EventStore):
         if flush_now:
             await self._flush()
         return event_id
+
+    # SQLite intentionally exposes no _allocate_event_ids / _store_event_with_id:
+    # BatchingEventStore is for backends whose per-event round trip is the
+    # bottleneck (Redis, Postgres). SQLite's own write-behind (commit_interval /
+    # commit_max_pending) already batches the fsync that dominates its write cost,
+    # so wrapping it in BatchingEventStore is rejected (see config.event_store_from_env
+    # and BatchingEventStore.__init__).
 
     # Write-behind commits
 
@@ -493,9 +558,11 @@ class SQLiteEventStore(EventStore):
         except (TypeError, ValueError):
             return None
 
+        tenant_sql, tenant_params = self._tenant_filter_sql()
+
         async with self._conn.execute(
-            f"SELECT stream_id FROM {self._table} WHERE event_id = ?",
-            (anchor_id,),
+            f"SELECT stream_id FROM {self._table} WHERE event_id = ?{tenant_sql}",
+            (anchor_id, *tenant_params),
         ) as cursor:
             row = await cursor.fetchone()
 
@@ -513,8 +580,8 @@ class SQLiteEventStore(EventStore):
             # expired one is not a gap and is excluded here.
             async with self._conn.execute(
                 f"SELECT 1 FROM {self._table} "
-                "WHERE stream_id = ? AND event_id > ? AND created_at < ? AND payload <> '' LIMIT 1",
-                (stream_id, anchor_id, cutoff),
+                f"WHERE stream_id = ? AND event_id > ? AND created_at < ? AND payload <> ''{tenant_sql} LIMIT 1",
+                (stream_id, anchor_id, cutoff, *tenant_params),
             ) as gap_cursor:
                 if await gap_cursor.fetchone() is not None:
                     logger.warning(
@@ -526,19 +593,21 @@ class SQLiteEventStore(EventStore):
                     )
             query = (
                 f"SELECT event_id, payload FROM {self._table} "
-                "WHERE stream_id = ? AND event_id > ? AND created_at >= ? "
+                f"WHERE stream_id = ? AND event_id > ? AND created_at >= ?{tenant_sql} "
                 "ORDER BY event_id"
             )
             params: tuple[Any, ...] = (
                 stream_id,
                 anchor_id,
                 cutoff,
+                *tenant_params,
             )
         else:
             query = (
-                f"SELECT event_id, payload FROM {self._table} WHERE stream_id = ? AND event_id > ? ORDER BY event_id"
+                f"SELECT event_id, payload FROM {self._table} "
+                f"WHERE stream_id = ? AND event_id > ?{tenant_sql} ORDER BY event_id"
             )
-            params = (stream_id, anchor_id)
+            params = (stream_id, anchor_id, *tenant_params)
 
         # Stream rows one at a time rather than fetchall()-ing the whole backlog
         # into memory: a client resuming from a long-idle Last-Event-ID could
@@ -578,6 +647,117 @@ class SQLiteEventStore(EventStore):
         async with self._conn.execute("SELECT 1"):
             return True
 
+    async def select_expired(
+        self,
+        *,
+        cutoff: float,
+        batch_size: int,
+    ) -> AsyncIterator[StoredEvent]:
+        """Yield up to ``batch_size`` expired events without deleting them."""
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+        if not self._initialized:
+            await self.initialize()
+
+        tenant_sql, tenant_params = self._tenant_filter_sql()
+        async with self._conn.execute(
+            f"SELECT stream_id, event_id, payload, created_at FROM {self._table} "
+            f"WHERE created_at < ?{tenant_sql} ORDER BY event_id LIMIT ?",
+            (cutoff, *tenant_params, batch_size),
+        ) as cursor:
+            async for stream_id, event_id_int, payload, created_at in cursor:
+                yield StoredEvent(
+                    stream_id=stream_id,
+                    event_id=str(event_id_int),
+                    payload=payload,
+                    created_at=created_at,
+                )
+
+    async def count_expired(self) -> int:
+        """Return the number of events older than ``ttl`` without deleting them."""
+        if self._ttl is None:
+            return 0
+        if not self._initialized:
+            await self.initialize()
+        cutoff = time.time() - self._ttl
+        tenant_sql, tenant_params = self._tenant_filter_sql()
+        async with self._conn.execute(
+            f"SELECT COUNT(*) FROM {self._table} WHERE created_at < ?{tenant_sql}",
+            (cutoff, *tenant_params),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return int(row[0])
+
+    async def delete_events(self, events: Sequence[StoredEvent]) -> int:
+        """Delete the given events by ``event_id`` and return the number removed."""
+        if not events:
+            return 0
+        if not self._initialized:
+            await self.initialize()
+        ids = [int(event.event_id) for event in events]
+        placeholders = ",".join("?" * len(ids))
+        async with self._conn.execute(
+            f"DELETE FROM {self._table} WHERE event_id IN ({placeholders})",
+            ids,
+        ) as cursor:
+            await self._conn.commit()
+            return cursor.rowcount
+
+    async def _store_event_raw(
+        self,
+        stream_id: StreamId,
+        event_id: EventId,
+        payload: str,
+        created_at: float,
+    ) -> None:
+        """Insert an event with an explicit ``event_id`` (upsert on conflict).
+
+        Used by tiered archival to copy a hot event into a cold store while
+        preserving its ID. A tenant-bound cold store tags the row with its tenant.
+        """
+        if not self._initialized:
+            await self.initialize()
+        await self._conn.execute(
+            f"INSERT INTO {self._table} (event_id, stream_id, payload, created_at, tenant_id) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(event_id) DO UPDATE SET "
+            "stream_id = excluded.stream_id, "
+            "payload = excluded.payload, "
+            "created_at = excluded.created_at, "
+            "tenant_id = excluded.tenant_id",
+            (int(event_id), stream_id, payload, created_at, self._tenant_id),
+        )
+        await self._conn.commit()
+
+    async def _event_exists(self, event_id: EventId) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        try:
+            anchor_id = int(event_id)
+        except (TypeError, ValueError):
+            return False
+        tenant_sql, tenant_params = self._tenant_filter_sql()
+        async with self._conn.execute(
+            f"SELECT 1 FROM {self._table} WHERE event_id = ?{tenant_sql} LIMIT 1",
+            (anchor_id, *tenant_params),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def _stream_id_for_event(self, event_id: EventId) -> StreamId | None:
+        if not self._initialized:
+            await self.initialize()
+        try:
+            anchor_id = int(event_id)
+        except (TypeError, ValueError):
+            return None
+        tenant_sql, tenant_params = self._tenant_filter_sql()
+        async with self._conn.execute(
+            f"SELECT stream_id FROM {self._table} WHERE event_id = ?{tenant_sql}",
+            (anchor_id, *tenant_params),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row is not None else None
+
     async def purge_expired(self, *, batch_size: int | None = None) -> int:
         """Delete events older than ``ttl`` and return the number removed.
 
@@ -604,11 +784,12 @@ class SQLiteEventStore(EventStore):
             await self.initialize()
 
         cutoff = time.time() - self._ttl
+        tenant_sql, tenant_params = self._tenant_filter_sql()
 
         if batch_size is None:
             async with self._conn.execute(
-                f"DELETE FROM {self._table} WHERE created_at < ?",
-                (cutoff,),
+                f"DELETE FROM {self._table} WHERE created_at < ?{tenant_sql}",
+                (cutoff, *tenant_params),
             ) as cursor:
                 await self._conn.commit()
                 return cursor.rowcount
@@ -620,8 +801,8 @@ class SQLiteEventStore(EventStore):
             # batch via a subselect on the indexed event_id instead.
             async with self._conn.execute(
                 f"DELETE FROM {self._table} WHERE event_id IN "
-                f"(SELECT event_id FROM {self._table} WHERE created_at < ? ORDER BY event_id LIMIT ?)",
-                (cutoff, batch_size),
+                f"(SELECT event_id FROM {self._table} WHERE created_at < ?{tenant_sql} ORDER BY event_id LIMIT ?)",
+                (cutoff, *tenant_params, batch_size),
             ) as cursor:
                 await self._conn.commit()
                 removed = cursor.rowcount
@@ -640,7 +821,10 @@ class SQLiteEventStore(EventStore):
         if not self._initialized:
             await self.initialize()
 
-        async with self._conn.execute(f"SELECT DISTINCT stream_id FROM {self._table}") as cursor:
+        tenant_sql, tenant_params = self._tenant_filter_sql()
+        # The tenant clause replaces the absent WHERE, so strip the leading " AND".
+        where = f" WHERE {tenant_sql[5:]}" if tenant_sql else ""
+        async with self._conn.execute(f"SELECT DISTINCT stream_id FROM {self._table}{where}", tenant_params) as cursor:
             async for (stream_id,) in cursor:
                 yield stream_id
 
@@ -657,9 +841,10 @@ class SQLiteEventStore(EventStore):
         if not self._initialized:
             await self.initialize()
 
+        tenant_sql, tenant_params = self._tenant_filter_sql()
         async with self._conn.execute(
-            f"SELECT event_id, payload FROM {self._table} WHERE stream_id = ? ORDER BY event_id",
-            (stream_id,),
+            f"SELECT event_id, payload FROM {self._table} WHERE stream_id = ?{tenant_sql} ORDER BY event_id",
+            (stream_id, *tenant_params),
         ) as cursor:
             async for event_id_int, payload in cursor:
                 event_id = str(event_id_int)

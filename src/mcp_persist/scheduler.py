@@ -28,6 +28,8 @@ import random
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
+from mcp_persist.stored import archive_expired_batch
+
 if TYPE_CHECKING:
     from typing import Protocol
 
@@ -129,6 +131,123 @@ class PurgeScheduler:
                 self._log.exception("purge_expired failed; the scheduler will retry next interval")
 
     async def __aenter__(self) -> PurgeScheduler:
+        await self.start()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
+
+class ArchiveScheduler:
+    """Periodically archive expired events from a hot store into a cold store.
+
+    Each cycle moves one batch (up to ``batch_size`` events) from ``hot_store``
+    to ``cold_store`` via :func:`~mcp_persist.stored.archive_expired_batch`:
+    read expired rows, ID-preserving insert into cold, then delete from hot.
+    A crash mid-cycle may duplicate rows in cold (upsert-safe) but never loses
+    data from hot before it is archived.
+
+    Args:
+        hot_store:  A store with ``select_expired``, ``delete_events``, and a
+                    positive ``ttl`` (SQLite or Postgres). Redis hot stores expire
+                    keys natively and are not supported here.
+        cold_store: A store with ``_store_event_raw``. Use ``ttl=None`` on Redis
+                    cold stores so archived events are not re-expired.
+        interval:   Seconds between archive cycles. Must be positive.
+        batch_size: Maximum events moved per cycle (default ``500``).
+        jitter:     Extra sleep jitter, same semantics as :class:`PurgeScheduler`.
+        log:        Logger for archive progress and errors.
+    """
+
+    def __init__(
+        self,
+        hot_store: Any,
+        cold_store: Any,
+        interval: float,
+        *,
+        batch_size: int = 500,
+        jitter: float = 0.0,
+        log: logging.Logger | None = None,
+    ) -> None:
+        if getattr(hot_store, "_ttl", None) is None:
+            raise TypeError(
+                f"{type(hot_store).__name__} has ttl=None; ArchiveScheduler requires a hot store "
+                "with a positive ttl so expired events can be selected"
+            )
+        if not callable(getattr(hot_store, "select_expired", None)):
+            raise TypeError(
+                f"{type(hot_store).__name__} has no select_expired(); ArchiveScheduler only applies "
+                "to backends that track created_at (SQLite, Postgres)"
+            )
+        if not callable(getattr(cold_store, "_store_event_raw", None)):
+            raise TypeError(
+                f"{type(cold_store).__name__} has no _store_event_raw(); cold store must support ID-preserving inserts"
+            )
+        if interval <= 0:
+            raise ValueError(f"interval must be a positive number of seconds, got {interval!r}")
+        if jitter < 0:
+            raise ValueError(f"jitter must be a non-negative number of seconds, got {jitter!r}")
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+
+        self._hot = hot_store
+        self._cold = cold_store
+        self._interval = interval
+        self._batch_size = batch_size
+        self._jitter = jitter
+        self._log = log if log is not None else logging.getLogger("mcp_persist.scheduler")
+        self._task: asyncio.Task[None] | None = None
+
+    async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            raise RuntimeError("ArchiveScheduler is already running")
+        self._task = asyncio.create_task(self._run())
+
+    async def aclose(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._task = None
+
+    async def _run(self) -> None:
+        while True:
+            delay = self._interval
+            if self._jitter:
+                delay += random.uniform(0, self._jitter)
+            await asyncio.sleep(delay)
+            try:
+                # Drain the whole expired backlog this cycle, not just one batch:
+                # a store accumulating more than batch_size expired events per
+                # interval would otherwise never catch up. Each batch is its own
+                # archive-then-delete unit, so a short batch means we're caught up.
+                total = 0
+                while True:
+                    archived = await archive_expired_batch(
+                        self._hot,
+                        self._cold,
+                        batch_size=self._batch_size,
+                    )
+                    total += archived
+                    if archived < self._batch_size:
+                        break
+                if total:
+                    self._log.info("archived %d expired events to cold store", total)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                self._log.exception("archive_expired_batch failed; the scheduler will retry next interval")
+
+    async def __aenter__(self) -> ArchiveScheduler:
         await self.start()
         return self
 

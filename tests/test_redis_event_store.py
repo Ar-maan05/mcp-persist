@@ -593,7 +593,7 @@ async def test_uncompressed_store_reads_compressed_payload(redis_client):
 
 def test_invalid_compression_codec_raises():
     with pytest.raises(ValueError):
-        RedisEventStore(object(), compression="zstd")
+        RedisEventStore(object(), compression="lz4")
 
 
 @pytest.mark.anyio

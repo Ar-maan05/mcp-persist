@@ -507,7 +507,7 @@ async def test_uncompressed_store_reads_compressed_payload(conn):
 
 def test_invalid_compression_codec_raises():
     with pytest.raises(ValueError):
-        SQLiteEventStore(object(), compression="zstd")
+        SQLiteEventStore(object(), compression="lz4")
 
 
 def test_negative_compress_min_bytes_raises():

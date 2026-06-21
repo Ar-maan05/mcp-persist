@@ -6,6 +6,8 @@ flags, or the `MCP_PERSIST_*` environment variables when no flags are given.
 
 - [`mcp-persist doctor`](#mcp-persist-doctor): pass/fail health checklist
 - [`mcp-persist stats`](#mcp-persist-stats): per-stream event inventory
+- [`mcp-persist purge`](#mcp-persist-purge): force a purge of expired events
+- [`mcp-persist migrate`](#mcp-persist-migrate): copy events between backends
 - [`mcp-persist-proxy --check`](#mcp-persist-proxy---check): upstream pre-flight probe
 
 ## `mcp-persist doctor`
@@ -78,6 +80,46 @@ the highest stored ID on SQLite/Postgres (which can trail the sequence once old
 rows are purged). Config is resolved exactly like the proxy and `doctor`
 (`--backend`/`--url` or `MCP_PERSIST_*`). An unreachable store prints a single
 error line and exits non-zero rather than a traceback.
+
+## `mcp-persist purge`
+
+`mcp-persist purge` forces an immediate `purge_expired()` against the configured
+store and reports how many events it removed. It is the on-demand counterpart to
+the in-process `PurgeScheduler`, useful for a cron job or a one-off cleanup.
+
+```bash
+# Delete every expired event now:
+mcp-persist purge --backend postgres --url postgresql://localhost/app --ttl 3600
+
+# Delete in bounded chunks so one long DELETE does not contend with live writes:
+mcp-persist purge --batch-size 1000
+
+# Count what would be deleted without touching anything:
+mcp-persist purge --dry-run
+```
+
+`--dry-run` reports the expired count via `count_expired()` and deletes nothing.
+Purge is tenant-scoped when `MCP_PERSIST_TENANT_ID` is set. A store configured
+without a `ttl` purges nothing (there is no expiry to act on).
+
+## `mcp-persist migrate`
+
+`mcp-persist migrate` copies every stream from one backend to another, the CLI
+front end to the `migrate()` function. Use it to move a deployment between
+backends (for example SQLite to Postgres) or to seed a cold archive store.
+
+```bash
+mcp-persist migrate \
+    --from-backend sqlite   --from-url events.db \
+    --to-backend   postgres --to-url   postgresql://localhost/app \
+    --batch-size 500
+```
+
+It prints one line per stream as it goes (or `--json` for a machine-readable
+summary) and exits non-zero if any stream failed. Payloads and ordering are
+preserved; as with `migrate()`, the destination assigns fresh event IDs, so
+in-flight resumability tokens are invalidated by the move (reconnecting clients
+start a fresh stream). Run it during a maintenance window.
 
 ## `mcp-persist-proxy --check`
 
