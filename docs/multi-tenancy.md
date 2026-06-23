@@ -42,6 +42,12 @@ Because `event_id` is globally unique within a table, a tenant store will not
 resolve another tenant's anchor even before the tenant predicate is applied; the
 predicate makes listing, purging, and counting tenant-scoped as well.
 
+## Retention per tenant
+
+If different tenants require different data retention periods, you can apply a per-team retention policy using the `RetentionScheduler`. An unscoped database store (where `tenant_id=None`) sweeps the table to identify distinct tenants, applying the configured window to each. 
+
+For full details on configuring policy windows and managing the database audit logs, see the [Per-Team Retention Policies guide](retention-policies.md).
+
 ## Notes
 
 - The MCP SDK fixes the `EventStore.store_event` / `replay_events_after`

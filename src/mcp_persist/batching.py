@@ -165,6 +165,19 @@ class BatchingEventStore(EventStore):
         self,
         last_event_id: EventId,
         send_callback: EventCallback,
+        stream_id: StreamId | None = None,
     ) -> StreamId | None:
         await self.flush()
-        return await self._inner.replay_events_after(last_event_id, send_callback)
+        return await self._inner.replay_events_after(last_event_id, send_callback, stream_id)  # pyright: ignore[reportCallIssue]
+
+    async def fork_stream(
+        self,
+        parent_stream_id: StreamId,
+        fork_event_id: EventId,
+        new_stream_id: StreamId,
+    ) -> None:
+        """Branch a session at a specific event ID."""
+        await self.flush()
+        fork_method = getattr(self._inner, "fork_stream", None)
+        if fork_method is not None:
+            await fork_method(parent_stream_id, fork_event_id, new_stream_id)

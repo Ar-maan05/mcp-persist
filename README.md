@@ -236,8 +236,15 @@ Full API and examples in **[docs/api.md](docs/api.md)**.
 - **`migrate()`**: copy events between backends (e.g. SQLite → Postgres as you grow), preserving per-stream ordering.
 - **`compression="gzip"` / `"zstd"`**: transparently compress large payloads above a threshold; decompression on read is automatic and config-independent. `zstd` (via the `zstd` extra) gives a better ratio for JSON-RPC.
 - **Multi-tenancy**: bind a store to a `tenant_id` to isolate event streams per customer inside one shared backend (scoped reads, purge, and metrics). See [docs/multi-tenancy.md](docs/multi-tenancy.md).
+- **Per-team retention**: enforce per-tenant policies (`RetentionPolicy`) and record deletions to an append-only audit trail (`DatabaseAuditSink`) via the `RetentionScheduler`:
+  ```python
+  policy = RetentionPolicy(windows={"team-a": 86400, None: 3600}, default=172800)
+  async with RetentionScheduler(store, policy, DatabaseAuditSink(store), interval=300):
+      ...
+  ```
 - **`BatchingEventStore`**: buffer writes for high-throughput Redis/Postgres deployments, flushing on a size or latency ceiling while still returning event IDs synchronously. See [docs/api.md](docs/api.md).
 - **Tiered storage**: archive expired events into cold storage instead of deleting them (`ArchiveScheduler`), and resume across both tiers (`ChainedEventStore`). See [docs/tiered-storage.md](docs/tiered-storage.md).
+- **Event stream forking**: branch an existing stream at any point and replay from that branch with different inputs or models (preserving the original branch intact), turning the linear log into a tree for systematic A/B evaluation. See [docs/api.md](docs/api.md#event-stream-forking).
 - **Metrics**: pass a `metrics=` collector (a `Protocol`, the built-in `LoggingMetricsCollector`, or `OTelMetricsCollector` for OpenTelemetry) to emit to Prometheus/Datadog/etc.; zero overhead when unused. The proxy adds an optional `on_proxy_replay` hook for reconnect/replay rates and blocked cross-session attempts.
 - **`PurgeScheduler`**: run `purge_expired()` on an interval for SQLite/Postgres (Redis expires natively).
 - **`event_store_from_env()`**: pick the backend at deploy time from `MCP_PERSIST_*` env vars, no branching in code.

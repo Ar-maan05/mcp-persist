@@ -69,9 +69,10 @@ class ChainedEventStore(EventStore):
         self,
         last_event_id: EventId,
         send_callback: EventCallback,
+        stream_id: StreamId | None = None,
     ) -> StreamId | None:
         if type(self._metrics) is NoOpMetricsCollector:
-            return await self._replay_events_after_impl(last_event_id, send_callback)
+            return await self._replay_events_after_impl(last_event_id, send_callback, stream_id)
         start = time.monotonic()
         count = 0
 
@@ -81,17 +82,18 @@ class ChainedEventStore(EventStore):
             await send_callback(event)
 
         try:
-            stream_id = await self._replay_events_after_impl(last_event_id, counting_callback)
+            resolved_stream_id = await self._replay_events_after_impl(last_event_id, counting_callback, stream_id)
         except Exception as exc:
             safe_call(self._metrics.on_error, "replay_events_after", exc)
             raise
-        safe_call(self._metrics.on_replay, stream_id, count, (time.monotonic() - start) * 1000.0)
-        return stream_id
+        safe_call(self._metrics.on_replay, resolved_stream_id, count, (time.monotonic() - start) * 1000.0)
+        return resolved_stream_id
 
     async def _replay_events_after_impl(
         self,
         last_event_id: EventId,
         send_callback: EventCallback,
+        stream_id: StreamId | None = None,
     ) -> StreamId | None:
         in_hot = await self._event_exists(self._hot, last_event_id)
         in_cold = await self._event_exists(self._cold, last_event_id)
@@ -100,11 +102,13 @@ class ChainedEventStore(EventStore):
             return None
 
         if in_hot:
-            return await self._hot.replay_events_after(last_event_id, send_callback)
+            return await self._hot.replay_events_after(last_event_id, send_callback, stream_id)  # pyright: ignore[reportCallIssue]
 
-        stream_id = await self._stream_id_for_event(self._cold, last_event_id)
-        if stream_id is None:
-            return None
+        resolved_stream_id = stream_id
+        if resolved_stream_id is None:
+            resolved_stream_id = await self._stream_id_for_event(self._cold, last_event_id)
+            if resolved_stream_id is None:
+                return None
 
         last_replayed = int(last_event_id)
 
@@ -114,9 +118,23 @@ class ChainedEventStore(EventStore):
                 last_replayed = int(event.event_id)
             await send_callback(event)
 
-        await self._cold.replay_events_after(last_event_id, cold_callback)
-        await self._replay_stream_after(self._hot, stream_id, last_replayed, send_callback)
-        return stream_id
+        await self._cold.replay_events_after(last_event_id, cold_callback, resolved_stream_id)  # pyright: ignore[reportCallIssue]
+        await self._replay_stream_after(self._hot, resolved_stream_id, last_replayed, send_callback)
+        return resolved_stream_id
+
+    async def fork_stream(
+        self,
+        parent_stream_id: StreamId,
+        fork_event_id: EventId,
+        new_stream_id: StreamId,
+    ) -> None:
+        """Branch a session at a specific event ID."""
+        fork_hot = getattr(self._hot, "fork_stream", None)
+        if fork_hot is not None:
+            await fork_hot(parent_stream_id, fork_event_id, new_stream_id)
+        fork_cold = getattr(self._cold, "fork_stream", None)
+        if fork_cold is not None:
+            await fork_cold(parent_stream_id, fork_event_id, new_stream_id)
 
     @staticmethod
     async def _event_exists(store: Any, event_id: EventId) -> bool:

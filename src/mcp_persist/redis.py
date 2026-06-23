@@ -393,14 +393,18 @@ class RedisEventStore(EventStore):
             return None
         return cast(StreamId, self._decode(stream_id_raw))
 
+    def _fork_key(self, child_stream_id: StreamId) -> str:
+        return f"{self._prefix}fork:{child_stream_id}"
+
     async def replay_events_after(
         self,
         last_event_id: EventId,
         send_callback: EventCallback,
+        stream_id: StreamId | None = None,
     ) -> StreamId | None:
         """Replay all events on the same stream that occurred after last_event_id."""
         if type(self._metrics) is NoOpMetricsCollector:
-            return await self._replay_events_after_impl(last_event_id, send_callback)
+            return await self._replay_events_after_impl(last_event_id, send_callback, stream_id)
         start = time.monotonic()
         count = 0
 
@@ -410,17 +414,18 @@ class RedisEventStore(EventStore):
             await send_callback(event)
 
         try:
-            stream_id = await self._replay_events_after_impl(last_event_id, counting_callback)
+            resolved_stream_id = await self._replay_events_after_impl(last_event_id, counting_callback, stream_id)
         except Exception as exc:
             safe_call(self._metrics.on_error, "replay_events_after", exc)
             raise
-        safe_call(self._metrics.on_replay, stream_id, count, (time.monotonic() - start) * 1000.0)
-        return stream_id
+        safe_call(self._metrics.on_replay, resolved_stream_id, count, (time.monotonic() - start) * 1000.0)
+        return resolved_stream_id
 
     async def _replay_events_after_impl(
         self,
         last_event_id: EventId,
         send_callback: EventCallback,
+        stream_id: StreamId | None = None,
     ) -> StreamId | None:
         # Last-Event-ID is a client-controlled header; a non-numeric value can't
         # match any stored event, so return None instead of raising on int().
@@ -429,42 +434,58 @@ class RedisEventStore(EventStore):
         except (TypeError, ValueError):
             return None
 
-        stream_id_raw = await self._redis.hget(self._event_key(last_event_id), "stream_id")
+        if stream_id is None:
+            stream_id_raw = await self._redis.hget(self._event_key(last_event_id), "stream_id")
+            if stream_id_raw is None:
+                return None
+            resolved_stream_id: StreamId = cast(StreamId, self._decode(stream_id_raw))
+        else:
+            resolved_stream_id = stream_id
 
-        if stream_id_raw is None:
-            return None
+        segments = await self._get_stream_segments(resolved_stream_id)
 
-        stream_id: StreamId = cast(StreamId, self._decode(stream_id_raw))
+        # We need to collect all matching event IDs across all segments,
+        # then pipeline their payload fetch.
+        event_info: list[tuple[EventId, StreamId]] = []
 
-        raw_ids = await self._redis.zrangebyscore(
-            self._stream_key(stream_id),
-            min=last_int + 1,
-            max="+inf",
-        )
+        for stream, min_id, max_id in segments:
+            low = last_int
+            if min_id is not None and min_id > low:
+                low = min_id
+            if max_id is not None and low >= max_id:
+                continue
 
-        if not raw_ids:
-            return stream_id
+            max_score = str(max_id) if max_id is not None else "+inf"
 
-        event_ids: list[EventId] = [cast(EventId, self._decode(r)) for r in raw_ids]
+            raw_ids = await self._redis.zrangebyscore(
+                self._stream_key(stream),
+                min=low + 1,
+                max=max_score,
+            )
+            if raw_ids:
+                for r in raw_ids:
+                    event_info.append((cast(EventId, self._decode(r)), stream))
+
+        if not event_info:
+            return resolved_stream_id
 
         # Fetch every payload in one pipelined round-trip rather than a blocking
-        # HGET per event (a 500-event backlog was 500 sequential round-trips).
-        # transaction=False keeps it cluster-safe — the hashes can live on
-        # different nodes.
+        # HGET per event. transaction=False keeps it cluster-safe (the hashes
+        # can live on different nodes).
         async with self._redis.pipeline(transaction=False) as pipe:
-            for eid in event_ids:
+            for eid, _ in event_info:
                 pipe.hget(self._event_key(eid), "payload")
             payloads = await pipe.execute()
 
-        stale: list[EventId] = []
+        stale_by_stream: dict[StreamId, list[EventId]] = {}
 
-        for eid, payload_raw in zip(event_ids, payloads):
+        for (eid, stream), payload_raw in zip(event_info, payloads):
             if payload_raw is None:
                 # The payload hash has expired but its ID lingered in the stream
                 # index; collect it so the sorted set can't grow without bound
                 # on a long-lived stream.
                 logger.debug("Event %s payload missing during replay (expired?)", eid)
-                stale.append(eid)
+                stale_by_stream.setdefault(stream, []).append(eid)
                 continue
 
             payload_str = self._decode(payload_raw)
@@ -481,27 +502,78 @@ class RedisEventStore(EventStore):
                 logger.warning(
                     "Skipping event %s on stream %s during replay: failed JSONRPC validation/decompression: %s",
                     eid,
-                    stream_id,
+                    resolved_stream_id,
                     exc,
                 )
                 continue
 
             await send_callback(EventMessage(message=message, event_id=eid))
 
-        if stale:
+        if stale_by_stream:
+            total_stale = sum(len(eids) for eids in stale_by_stream.values())
             # Their stream-index entries are still after the anchor, but the
             # payloads are gone (expired, or a mid-write disconnect never wrote
             # them), so the resuming client misses them with no other signal.
             logger.warning(
                 "Replay gap on stream %s: %d event(s) after Last-Event-ID %s are missing "
                 "(expired or never completed) and cannot be replayed; the resuming client will miss them.",
-                stream_id,
-                len(stale),
+                resolved_stream_id,
+                total_stale,
                 last_event_id,
             )
-            await self._redis.zrem(self._stream_key(stream_id), *stale)
+            async with self._redis.pipeline(transaction=False) as pipe:
+                for stream, eids in stale_by_stream.items():
+                    pipe.zrem(self._stream_key(stream), *eids)
+                await pipe.execute()
 
-        return stream_id
+        return resolved_stream_id
+
+    async def fork_stream(
+        self,
+        parent_stream_id: StreamId,
+        fork_event_id: EventId,
+        new_stream_id: StreamId,
+    ) -> None:
+        """Branch a session at a specific event ID."""
+        key = self._fork_key(new_stream_id)
+        async with self._redis.pipeline(transaction=False) as pipe:
+            pipe.hset(
+                key,
+                mapping={
+                    "parent_stream_id": parent_stream_id,
+                    "fork_event_id": str(fork_event_id),
+                },
+            )
+            if self._ttl is not None:
+                pipe.expire(key, self._ttl)
+            await pipe.execute()
+
+    async def _get_stream_segments(self, stream_id: StreamId) -> list[tuple[StreamId, int | None, int | None]]:
+        segments = []
+        current_stream = stream_id
+        max_id = None
+
+        while True:
+            key = self._fork_key(current_stream)
+            row = await self._redis.hgetall(key)
+            if not row:
+                segments.append((current_stream, None, max_id))
+                break
+
+            decoded_row = {self._decode(k): self._decode(v) for k, v in row.items()}
+            parent_stream = decoded_row.get("parent_stream_id")
+            fork_event_id_str = decoded_row.get("fork_event_id")
+            if parent_stream is None or fork_event_id_str is None:
+                segments.append((current_stream, None, max_id))
+                break
+
+            fork_event_id_int = int(fork_event_id_str)
+            segments.append((current_stream, fork_event_id_int, max_id))
+            max_id = fork_event_id_int
+            current_stream = parent_stream
+
+        segments.reverse()
+        return segments
 
     # Migration support
 
@@ -522,51 +594,51 @@ class RedisEventStore(EventStore):
             yield cast(StreamId, key.removeprefix(prefix))
 
     async def _iter_stream_events(self, stream_id: StreamId) -> AsyncIterator[tuple[EventId, JSONRPCMessage | None]]:
-        """Yield ``(event_id, message)`` for every stored event on a stream, oldest first.
+        """Yield ``(event_id, message)`` for every stored event on a stream, oldest first."""
+        segments = await self._get_stream_segments(stream_id)
 
-        Unlike :meth:`replay_events_after`, this enumerates the whole stream from
-        the beginning (no anchor) and includes priming events (yielded as a
-        ``None`` message), so :func:`mcp_persist.migrate` can copy a stream
-        faithfully. Events whose payload has expired are skipped; a payload that
-        fails JSONRPC validation is logged and skipped rather than aborting the
-        iteration.
-        """
-        raw_ids = await self._redis.zrange(self._stream_key(stream_id), 0, -1)
-        if not raw_ids:
-            return
+        for stream, min_id, max_id in segments:
+            min_score = str(min_id + 1) if min_id is not None else "-inf"
+            max_score = str(max_id) if max_id is not None else "+inf"
 
-        event_ids: list[EventId] = [cast(EventId, self._decode(r)) for r in raw_ids]
-
-        async with self._redis.pipeline(transaction=False) as pipe:
-            for eid in event_ids:
-                pipe.hget(self._event_key(eid), "payload")
-            payloads = await pipe.execute()
-
-        for eid, payload_raw in zip(event_ids, payloads):
-            if payload_raw is None:
-                # Payload hash expired but the ID lingered in the index; nothing
-                # to migrate.
+            raw_ids = await self._redis.zrangebyscore(
+                self._stream_key(stream),
+                min=min_score,
+                max=max_score,
+            )
+            if not raw_ids:
                 continue
 
-            payload_str = self._decode(payload_raw)
+            event_ids: list[EventId] = [cast(EventId, self._decode(r)) for r in raw_ids]
 
-            if not payload_str:
-                # Priming event: stored with an empty payload, copied as None.
-                yield eid, None
-                continue
+            async with self._redis.pipeline(transaction=False) as pipe:
+                for eid in event_ids:
+                    pipe.hget(self._event_key(eid), "payload")
+                payloads = await pipe.execute()
 
-            try:
-                message = jsonrpc_message_adapter.validate_json(decompress_payload(payload_str))
-            except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
-                logger.warning(
-                    "Skipping event %s on stream %s during migration: failed JSONRPC validation/decompression: %s",
-                    eid,
-                    stream_id,
-                    exc,
-                )
-                continue
+            for eid, payload_raw in zip(event_ids, payloads):
+                if payload_raw is None:
+                    continue
 
-            yield eid, message
+                payload_str = self._decode(payload_raw)
+
+                if not payload_str:
+                    # Priming event: stored with an empty payload, copied as None.
+                    yield eid, None
+                    continue
+
+                try:
+                    message = jsonrpc_message_adapter.validate_json(decompress_payload(payload_str))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Skipping event %s on stream %s during migration: failed JSONRPC validation/decompression: %s",
+                        eid,
+                        stream_id,
+                        exc,
+                    )
+                    continue
+
+                yield eid, message
 
     # Push-based streaming
 

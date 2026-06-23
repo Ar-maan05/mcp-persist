@@ -5,6 +5,12 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] - 2026-06-23
+
+### Added
+- **Event stream forking.** Support branching an existing stream (`stream_id`) at any point (a specific `fork_event_id`) and replaying from that branch with different inputs or a different model, preserving the original branch intact. This turns the linear event log history into a tree for systematic A/B evaluation. The SQLite, Redis, and Postgres stores implement `fork_stream` and update event replay (`replay_events_after` / `_iter_stream_events`) to traverse segment boundaries dynamically. The wrappers `BatchingEventStore` and `ChainedEventStore` propagate the optional `stream_id` parameter and delegate the fork registration to their inner store.
+- **Per-team retention policies with audit logging.** Added support for defining per-tenant retention windows via `RetentionPolicy` and periodically purging expired events via a background `RetentionScheduler`. Deletions are captured and written to a pluggable `AuditSink`, which ships with three implementations: `NoOpAuditSink` (discards entries), `LoggingAuditSink` (logs entries as JSON), and `DatabaseAuditSink` (writes to an append-only table). Features a `strict_audit` mode that re-raises sink errors to prevent silent compliance failures. The SQLite and Postgres stores implement `purge_tenant` and `distinct_tenants` (Redis is rejected by design). Policies can be configured from environment variables `MCP_PERSIST_RETENTION_WINDOWS` and `MCP_PERSIST_RETENTION_DEFAULT` using the `retention_policy_from_env()` helper. See `docs/retention-policies.md`.
+
 ## [1.9.0] - 2026-06-21
 
 ### Added

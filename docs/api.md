@@ -11,6 +11,9 @@ and configuring the stores themselves, see [backends.md](backends.md).
 - [Scheduled cleanup: `PurgeScheduler`](#scheduled-cleanup-purgescheduler)
 - [Configuration from the environment: `event_store_from_env()`](#configuration-from-the-environment-event_store_from_env)
 - [Readiness probes: `ping()`](#readiness-probes-ping)
+- [Per-team retention policies](#per-team-retention-policies)
+- [Event stream forking](#event-stream-forking)
+
 
 ## Real-time streaming: `subscribe()`
 
@@ -271,3 +274,71 @@ Every store exposes `await store.ping()` (Redis `PING`, Postgres/SQLite
 reachable and lets the driver error propagate otherwise, so a health endpoint can
 report "not ready" when the store's dependency is down. See
 [production.md](production.md#11-readiness-probes-ping).
+
+## Per-team retention policies
+
+When different teams require different event retention windows accompanied by a compliant, append-only deletion audit trail, use the retention policy components.
+
+### `RetentionPolicy`
+
+A frozen dataclass defining retention windows (in seconds) per tenant:
+
+```python
+from mcp_persist import RetentionPolicy
+
+policy = RetentionPolicy(
+    windows={
+        "team-a": 86400,
+        "team-b": 604800,
+        None: 3600,
+    },
+    default=172800,
+)
+```
+
+* `window_for(tenant_id)`: Return the retention window in seconds for the given tenant (or `None` to skip purging it).
+
+### `retention_policy_from_env`
+
+Build a `RetentionPolicy` from environment variables `MCP_PERSIST_RETENTION_WINDOWS` and `MCP_PERSIST_RETENTION_DEFAULT`. Returns `None` if unset.
+
+### `RetentionScheduler`
+
+A background scheduler that periodically checks and deletes expired events for each tenant:
+
+```python
+from mcp_persist import RetentionScheduler, DatabaseAuditSink
+
+sink = DatabaseAuditSink(store)
+async with RetentionScheduler(store, policy, sink, interval=300.0):
+    # Runs in the background
+    ...
+```
+
+* `strict_audit=True` (default): Propagates audit sink exceptions to force operator attention under logging failures.
+
+### Audit Sinks
+
+Pluggable destinations conforming to the `AuditSink` protocol (`record(entry)` method):
+
+* `NoOpAuditSink`: Discards all entries.
+* `LoggingAuditSink`: Writes entries as JSON lines to the python logger.
+* `DatabaseAuditSink`: Appends entries to a dedicated table (`{events_table}_retention_audit`).
+
+
+## Event stream forking
+
+Event stream forking allows branching an existing session (`stream_id`) at any point (a specific `fork_event_id`), letting clients/runners replay from that branch with different inputs or a different model while preserving the original branch intact. This turns the linear event log history into a tree for systematic A/B evaluation.
+
+```python
+# Fork 'orig-stream' at event '123' into a new branch 'fork-stream'
+await store.fork_stream("orig-stream", "123", "fork-stream")
+
+# Replay events for the branched session starting from the beginning
+await store.replay_events_after("0", send_callback, "fork-stream")
+```
+
+- **Ancestry resolution:** replaying or iterating over a child stream dynamically traverses all ancestor stream segments up to the root, only scanning the slice of events valid for that segment.
+- **Segment scope:** replaying handles boundary constraints (`min_id` and `max_id`) per segment segmentally.
+- **Unified interfaces:** supported natively by SQLite, Redis, and Postgres backends, as well as `BatchingEventStore` and `ChainedEventStore`.
+

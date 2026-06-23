@@ -29,7 +29,7 @@ events (see :mod:`mcp_persist.proxy`).
 from importlib.metadata import PackageNotFoundError, version
 
 from mcp_persist.batching import BatchingEventStore
-from mcp_persist.config import event_store_from_env
+from mcp_persist.config import event_store_from_env, retention_policy_from_env
 from mcp_persist.fastmcp import with_persistence
 from mcp_persist.metrics import (
     LoggingMetricsCollector,
@@ -40,7 +40,15 @@ from mcp_persist.migration import MigrationResult, migrate
 from mcp_persist.postgres import PostgresEventStore
 from mcp_persist.proxy import PersistenceProxy
 from mcp_persist.redis import RedisEventStore
-from mcp_persist.scheduler import ArchiveScheduler, PurgeScheduler
+from mcp_persist.retention import (
+    AuditSink,
+    DatabaseAuditSink,
+    DeletionAuditEntry,
+    LoggingAuditSink,
+    NoOpAuditSink,
+    RetentionPolicy,
+)
+from mcp_persist.scheduler import ArchiveScheduler, PurgeScheduler, RetentionScheduler
 from mcp_persist.sqlite import SQLiteEventStore
 from mcp_persist.stored import StoredEvent, archive_expired_batch, count_expired
 from mcp_persist.tiered import ChainedEventStore
@@ -52,16 +60,23 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree wi
 
 __all__ = [
     "ArchiveScheduler",
+    "AuditSink",
     "BatchingEventStore",
     "ChainedEventStore",
+    "DatabaseAuditSink",
+    "DeletionAuditEntry",
+    "LoggingAuditSink",
     "LoggingMetricsCollector",
     "MetricsCollector",
     "MigrationResult",
+    "NoOpAuditSink",
     "NoOpMetricsCollector",
     "PersistenceProxy",
     "PostgresEventStore",
     "PurgeScheduler",
     "RedisEventStore",
+    "RetentionPolicy",
+    "RetentionScheduler",
     "SQLiteEventStore",
     "StoredEvent",
     "__version__",
@@ -69,5 +84,6 @@ __all__ = [
     "count_expired",
     "event_store_from_env",
     "migrate",
+    "retention_policy_from_env",
     "with_persistence",
 ]

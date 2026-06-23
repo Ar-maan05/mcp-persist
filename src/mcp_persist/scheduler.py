@@ -28,10 +28,13 @@ import random
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
+from mcp_persist.retention import DeletionAuditEntry
 from mcp_persist.stored import archive_expired_batch
 
 if TYPE_CHECKING:
     from typing import Protocol
+
+    from mcp_persist.retention import AuditSink, RetentionPolicy
 
     class _Purgeable(Protocol):
         async def purge_expired(self, *, batch_size: int | None = ...) -> int: ...
@@ -248,6 +251,122 @@ class ArchiveScheduler:
                 self._log.exception("archive_expired_batch failed; the scheduler will retry next interval")
 
     async def __aenter__(self) -> ArchiveScheduler:
+        await self.start()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
+
+class RetentionScheduler:
+    """Background scheduler applying per-tenant retention policies with audit logging.
+
+    Applies retention windows specified in a RetentionPolicy, deletes expired rows,
+    and captures audit entries written to an AuditSink.
+    """
+
+    def __init__(
+        self,
+        store: Any,
+        policy: RetentionPolicy,
+        audit_sink: AuditSink,
+        interval: float,
+        *,
+        jitter: float = 0.0,
+        batch_size: int | None = None,
+        strict_audit: bool = True,
+        audit_empty: bool = False,
+        log: logging.Logger | None = None,
+    ) -> None:
+        if not callable(getattr(store, "purge_tenant", None)) or not callable(getattr(store, "distinct_tenants", None)):
+            raise TypeError(
+                f"{type(store).__name__} lacks purge_tenant or distinct_tenants; "
+                "RetentionScheduler does not support this store (e.g. RedisEventStore is unsupported)"
+            )
+        if interval <= 0:
+            raise ValueError(f"interval must be a positive number of seconds, got {interval!r}")
+        if jitter < 0:
+            raise ValueError(f"jitter must be a non-negative number of seconds, got {jitter!r}")
+        if batch_size is not None and batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer or None, got {batch_size!r}")
+        if policy is None or not hasattr(policy, "window_for"):
+            raise TypeError("policy must be a RetentionPolicy instance")
+        if audit_sink is None:
+            raise TypeError("audit_sink cannot be None")
+
+        self._store = store
+        self._policy = policy
+        self._audit_sink = audit_sink
+        self._interval = interval
+        self._jitter = jitter
+        self._batch_size = batch_size
+        self._strict_audit = strict_audit
+        self._audit_empty = audit_empty
+        self._log = log if log is not None else logging.getLogger("mcp_persist.scheduler")
+        self._task: asyncio.Task[None] | None = None
+
+    async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            raise RuntimeError("RetentionScheduler is already running")
+        self._task = asyncio.create_task(self._run())
+
+    async def aclose(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._task = None
+
+    async def _run(self) -> None:
+        import time
+
+        while True:
+            delay = self._interval
+            if self._jitter:
+                delay += random.uniform(0, self._jitter)
+            await asyncio.sleep(delay)
+            try:
+                now = time.time()
+                tenants = await self._store.distinct_tenants()
+                for tenant in tenants:
+                    window = self._policy.window_for(tenant)
+                    if window is None:
+                        continue
+                    cutoff = now - window
+                    deleted = await self._store.purge_tenant(tenant, window_seconds=window, batch_size=self._batch_size)
+                    if deleted == 0 and not self._audit_empty:
+                        continue
+                    entry = DeletionAuditEntry(
+                        timestamp=now,
+                        tenant_id=tenant,
+                        window_seconds=window,
+                        cutoff=cutoff,
+                        deleted_count=deleted,
+                        backend=self._store.backend_name,
+                        source_table=self._store.table_name,
+                        default_applied=(tenant not in self._policy.windows),
+                    )
+                    try:
+                        await self._audit_sink.record(entry)
+                    except Exception:
+                        self._log.exception("audit sink failed to record deletion for tenant %r", tenant)
+                        if self._strict_audit:
+                            raise
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                self._log.exception("RetentionScheduler cycle failed; the scheduler will retry next interval")
+
+    async def __aenter__(self) -> RetentionScheduler:
         await self.start()
         return self
 

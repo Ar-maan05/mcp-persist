@@ -176,6 +176,7 @@ class SQLiteEventStore(EventStore):
         self._index_target = f'"{bare}"'
         self._stream_index = f'{schema_prefix}"{bare}_stream_idx"'
         self._created_index = f'{schema_prefix}"{bare}_created_idx"'
+        self._forks_table = f'{schema_prefix}"{bare}_forks"'
         self._ttl = ttl
         self._tenant_id = tenant_id
         self._tenant_column_ready = False
@@ -316,6 +317,12 @@ class SQLiteEventStore(EventStore):
                 )
                 await self._conn.execute(
                     f"CREATE INDEX IF NOT EXISTS {self._created_index} ON {self._index_target} (created_at)"
+                )
+                await self._conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {self._forks_table} ("
+                    "child_stream_id TEXT PRIMARY KEY, "
+                    "parent_stream_id TEXT NOT NULL, "
+                    "fork_event_id INTEGER NOT NULL)"
                 )
                 await self._conn.commit()
                 # Bring a table created by an older version (no tenant_id column)
@@ -523,10 +530,11 @@ class SQLiteEventStore(EventStore):
         self,
         last_event_id: EventId,
         send_callback: EventCallback,
+        stream_id: StreamId | None = None,
     ) -> StreamId | None:
         """Replay all events on the same stream that occurred after last_event_id."""
         if type(self._metrics) is NoOpMetricsCollector:
-            return await self._replay_events_after_impl(last_event_id, send_callback)
+            return await self._replay_events_after_impl(last_event_id, send_callback, stream_id)
         start = time.monotonic()
         count = 0
 
@@ -536,23 +544,22 @@ class SQLiteEventStore(EventStore):
             await send_callback(event)
 
         try:
-            stream_id = await self._replay_events_after_impl(last_event_id, counting_callback)
+            resolved_stream_id = await self._replay_events_after_impl(last_event_id, counting_callback, stream_id)
         except Exception as exc:
             safe_call(self._metrics.on_error, "replay_events_after", exc)
             raise
-        safe_call(self._metrics.on_replay, stream_id, count, (time.monotonic() - start) * 1000.0)
-        return stream_id
+        safe_call(self._metrics.on_replay, resolved_stream_id, count, (time.monotonic() - start) * 1000.0)
+        return resolved_stream_id
 
     async def _replay_events_after_impl(
         self,
         last_event_id: EventId,
         send_callback: EventCallback,
+        stream_id: StreamId | None = None,
     ) -> StreamId | None:
         if not self._initialized:
             await self.initialize()
 
-        # Last-Event-ID is a client-controlled header; a non-numeric value can't
-        # match any stored event, so return None instead of raising on int().
         try:
             anchor_id = int(last_event_id)
         except (TypeError, ValueError):
@@ -560,80 +567,114 @@ class SQLiteEventStore(EventStore):
 
         tenant_sql, tenant_params = self._tenant_filter_sql()
 
-        async with self._conn.execute(
-            f"SELECT stream_id FROM {self._table} WHERE event_id = ?{tenant_sql}",
-            (anchor_id, *tenant_params),
-        ) as cursor:
-            row = await cursor.fetchone()
-
-        if row is None:
-            return None
-
-        stream_id: StreamId = row[0]
-
-        if self._ttl is not None:
-            cutoff = time.time() - self._ttl
-            # Detect an unrecoverable gap: the anchor still exists but one or more
-            # client-visible events after it have expired and will be silently
-            # skipped below, so the resuming client misses them with no other
-            # signal. Priming events (empty payload) are never replayed, so an
-            # expired one is not a gap and is excluded here.
+        if stream_id is None:
             async with self._conn.execute(
-                f"SELECT 1 FROM {self._table} "
-                f"WHERE stream_id = ? AND event_id > ? AND created_at < ? AND payload <> ''{tenant_sql} LIMIT 1",
-                (stream_id, anchor_id, cutoff, *tenant_params),
-            ) as gap_cursor:
-                if await gap_cursor.fetchone() is not None:
-                    logger.warning(
-                        "Replay gap on stream %s: one or more events after Last-Event-ID %s have expired "
-                        "(ttl=%ss) and cannot be replayed; the resuming client will miss them.",
-                        stream_id,
-                        last_event_id,
-                        self._ttl,
-                    )
-            query = (
-                f"SELECT event_id, payload FROM {self._table} "
-                f"WHERE stream_id = ? AND event_id > ? AND created_at >= ?{tenant_sql} "
-                "ORDER BY event_id"
-            )
-            params: tuple[Any, ...] = (
-                stream_id,
-                anchor_id,
-                cutoff,
-                *tenant_params,
-            )
+                f"SELECT stream_id FROM {self._table} WHERE event_id = ?{tenant_sql}",
+                (anchor_id, *tenant_params),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return None
+            resolved_stream_id: StreamId = row[0]
         else:
-            query = (
-                f"SELECT event_id, payload FROM {self._table} "
-                f"WHERE stream_id = ? AND event_id > ?{tenant_sql} ORDER BY event_id"
-            )
-            params = (stream_id, anchor_id, *tenant_params)
+            resolved_stream_id = stream_id
 
-        # Stream rows one at a time rather than fetchall()-ing the whole backlog
-        # into memory: a client resuming from a long-idle Last-Event-ID could
-        # otherwise pull hundreds of thousands of rows into RAM at once.
-        async with self._conn.execute(query, params) as cursor:
-            async for event_id_int, payload in cursor:
-                # Priming events (empty payload) are stored but never replayed.
-                if not payload:
-                    continue
+        segments = await self._get_stream_segments(resolved_stream_id)
+        cutoff = time.time() - self._ttl if self._ttl is not None else None
 
-                try:
-                    message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
-                except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
-                    # A single corrupt/unparseable payload must not abort the whole
-                    # replay: a reconnecting client would otherwise lose every event
-                    # on the stream, not just the bad one. Skip it and keep going.
-                    logger.warning(
-                        "Skipping event %s on stream %s during replay: failed JSONRPC validation/decompression: %s",
-                        event_id_int,
-                        stream_id,
-                        exc,
-                    )
-                    continue
-                await send_callback(EventMessage(message=message, event_id=str(event_id_int)))
+        for stream, min_id, max_id in segments:
+            low = anchor_id
+            if min_id is not None and min_id > low:
+                low = min_id
+            if max_id is not None and low >= max_id:
+                continue
 
-        return stream_id
+            if cutoff is not None:
+                gap_where = [f"stream_id = ?{tenant_sql}", "event_id > ?", "created_at < ?", "payload <> ''"]
+                gap_params = [stream, *tenant_params, low, cutoff]
+                if max_id is not None:
+                    gap_where.append("event_id <= ?")
+                    gap_params.append(max_id)
+                gap_query = f"SELECT 1 FROM {self._table} WHERE " + " AND ".join(gap_where) + " LIMIT 1"
+                async with self._conn.execute(gap_query, gap_params) as gap_cursor:
+                    if await gap_cursor.fetchone() is not None:
+                        logger.warning(
+                            "Replay gap on stream %s: one or more events after Last-Event-ID %s have expired "
+                            "(ttl=%ss) and cannot be replayed; the resuming client will miss them.",
+                            resolved_stream_id,
+                            last_event_id,
+                            self._ttl,
+                        )
+
+            where_clauses = [f"stream_id = ?{tenant_sql}", "event_id > ?"]
+            params = [stream, *tenant_params, low]
+            if max_id is not None:
+                where_clauses.append("event_id <= ?")
+                params.append(max_id)
+            if cutoff is not None:
+                where_clauses.append("created_at >= ?")
+                params.append(cutoff)
+
+            query = f"SELECT event_id, payload FROM {self._table} WHERE {' AND '.join(where_clauses)} ORDER BY event_id"
+            async with self._conn.execute(query, params) as cursor:
+                async for event_id_int, payload in cursor:
+                    if not payload:
+                        continue
+                    try:
+                        message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Skipping event %s on stream %s during replay: failed JSONRPC validation/decompression: %s",
+                            event_id_int,
+                            resolved_stream_id,
+                            exc,
+                        )
+                        continue
+                    await send_callback(EventMessage(message=message, event_id=str(event_id_int)))
+
+        return resolved_stream_id
+
+    async def fork_stream(
+        self,
+        parent_stream_id: StreamId,
+        fork_event_id: EventId,
+        new_stream_id: StreamId,
+    ) -> None:
+        """Branch a session at a specific event ID."""
+        if not self._initialized:
+            await self.initialize()
+        await self._conn.execute(
+            f"INSERT OR REPLACE INTO {self._forks_table} "
+            "(child_stream_id, parent_stream_id, fork_event_id) VALUES (?, ?, ?)",
+            (new_stream_id, parent_stream_id, int(fork_event_id)),
+        )
+        await self._conn.commit()
+
+    async def _get_stream_segments(self, stream_id: StreamId) -> list[tuple[StreamId, int | None, int | None]]:
+        if not self._initialized:
+            await self.initialize()
+        segments = []
+        current_stream = stream_id
+        max_id = None
+
+        while True:
+            async with self._conn.execute(
+                f"SELECT parent_stream_id, fork_event_id FROM {self._forks_table} WHERE child_stream_id = ?",
+                (current_stream,),
+            ) as cursor:
+                parent_row = await cursor.fetchone()
+
+            if parent_row is None:
+                segments.append((current_stream, None, max_id))
+                break
+
+            parent_stream, fork_event_id_int = parent_row[0], int(parent_row[1])
+            segments.append((current_stream, fork_event_id_int, max_id))
+            max_id = fork_event_id_int
+            current_stream = parent_stream
+
+        segments.reverse()
+        return segments
 
     # Maintenance
 
@@ -811,6 +852,81 @@ class SQLiteEventStore(EventStore):
                 break
         return total
 
+    @property
+    def backend_name(self) -> str:
+        """Return the backend name."""
+        return "sqlite"
+
+    @property
+    def table_name(self) -> str:
+        """Return the events table name."""
+        return self._table
+
+    async def purge_tenant(
+        self,
+        tenant_id: str | None,
+        *,
+        window_seconds: int,
+        batch_size: int | None = None,
+    ) -> int:
+        """Delete this tenant's events older than `window_seconds` and return the count.
+
+        Unlike `purge_expired`, the tenant and window are explicit arguments rather
+        than the store's bound `tenant_id` / `ttl`, so one unscoped store can apply a
+        different retention window to each tenant in a single pass. The cutoff is
+        captured once up front.
+        """
+        if window_seconds <= 0:
+            raise ValueError(f"window_seconds must be a positive integer, got {window_seconds!r}")
+        if batch_size is not None and batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer or None, got {batch_size!r}")
+
+        if not self._initialized:
+            await self.initialize()
+
+        cutoff = time.time() - window_seconds
+
+        if tenant_id is None:
+            tenant_sql = "tenant_id IS NULL"
+            tenant_params: tuple[Any, ...] = ()
+        else:
+            tenant_sql = "tenant_id = ?"
+            tenant_params = (tenant_id,)
+
+        if batch_size is None:
+            async with self._conn.execute(
+                f"DELETE FROM {self._table} WHERE created_at < ? AND {tenant_sql}",
+                (cutoff, *tenant_params),
+            ) as cursor:
+                await self._conn.commit()
+                return cursor.rowcount
+
+        total = 0
+        while True:
+            # SQLite only supports DELETE ... LIMIT when built with
+            # SQLITE_ENABLE_UPDATE_DELETE_LIMIT (not the default), so bound the
+            # batch via a subselect on the indexed event_id instead.
+            async with self._conn.execute(
+                f"DELETE FROM {self._table} WHERE event_id IN "
+                f"(SELECT event_id FROM {self._table} WHERE created_at < ? AND {tenant_sql} ORDER BY event_id LIMIT ?)",
+                (cutoff, *tenant_params, batch_size),
+            ) as cursor:
+                await self._conn.commit()
+                removed = cursor.rowcount
+            total += removed
+            if removed < batch_size:
+                break
+        return total
+
+    async def distinct_tenants(self) -> list[str | None]:
+        """Return every distinct tenant_id present in the table, including None."""
+        if not self._initialized:
+            await self.initialize()
+
+        async with self._conn.execute(f"SELECT DISTINCT tenant_id FROM {self._table}") as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
     # Migration support
 
     async def list_streams(self) -> AsyncIterator[StreamId]:
@@ -829,42 +945,39 @@ class SQLiteEventStore(EventStore):
                 yield stream_id
 
     async def _iter_stream_events(self, stream_id: StreamId) -> AsyncIterator[tuple[EventId, JSONRPCMessage | None]]:
-        """Yield ``(event_id, message)`` for every stored event on a stream, oldest first.
-
-        Unlike :meth:`replay_events_after`, this enumerates the whole stream from
-        the beginning (no anchor) and includes priming events (yielded as a
-        ``None`` message), so :func:`mcp_persist.migrate` can copy a stream
-        faithfully. Rows are not filtered by ``ttl`` — every stored row is
-        yielded; run :meth:`purge_expired` first to drop stale events. A payload
-        that fails JSONRPC validation is logged and skipped.
-        """
+        """Yield ``(event_id, message)`` for every stored event on a stream, oldest first."""
         if not self._initialized:
             await self.initialize()
 
+        segments = await self._get_stream_segments(stream_id)
         tenant_sql, tenant_params = self._tenant_filter_sql()
-        async with self._conn.execute(
-            f"SELECT event_id, payload FROM {self._table} WHERE stream_id = ?{tenant_sql} ORDER BY event_id",
-            (stream_id, *tenant_params),
-        ) as cursor:
-            async for event_id_int, payload in cursor:
-                event_id = str(event_id_int)
-                if not payload:
-                    # Priming event: stored with an empty payload, copied as None.
-                    yield event_id, None
-                    continue
 
-                try:
-                    message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
-                except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
-                    logger.warning(
-                        "Skipping event %s on stream %s during migration: failed JSONRPC validation/decompression: %s",
-                        event_id,
-                        stream_id,
-                        exc,
-                    )
-                    continue
+        for stream, min_id, max_id in segments:
+            where_clauses = [f"stream_id = ?{tenant_sql}"]
+            params = [stream, *tenant_params]
+            if min_id is not None:
+                where_clauses.append("event_id > ?")
+                params.append(min_id)
+            if max_id is not None:
+                where_clauses.append("event_id <= ?")
+                params.append(max_id)
 
-                yield event_id, message
+            query = f"SELECT event_id, payload FROM {self._table} WHERE {' AND '.join(where_clauses)} ORDER BY event_id"
+            async with self._conn.execute(query, params) as cursor:
+                async for event_id_int, payload in cursor:
+                    event_id = str(event_id_int)
+                    if not payload:
+                        yield event_id, None
+                        continue
+
+                    try:
+                        message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Skipping event %s on stream %s: failed validation: %s", event_id, stream_id, exc
+                        )
+                        continue
+                    yield event_id, message
 
     # Push-based streaming
 

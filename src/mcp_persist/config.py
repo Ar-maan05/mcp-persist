@@ -47,6 +47,8 @@ if TYPE_CHECKING:
 
     from mcp.server.streamable_http import EventStore
 
+    from mcp_persist.retention import RetentionPolicy
+
 _PREFIX = "MCP_PERSIST_"
 _BACKENDS = ("sqlite", "redis", "postgres")
 
@@ -160,3 +162,67 @@ def _maybe_batch(
                 await batching.aclose()
 
     return wrapped()  # type: ignore[return-value]
+
+
+def retention_policy_from_env(env: Mapping[str, str] | None = None) -> RetentionPolicy | None:
+    """Build a RetentionPolicy from MCP_PERSIST_RETENTION_* env vars, or None if unset.
+
+    If neither env var is set, returns None. Raises ValueError if validation
+    fails.
+    """
+    import json
+    import os
+
+    from mcp_persist.retention import RetentionPolicy
+
+    target_env = os.environ if env is None else env
+
+    windows_raw = target_env.get("MCP_PERSIST_RETENTION_WINDOWS")
+    default_raw = target_env.get("MCP_PERSIST_RETENTION_DEFAULT")
+
+    if windows_raw is None and default_raw is None:
+        return None
+
+    windows: dict[str | None, int] = {}
+    default_val: int | None = None
+
+    if default_raw is not None:
+        try:
+            default_val = int(default_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"MCP_PERSIST_RETENTION_DEFAULT must be an integer, got {default_raw!r}") from exc
+
+    if windows_raw is not None:
+        try:
+            parsed = json.loads(windows_raw)
+        except Exception as exc:
+            raise ValueError(f"MCP_PERSIST_RETENTION_WINDOWS must be a valid JSON object, got {windows_raw!r}") from exc
+
+        if not isinstance(parsed, dict):
+            raise ValueError(f"MCP_PERSIST_RETENTION_WINDOWS must be a JSON object (dict), got {type(parsed).__name__}")
+
+        for k, v in parsed.items():
+            key: str | None = None if k == "null" else k
+
+            if k == "__default__":
+                try:
+                    default_from_windows = int(v)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"__default__ window in JSON must be an integer, got {v!r}") from exc
+
+                if default_val is not None and default_val != default_from_windows:
+                    raise ValueError(
+                        f"__default__ in JSON ({default_from_windows}) and "
+                        f"MCP_PERSIST_RETENTION_DEFAULT ({default_val}) disagree"
+                    )
+                default_val = default_from_windows
+                continue
+
+            try:
+                val = int(v)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Retention window for tenant {k!r} must be an integer, got {v!r}") from exc
+
+            windows[key] = val
+
+    return RetentionPolicy(windows=windows, default=default_val)
