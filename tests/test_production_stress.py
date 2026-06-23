@@ -75,12 +75,13 @@ async def run_production_stress_test(store, num_forks=30, writes_per_fork=50):
     # We will track active fork streams and verify histories on completion
     verification_errors = []
 
+    # Fork all streams first so they exist and can be replayed safely
+    for stream_name in forked_streams:
+        await store.fork_stream(base_stream, last_eid, stream_name)
+
     async def fork_and_write_worker(stream_idx):
         try:
             stream_name = forked_streams[stream_idx]
-            # Fork the base stream at the 10th event
-            await store.fork_stream(base_stream, last_eid, stream_name)
-
             # Store events on this fork
             for step in range(writes_per_fork):
                 val = 1000 + stream_idx * 100 + step
