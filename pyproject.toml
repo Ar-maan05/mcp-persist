@@ -1,6 +1,6 @@
 [project]
 name = "mcp-persist"
-version = "1.10.0"
+version = "1.11.0"
 description = "Production-grade persistence backends for the MCP Python SDK"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,6 +29,7 @@ sqlite = ["aiosqlite>=0.20.0"]
 postgres = ["asyncpg>=0.30.0"]
 zstd = ["zstandard>=0.22.0"]
 otel = ["opentelemetry-api>=1.20.0"]
+crypto = ["cryptography>=42.0.0"]
 # The mcp-persist-proxy CLI needs no extra: httpx and uvicorn are already
 # transitive dependencies of `mcp`.
 
@@ -49,6 +50,8 @@ dev = [
     "fakeredis>=2.26.0",
     "aiosqlite>=0.20.0",
     "asyncpg>=0.30.0",
+    "cryptography>=42.0.0",
+    "lupa>=2.0",
     "pytest-anyio",
     "pyright>=1.1.400",
     "ruff>=0.8.5",

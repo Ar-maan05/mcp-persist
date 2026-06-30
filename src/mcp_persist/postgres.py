@@ -49,10 +49,12 @@ from mcp.types import JSONRPCMessage
 from pydantic import TypeAdapter
 
 from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
+from mcp_persist.encryption import decrypt_payload, encrypt_payload
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 from mcp_persist.stored import StoredEvent
 
 if TYPE_CHECKING:
+    from mcp_persist.encryption import KeyRing
     from mcp_persist.metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
@@ -146,6 +148,14 @@ class PostgresEventStore(EventStore):
                     many bytes (default ``1024``). Smaller payloads are stored
                     plain, since base64 overhead would outweigh the saving.
                     Ignored when ``compression`` is ``None``.
+        keyring:    Optional :class:`~mcp_persist.encryption.KeyRing` enabling
+                    AES-256-GCM encryption at rest. When set, payloads are
+                    encrypted (after compression) before being written and
+                    decrypted on read; ``None`` (the default) stores them
+                    unencrypted. Decryption is keyed off a per-payload marker, so a
+                    keyring reads plaintext rows written before it was enabled, and
+                    a store without the keyring never returns ciphertext: it skips
+                    an encrypted row on replay (logging a warning) instead.
     """
 
     def __init__(
@@ -161,6 +171,7 @@ class PostgresEventStore(EventStore):
         enable_streaming: bool = False,
         compression: str | None = None,
         compress_min_bytes: int = 1024,
+        keyring: KeyRing | None = None,
     ) -> None:
         parts = table_name.split(".")
         if len(parts) > 2 or not all(part and IDENTIFIER_RE.match(part) for part in parts):
@@ -191,6 +202,7 @@ class PostgresEventStore(EventStore):
         self._enable_streaming = enable_streaming
         self._compression = compression
         self._compress_min_bytes = compress_min_bytes
+        self._keyring = keyring
         self._initialized = False
         self._init_lock = asyncio.Lock()
         self._tenant_column_ready = False
@@ -217,6 +229,9 @@ class PostgresEventStore(EventStore):
         ttl: int | None = None,
         timeout: float | None = None,
         replay_batch_size: int = _DEFAULT_REPLAY_BATCH_SIZE,
+        compression: str | None = None,
+        compress_min_bytes: int = 1024,
+        keyring: KeyRing | None = None,
         **pool_kwargs: Any,
     ) -> AsyncIterator[PostgresEventStore]:
         """Open an asyncpg pool, initialize, yield a store, and close it on exit.
@@ -230,7 +245,8 @@ class PostgresEventStore(EventStore):
 
         ``dsn`` and any extra ``pool_kwargs`` (e.g. ``min_size=``, ``max_size=``)
         are passed to ``asyncpg.create_pool``; ``table_name``, ``ttl``,
-        ``timeout``, and ``replay_batch_size`` configure the store and behave
+        ``timeout``, ``replay_batch_size``, ``compression``,
+        ``compress_min_bytes``, and ``keyring`` configure the store and behave
         exactly as in :meth:`__init__`. :meth:`initialize` is called before the
         store is yielded. The pool is always closed on exit, including when
         ``initialize`` or the body raises.
@@ -249,6 +265,9 @@ class PostgresEventStore(EventStore):
             ttl=ttl,
             timeout=timeout,
             replay_batch_size=replay_batch_size,
+            compression=compression,
+            compress_min_bytes=compress_min_bytes,
+            keyring=keyring,
         )
         try:
             await store.initialize()
@@ -343,6 +362,20 @@ class PostgresEventStore(EventStore):
 
     # EventStore interface
 
+    def _encode_payload(self, payload: str) -> str:
+        """Compress then encrypt a payload for storage (the order matters).
+
+        Compression runs first so the codec sees plaintext (ciphertext does not
+        compress); encryption is the outer layer. Both pass the empty string
+        (priming events) through untouched.
+        """
+        payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
+        return encrypt_payload(payload, keyring=self._keyring)
+
+    def _decode_payload(self, stored: str) -> str:
+        """Inverse of :meth:`_encode_payload`: decrypt then decompress."""
+        return decompress_payload(decrypt_payload(stored, keyring=self._keyring))
+
     async def store_event(
         self,
         stream_id: StreamId,
@@ -372,7 +405,7 @@ class PostgresEventStore(EventStore):
             payload = ""
         else:
             payload = message.model_dump_json(by_alias=True, exclude_none=True)
-            payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
+            payload = self._encode_payload(payload)
 
         event_id = await self._pool.fetchval(
             f"INSERT INTO {self._table} (stream_id, payload, created_at, tenant_id) "
@@ -420,7 +453,7 @@ class PostgresEventStore(EventStore):
             payload = ""
         else:
             payload = message.model_dump_json(by_alias=True, exclude_none=True)
-            payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
+            payload = self._encode_payload(payload)
         await self._pool.execute(
             f"INSERT INTO {self._table} (event_id, stream_id, payload, created_at, tenant_id) "
             "OVERRIDING SYSTEM VALUE VALUES ($1, $2, $3, $4, $5) "
@@ -567,7 +600,7 @@ class PostgresEventStore(EventStore):
                     if not payload:
                         continue
                     try:
-                        message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
+                        message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload))
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "Skipping event %s on stream %s during replay: failed JSONRPC validation/decompression: %s",
@@ -970,7 +1003,7 @@ class PostgresEventStore(EventStore):
                         continue
 
                     try:
-                        message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
+                        message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload))
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "Skipping event %s on stream %s during migration: "
@@ -1084,7 +1117,7 @@ class PostgresEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
+                    message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload))
                 except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
                     logger.warning(
                         "Skipping event %s on stream %s during subscribe: failed JSONRPC validation/decompression: %s",

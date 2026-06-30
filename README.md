@@ -203,6 +203,12 @@ How they compare:
 | Automatic expiry | No (call `purge_expired()`) | Yes (native key TTL) | No (call `purge_expired()`) |
 | Best fit | Single node, edge, local dev | Load-balanced / ephemeral fan-out | Teams already running Postgres |
 
+On a standalone (non-cluster) Redis, `store_event` runs as a single server-side
+`EVALSHA` (counter increment plus the event write in one step) rather than an
+`INCR` followed by a pipeline, halving the per-event round-trips. The store probes
+for this on its first write and falls back automatically on Redis Cluster or any
+server without scripting, so behavior is identical either way.
+
 Per-backend construction, configuration, write-behind tuning, and multi-tenant
 setup live in **[docs/backends.md](docs/backends.md)**; latency and throughput
 characteristics in **[docs/benchmarks.md](docs/benchmarks.md)**.
@@ -222,9 +228,11 @@ pip install "mcp-persist[postgres]"
 # Multiple backends
 pip install "mcp-persist[sqlite,redis,postgres]"
 
-# Optional extras: zstd compression, OpenTelemetry metrics export
+# Optional extras: zstd compression, OpenTelemetry metrics export,
+# AES-256-GCM encryption at rest
 pip install "mcp-persist[zstd]"
 pip install "mcp-persist[otel]"
+pip install "mcp-persist[crypto]"
 ```
 
 ## Programmatic features at a glance
@@ -235,6 +243,7 @@ Full API and examples in **[docs/api.md](docs/api.md)**.
 - **`subscribe()`**: push new events to an in-process consumer as they're written (Redis pub/sub, Postgres `LISTEN`/`NOTIFY`, SQLite polling).
 - **`migrate()`**: copy events between backends (e.g. SQLite → Postgres as you grow), preserving per-stream ordering.
 - **`compression="gzip"` / `"zstd"`**: transparently compress large payloads above a threshold; decompression on read is automatic and config-independent. `zstd` (via the `zstd` extra) gives a better ratio for JSON-RPC.
+- **Encryption at rest**: pass a `keyring=` (via the `crypto` extra) to AES-256-GCM encrypt payloads before they reach the backend; decryption on read is automatic and marker-driven, composes with compression, and supports zero-downtime key rotation. See [docs/encryption.md](docs/encryption.md).
 - **Multi-tenancy**: bind a store to a `tenant_id` to isolate event streams per customer inside one shared backend (scoped reads, purge, and metrics). See [docs/multi-tenancy.md](docs/multi-tenancy.md).
 - **Per-team retention**: enforce per-tenant policies (`RetentionPolicy`) and record deletions to an append-only audit trail (`DatabaseAuditSink`) via the `RetentionScheduler`:
   ```python
@@ -300,6 +309,7 @@ Full methodology, environment spec, percentiles, and analysis in
 | [docs/backends.md](docs/backends.md) | Manual wiring, per-backend config, write-behind commits, multi-tenant isolation, `create()` lifecycle |
 | [docs/cli.md](docs/cli.md) | `doctor`, `stats`, `purge` & `migrate` full reference: sample output, `--json`, exit codes |
 | [docs/api.md](docs/api.md) | `subscribe`, `migrate`, metrics + OpenTelemetry, compression, batching, tiered storage, `PurgeScheduler`, env config, `ping` |
+| [docs/encryption.md](docs/encryption.md) | AES-256-GCM encryption at rest: `KeyRing`, env config, key rotation, composition with compression, threat model |
 | [docs/multi-tenancy.md](docs/multi-tenancy.md) | Per-tenant isolation: binding `tenant_id`, scoped reads/purge/metrics, how each backend isolates |
 | [docs/tiered-storage.md](docs/tiered-storage.md) | Archiving expired events to cold storage: `ArchiveScheduler`, `ChainedEventStore`, resume across tiers |
 | [docs/architecture.md](docs/architecture.md) | Event ordering, concurrency & write semantics, consistency & durability |

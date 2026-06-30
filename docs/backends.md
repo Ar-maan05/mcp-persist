@@ -116,6 +116,7 @@ SQLiteEventStore(
     table_name="mcp_events",  # isolate multiple servers in one database file
     ttl=3600,               # seconds; None = never expire (not recommended)
     compression=None,       # "gzip" to compress large payloads (see "Large payloads" in api.md)
+    keyring=None,           # KeyRing to encrypt payloads at rest (see encryption.md)
     commit_interval=None,   # seconds; set to batch commits (write-behind, see below)
     commit_max_pending=None,  # cap buffered events under write-behind
 )
@@ -188,8 +189,16 @@ RedisEventStore(
     ttl=3600,               # seconds; None = never expire (not recommended)
     max_stream_length=None, # optional cap on how many event IDs each stream retains
     compression=None,       # "gzip" to compress large payloads (see "Large payloads" in api.md)
+    keyring=None,           # KeyRing to encrypt payloads at rest (see encryption.md)
 )
 ```
+
+> On a standalone (non-cluster) Redis with server-side scripting, `store_event`
+> runs as a single `EVALSHA` (counter increment plus the event write) instead of
+> an `INCR` followed by a pipeline, halving the per-event round-trips. The store
+> probes for this on its first write and falls back to the pipeline path
+> automatically on Redis Cluster or any server without scripting, so behavior is
+> identical either way.
 
 - **TTL guidance:** Set `ttl` to at least 2× your session idle timeout. If you leave it as `None`, a warning is logged and events accumulate indefinitely.
 - **Stream bounds (`max_stream_length`):** Set a positive integer to cap the size of each stream's sorted set. The oldest event IDs beyond this limit are automatically trimmed on every write, preventing unbounded memory growth on long-lived streams.
@@ -258,6 +267,7 @@ PostgresEventStore(
     ttl=3600,                 # seconds; None = never expire (not recommended)
     replay_batch_size=500,    # rows fetched per round-trip on replay; lower for very large payloads
     compression=None,         # "gzip" to compress large payloads (see "Large payloads" in api.md)
+    keyring=None,             # KeyRing to encrypt payloads at rest (see encryption.md)
 )
 ```
 

@@ -30,6 +30,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from mcp_persist.batching import BatchingEventStore
 from mcp_persist.config import event_store_from_env, retention_policy_from_env
+from mcp_persist.encryption import KeyRing, generate_key, keyring_from_env
 from mcp_persist.fastmcp import with_persistence
 from mcp_persist.metrics import (
     LoggingMetricsCollector,
@@ -65,6 +66,7 @@ __all__ = [
     "ChainedEventStore",
     "DatabaseAuditSink",
     "DeletionAuditEntry",
+    "KeyRing",
     "LoggingAuditSink",
     "LoggingMetricsCollector",
     "MetricsCollector",
@@ -83,6 +85,8 @@ __all__ = [
     "archive_expired_batch",
     "count_expired",
     "event_store_from_env",
+    "generate_key",
+    "keyring_from_env",
     "migrate",
     "retention_policy_from_env",
     "with_persistence",

@@ -22,6 +22,9 @@ Variables:
 ``MCP_PERSIST_MAX_STREAM_LENGTH``   per-stream cap (Redis, optional integer)
 ``MCP_PERSIST_TENANT_ID``           tenant namespace bound at construction (optional)
 ``MCP_PERSIST_COMPRESSION``         ``gzip`` | ``zstd`` payload codec (optional)
+``MCP_PERSIST_ENCRYPTION_KEY``      single base64 AES-256 key for encryption at rest (optional)
+``MCP_PERSIST_ENCRYPTION_KEYS``     ``id:b64,id:b64`` key list for rotation (optional)
+``MCP_PERSIST_ENCRYPTION_KEY_ID``   active key id when more than one key is listed (optional)
 ``MCP_PERSIST_BATCH_MAX_EVENTS``    batching wrapper flush size (optional integer)
 ``MCP_PERSIST_BATCH_MAX_LATENCY_MS`` batching wrapper flush latency (optional integer)
 
@@ -38,6 +41,7 @@ from typing import TYPE_CHECKING
 
 from mcp_persist.batching import BatchingEventStore
 from mcp_persist.compression import validate_compression
+from mcp_persist.encryption import keyring_from_env
 from mcp_persist.postgres import PostgresEventStore
 from mcp_persist.redis import RedisEventStore
 from mcp_persist.sqlite import SQLiteEventStore
@@ -89,6 +93,7 @@ def event_store_from_env(env: Mapping[str, str] | None = None) -> AbstractAsyncC
     compression = env.get(f"{_PREFIX}COMPRESSION") or None
     if compression:
         validate_compression(compression)
+    keyring = keyring_from_env(env)
     batch_max_events = _optional_int(env, f"{_PREFIX}BATCH_MAX_EVENTS")
     batch_max_latency_ms = env.get(f"{_PREFIX}BATCH_MAX_LATENCY_MS")
     batch_latency = float(batch_max_latency_ms) if batch_max_latency_ms else None
@@ -108,6 +113,8 @@ def event_store_from_env(env: Mapping[str, str] | None = None) -> AbstractAsyncC
             kwargs["tenant_id"] = tenant_id
         if compression:
             kwargs["compression"] = compression
+        if keyring is not None:
+            kwargs["keyring"] = keyring
         return SQLiteEventStore.create(url, **kwargs)  # type: ignore[arg-type]
 
     if backend == "redis":
@@ -119,6 +126,8 @@ def event_store_from_env(env: Mapping[str, str] | None = None) -> AbstractAsyncC
             kwargs["tenant_id"] = tenant_id
         if compression:
             kwargs["compression"] = compression
+        if keyring is not None:
+            kwargs["keyring"] = keyring
         max_stream_length = _optional_int(env, f"{_PREFIX}MAX_STREAM_LENGTH")
         if max_stream_length is not None:
             kwargs["max_stream_length"] = max_stream_length
@@ -134,6 +143,8 @@ def event_store_from_env(env: Mapping[str, str] | None = None) -> AbstractAsyncC
             kwargs["tenant_id"] = tenant_id
         if compression:
             kwargs["compression"] = compression
+        if keyring is not None:
+            kwargs["keyring"] = keyring
         cm = PostgresEventStore.create(url, **kwargs)  # type: ignore[arg-type]
         return _maybe_batch(cm, batch_max_events, batch_latency)
 

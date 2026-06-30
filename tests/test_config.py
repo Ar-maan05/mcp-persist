@@ -1,3 +1,6 @@
+# pyright: reportArgumentType=false
+# pyright: reportMissingImports=false
+# pyright: reportPrivateUsage=false
 """Tests for event_store_from_env.
 
 The SQLite path is exercised end-to-end (no external service needed). The Redis
@@ -90,3 +93,81 @@ def test_from_env_invalid_ttl_raises():
         event_store_from_env(
             {"MCP_PERSIST_BACKEND": "sqlite", "MCP_PERSIST_URL": ":memory:", "MCP_PERSIST_TTL": "not-an-int"}
         )
+
+
+# ── create()-forwarding fixes (compression / tenant_id / keyring via env) ────
+
+
+@pytest.mark.anyio
+async def test_from_env_sqlite_compression_is_applied():
+    # Regression: SQLiteEventStore.create() previously dropped compression into
+    # the aiosqlite connect kwargs, which raised TypeError. It must now configure
+    # the store instead.
+    env = {
+        "MCP_PERSIST_BACKEND": "sqlite",
+        "MCP_PERSIST_URL": ":memory:",
+        "MCP_PERSIST_TTL": "3600",
+        "MCP_PERSIST_COMPRESSION": "gzip",
+    }
+    async with event_store_from_env(env) as store:
+        assert store._compression == "gzip"  # type: ignore[attr-defined]
+        await _roundtrip(store)
+
+
+@pytest.mark.anyio
+async def test_from_env_sqlite_encryption_roundtrips():
+    from mcp_persist import generate_key
+    from mcp_persist.encryption import _ENC_PREFIX
+
+    env = {
+        "MCP_PERSIST_BACKEND": "sqlite",
+        "MCP_PERSIST_URL": ":memory:",
+        "MCP_PERSIST_TTL": "3600",
+        "MCP_PERSIST_ENCRYPTION_KEY": generate_key(),
+    }
+    async with event_store_from_env(env) as store:
+        assert store._keyring is not None  # type: ignore[attr-defined]
+        eid = await store.store_event("s", SAMPLE_MSG)
+        async with store._conn.execute(  # type: ignore[attr-defined]
+            f"SELECT payload FROM {store._table} WHERE event_id = ?",  # type: ignore[attr-defined]
+            (int(eid),),
+        ) as cur:
+            raw = (await cur.fetchone())[0]
+        assert raw.startswith(_ENC_PREFIX)
+
+
+def test_from_env_redis_applies_tenant_and_compression(monkeypatch):
+    # Regression: RedisEventStore.create() previously dropped tenant_id and
+    # compression into from_url kwargs (silently ignored), so an env-configured
+    # multi-tenant or compressed store was neither. They must reach the store.
+    import fakeredis.aioredis as fakeredis
+
+    monkeypatch.setattr("redis.asyncio.from_url", lambda *a, **k: fakeredis.FakeRedis())
+    env = {
+        "MCP_PERSIST_BACKEND": "redis",
+        "MCP_PERSIST_URL": "redis://x",
+        "MCP_PERSIST_TTL": "60",
+        "MCP_PERSIST_TENANT_ID": "acme",
+        "MCP_PERSIST_COMPRESSION": "gzip",
+    }
+    cm = event_store_from_env(env)
+
+    async def check():
+        async with cm as store:
+            assert store._tenant_id == "acme"  # type: ignore[attr-defined]
+            assert store._compression == "gzip"  # type: ignore[attr-defined]
+            assert store._prefix == "mcp:acme:"  # type: ignore[attr-defined]
+
+    import anyio
+
+    anyio.run(check)
+
+
+def test_from_env_invalid_encryption_key_raises():
+    env = {
+        "MCP_PERSIST_BACKEND": "sqlite",
+        "MCP_PERSIST_URL": ":memory:",
+        "MCP_PERSIST_ENCRYPTION_KEY": "not-valid-base64-32-bytes",
+    }
+    with pytest.raises(ValueError):
+        event_store_from_env(env)

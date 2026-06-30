@@ -5,6 +5,15 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0] - 2026-06-30
+
+### Added
+- **Encryption at rest (AES-256-GCM).** Pass a `KeyRing` as `keyring=` to any backend (or configure it from `MCP_PERSIST_ENCRYPTION_KEY` / `MCP_PERSIST_ENCRYPTION_KEYS` plus `MCP_PERSIST_ENCRYPTION_KEY_ID`) to encrypt event payloads before they reach the store; decryption on read is automatic. Like compression, the stored form is marker-prefixed (`en:<key_id>:<base64(nonce+ciphertext)>`), so a reader recognizes ciphertext without configuration, plaintext rows written before encryption was enabled stay readable, and writers holding different keys coexist for zero-downtime key rotation. Encryption composes with compression as the outer layer (compress then encrypt on write; decrypt then decompress on read) and adds no new decompression-bomb surface. AES-GCM is authenticated, so a tampered payload fails to decrypt rather than decrypting to silently wrong bytes; the codec fails closed (a missing or wrong key raises rather than returning ciphertext), and on replay an undecryptable event is skipped with a logged warning rather than leaking ciphertext or aborting the resume. New public API: `KeyRing`, `generate_key`, `keyring_from_env`. Requires the new `crypto` extra (`pip install "mcp-persist[crypto]"`). See `docs/encryption.md`.
+- **Single-round-trip Redis writes.** On a standalone (non-cluster) Redis that supports server-side scripting, `RedisEventStore.store_event` now runs as one `EVALSHA` (counter increment plus the event hash, stream-index entry, optional length trim, and optional ttls in a single server-side step) instead of an `INCR` followed by a pipelined write, halving the per-event round-trips. The store probes for script support on its first write and caches the result; it falls back to the original `INCR` plus pipeline path automatically on Redis Cluster (where the keys span hash slots) or any server without scripting, so behavior, event ids, and durability semantics are identical either way.
+
+### Fixed
+- **`event_store_from_env` now forwards `compression`, `compress_min_bytes`, and (new) `keyring` to every backend, plus `tenant_id` to Redis.** Previously each backend's `create()` did not accept these, so env-configured values fell through into the underlying connection call: on SQLite that raised a `TypeError` for `compression`, and on Redis `tenant_id` and `compression` were silently dropped (an env-configured multi-tenant or compressed Redis store was neither). The `create()` classmethods now accept these explicitly and apply them, matching the direct constructors.
+
 ## [1.10.0] - 2026-06-23
 
 ### Added

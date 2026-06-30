@@ -47,10 +47,12 @@ from mcp.types import JSONRPCMessage
 from pydantic import TypeAdapter
 
 from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
+from mcp_persist.encryption import decrypt_payload, encrypt_payload
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 from mcp_persist.stored import StoredEvent
 
 if TYPE_CHECKING:
+    from mcp_persist.encryption import KeyRing
     from mcp_persist.metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
@@ -116,6 +118,14 @@ class SQLiteEventStore(EventStore):
                     many bytes (default ``1024``). Smaller payloads are stored
                     plain, since base64 overhead would outweigh the saving.
                     Ignored when ``compression`` is ``None``.
+        keyring:    Optional :class:`~mcp_persist.encryption.KeyRing` enabling
+                    AES-256-GCM encryption at rest. When set, payloads are
+                    encrypted (after compression) before being written and
+                    decrypted on read; ``None`` (the default) stores them
+                    unencrypted. Decryption is keyed off a per-payload marker, so a
+                    keyring reads plaintext rows written before it was enabled, and
+                    a store without the keyring never returns ciphertext: it skips
+                    an encrypted row on replay (logging a warning) instead.
         commit_interval:
                     Optional write-behind interval in seconds. When set (must be
                     ``> 0``), ``store_event`` no longer commits on every call;
@@ -151,6 +161,7 @@ class SQLiteEventStore(EventStore):
         enable_streaming: bool = False,
         compression: str | None = None,
         compress_min_bytes: int = 1024,
+        keyring: KeyRing | None = None,
         commit_interval: float | None = None,
         commit_max_pending: int | None = None,
     ) -> None:
@@ -185,6 +196,7 @@ class SQLiteEventStore(EventStore):
         self._enable_streaming = enable_streaming
         self._compression = compression
         self._compress_min_bytes = compress_min_bytes
+        self._keyring = keyring
         self._commit_interval = commit_interval
         self._commit_max_pending = commit_max_pending
         self._pending = 0
@@ -214,6 +226,9 @@ class SQLiteEventStore(EventStore):
         tenant_id: str | None = None,
         ttl: int | None = None,
         timeout: float | None = None,
+        compression: str | None = None,
+        compress_min_bytes: int = 1024,
+        keyring: KeyRing | None = None,
         commit_interval: float | None = None,
         commit_max_pending: int | None = None,
         **connect_kwargs: Any,
@@ -229,8 +244,9 @@ class SQLiteEventStore(EventStore):
 
         ``path`` and any extra ``connect_kwargs`` are passed to
         ``aiosqlite.connect``; ``table_name``, ``ttl``, ``timeout``,
-        ``commit_interval``, and ``commit_max_pending`` configure the store and
-        behave exactly as in :meth:`__init__`. :meth:`initialize` is called before
+        ``compression``, ``compress_min_bytes``, ``keyring``, ``commit_interval``,
+        and ``commit_max_pending`` configure the store and behave exactly as in
+        :meth:`__init__`. :meth:`initialize` is called before
         the store is yielded. On exit the store is closed first (:meth:`aclose`,
         which flushes any write-behind buffer) and then the connection is closed —
         always, including when ``initialize`` or the body raises. Pass ``":memory:"``
@@ -249,6 +265,9 @@ class SQLiteEventStore(EventStore):
             tenant_id=tenant_id,
             ttl=ttl,
             timeout=timeout,
+            compression=compression,
+            compress_min_bytes=compress_min_bytes,
+            keyring=keyring,
             commit_interval=commit_interval,
             commit_max_pending=commit_max_pending,
         )
@@ -376,6 +395,20 @@ class SQLiteEventStore(EventStore):
 
     # EventStore interface
 
+    def _encode_payload(self, payload: str) -> str:
+        """Compress then encrypt a payload for storage (the order matters).
+
+        Compression runs first so the codec sees plaintext (ciphertext does not
+        compress); encryption is the outer layer. Both pass the empty string
+        (priming events) through untouched.
+        """
+        payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
+        return encrypt_payload(payload, keyring=self._keyring)
+
+    def _decode_payload(self, stored: str) -> str:
+        """Inverse of :meth:`_encode_payload`: decrypt then decompress."""
+        return decompress_payload(decrypt_payload(stored, keyring=self._keyring))
+
     async def store_event(
         self,
         stream_id: StreamId,
@@ -405,7 +438,7 @@ class SQLiteEventStore(EventStore):
             payload = ""
         else:
             payload = message.model_dump_json(by_alias=True, exclude_none=True)
-            payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
+            payload = self._encode_payload(payload)
 
         cols = "(stream_id, payload, created_at"
         vals = "(?, ?, ?"
@@ -621,7 +654,7 @@ class SQLiteEventStore(EventStore):
                     if not payload:
                         continue
                     try:
-                        message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
+                        message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload))
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "Skipping event %s on stream %s during replay: failed JSONRPC validation/decompression: %s",
@@ -971,7 +1004,7 @@ class SQLiteEventStore(EventStore):
                         continue
 
                     try:
-                        message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
+                        message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload))
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "Skipping event %s on stream %s: failed validation: %s", event_id, stream_id, exc
@@ -1036,7 +1069,7 @@ class SQLiteEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(decompress_payload(payload))
+                    message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload))
                 except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
                     logger.warning(
                         "Skipping event %s on stream %s during subscribe: failed JSONRPC validation/decompression: %s",

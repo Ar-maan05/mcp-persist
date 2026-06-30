@@ -38,14 +38,70 @@ from mcp.types import JSONRPCMessage
 from pydantic import TypeAdapter
 
 from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
+from mcp_persist.encryption import decrypt_payload, encrypt_payload
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 
 if TYPE_CHECKING:
+    from mcp_persist.encryption import KeyRing
     from mcp_persist.metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
 
 jsonrpc_message_adapter = TypeAdapter(JSONRPCMessage)
+
+# Single-round-trip write used by store_event on a scripting-capable standalone
+# Redis. It increments the counter and writes the event hash, the stream-index
+# entry, the optional length trim, and the optional ttls in one server-side step,
+# returning the new event id. Collapsing the INCR and the write into one EVALSHA
+# halves the per-event round-trips versus "INCR then pipeline".
+#
+# KEYS[1] = counter key
+# KEYS[2] = event-key prefix (the id is appended inside the script, since it is
+#           only known after the INCR)
+# KEYS[3] = stream-index (sorted set) key
+# ARGV[1] = stream_id, ARGV[2] = payload
+# ARGV[3] = ttl seconds or -1 for none, ARGV[4] = max_stream_length or -1 for none
+#
+# This builds KEYS[2]..id inside the script, which Redis only permits when every
+# key lives in one hash slot; on Redis Cluster the global counter and the
+# per-id keys span slots, so the caller never runs this there (see _write_event).
+_STORE_EVENT_LUA = """
+local id = redis.call('INCR', KEYS[1])
+local event_key = KEYS[2] .. id
+redis.call('HSET', event_key, 'stream_id', ARGV[1], 'payload', ARGV[2])
+redis.call('ZADD', KEYS[3], id, id)
+local maxlen = tonumber(ARGV[4])
+if maxlen >= 0 then
+  redis.call('ZREMRANGEBYRANK', KEYS[3], 0, -(maxlen + 1))
+end
+local ttl = tonumber(ARGV[3])
+if ttl >= 0 then
+  redis.call('EXPIRE', event_key, ttl)
+  redis.call('EXPIRE', KEYS[3], ttl)
+end
+return id
+"""
+
+_script_error_types: tuple[type[BaseException], ...] | None = None
+
+
+def _scripting_error_types() -> tuple[type[BaseException], ...]:
+    """Exception types that mean "server-side scripting is unavailable here".
+
+    Imported lazily: the package must load without ``redis`` installed, and a
+    store only reaches this once it already holds a live client. ``ResponseError``
+    covers both a server with no scripting (``unknown command 'evalsha'``) and a
+    Redis Cluster slot violation; some fakes raise ``NotImplementedError``.
+    """
+    global _script_error_types
+    if _script_error_types is None:
+        try:
+            from redis.exceptions import ResponseError
+
+            _script_error_types = (ResponseError, NotImplementedError)
+        except ImportError:  # pragma: no cover - redis is present whenever this runs
+            _script_error_types = (NotImplementedError,)
+    return _script_error_types
 
 
 class RedisEventStore(EventStore):
@@ -105,6 +161,22 @@ class RedisEventStore(EventStore):
                     many bytes (default ``1024``). Smaller payloads are stored
                     plain, since base64 overhead would outweigh the saving.
                     Ignored when ``compression`` is ``None``.
+        keyring:    Optional :class:`~mcp_persist.encryption.KeyRing` enabling
+                    AES-256-GCM encryption at rest. When set, payloads are
+                    encrypted (after compression) before being written and
+                    decrypted on read; ``None`` (the default) stores them
+                    unencrypted. Decryption is keyed off a per-payload marker, so a
+                    keyring reads plaintext values written before it was enabled,
+                    and a store without the keyring never returns ciphertext: it
+                    skips an encrypted value on replay (logging a warning)
+                    instead.
+
+    On a standalone (non-cluster) Redis that supports server-side scripting,
+    ``store_event`` runs as a single ``EVALSHA`` round-trip (counter increment plus
+    the event write) instead of an ``INCR`` followed by a pipeline, halving the
+    per-event round-trips. The store probes for this on its first write and falls
+    back to the pipeline path automatically on Redis Cluster (where the keys span
+    slots) or any server without scripting, so behavior is identical either way.
 
     The Redis client may be configured with ``decode_responses`` either way:
     values are normalized whether Redis returns ``bytes`` or ``str``.
@@ -122,6 +194,7 @@ class RedisEventStore(EventStore):
         enable_streaming: bool = False,
         compression: str | None = None,
         compress_min_bytes: int = 1024,
+        keyring: KeyRing | None = None,
     ) -> None:
         if max_stream_length is not None and max_stream_length <= 0:
             raise ValueError(f"max_stream_length must be a positive integer or None, got {max_stream_length!r}")
@@ -138,6 +211,13 @@ class RedisEventStore(EventStore):
         self._enable_streaming = enable_streaming
         self._compression = compression
         self._compress_min_bytes = compress_min_bytes
+        self._keyring = keyring
+        # Server-side write-script state for the single-round-trip store_event
+        # fast path: None until probed, then True (script in use) or False
+        # (scripting unsupported or Redis Cluster, so the pipeline path is used).
+        # See _write_event.
+        self._write_script: Any = None
+        self._script_ok: bool | None = None
 
         if ttl is None:
             logger.warning(
@@ -165,8 +245,12 @@ class RedisEventStore(EventStore):
         url: str,
         *,
         key_prefix: str = "mcp:",
+        tenant_id: str | None = None,
         ttl: int | None = None,
         max_stream_length: int | None = None,
+        compression: str | None = None,
+        compress_min_bytes: int = 1024,
+        keyring: KeyRing | None = None,
         **connect_kwargs: Any,
     ) -> AsyncIterator[RedisEventStore]:
         """Open a Redis connection, yield a store, and close the connection on exit.
@@ -180,10 +264,12 @@ class RedisEventStore(EventStore):
 
         ``url`` is passed to ``redis.asyncio.from_url`` along with any extra
         ``connect_kwargs`` (e.g. ``decode_responses=``, ``max_connections=``);
-        ``key_prefix``, ``ttl``, and ``max_stream_length`` configure the store and
-        behave exactly as in :meth:`__init__`. The client is always closed on
-        exit, including when the body raises. To manage the connection yourself
-        (e.g. to share one client across stores), construct the store directly.
+        ``key_prefix``, ``tenant_id``, ``ttl``, ``max_stream_length``,
+        ``compression``, ``compress_min_bytes``, and ``keyring`` configure the
+        store and behave exactly as in :meth:`__init__`. The client is always
+        closed on exit, including when the body raises. To manage the connection
+        yourself (e.g. to share one client across stores), construct the store
+        directly.
 
         Requires the ``redis`` extra (``pip install "mcp-persist[redis]"``); the
         import happens here, not at module import time, so the package loads
@@ -192,7 +278,16 @@ class RedisEventStore(EventStore):
         import redis.asyncio as aioredis
 
         client = aioredis.from_url(url, **connect_kwargs)
-        store = cls(client, key_prefix=key_prefix, ttl=ttl, max_stream_length=max_stream_length)
+        store = cls(
+            client,
+            key_prefix=key_prefix,
+            tenant_id=tenant_id,
+            ttl=ttl,
+            max_stream_length=max_stream_length,
+            compression=compression,
+            compress_min_bytes=compress_min_bytes,
+            keyring=keyring,
+        )
         try:
             yield store
         finally:
@@ -255,14 +350,25 @@ class RedisEventStore(EventStore):
         safe_call(self._metrics.on_store_event, stream_id, event_id, (time.monotonic() - start) * 1000.0)
         return event_id
 
+    def _encode_payload(self, payload: str) -> str:
+        """Compress then encrypt a payload for storage (the order matters).
+
+        Compression runs first so the codec sees plaintext (ciphertext does not
+        compress); encryption is the outer layer. Both pass the empty string
+        (priming events) through untouched.
+        """
+        payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
+        return encrypt_payload(payload, keyring=self._keyring)
+
+    def _decode_payload(self, stored: str) -> str:
+        """Inverse of :meth:`_encode_payload`: decrypt then decompress."""
+        return decompress_payload(decrypt_payload(stored, keyring=self._keyring))
+
     async def _store_event_impl(
         self,
         stream_id: StreamId,
         message: JSONRPCMessage | None,
     ) -> EventId:
-        event_id_int: int = await self._redis.incr(self._counter_key())
-        event_id: EventId = str(event_id_int)
-
         if message is None:
             payload = ""
         else:
@@ -270,20 +376,86 @@ class RedisEventStore(EventStore):
                 by_alias=True,
                 exclude_none=True,
             )
-            payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
+            payload = self._encode_payload(payload)
 
-        # Write the event hash, its sorted-set entry, and their TTLs in a single
-        # pipelined round-trip. transaction=False (no MULTI/EXEC) keeps this
-        # valid on Redis Cluster: the event hash and the stream index hash to
-        # different slots, which a transactional pipeline would reject with
-        # CROSSSLOT. The trade-off — losing cross-key atomicity — is bounded:
-        # a stream-index entry left without its payload (e.g. a mid-write
-        # disconnect) is pruned lazily on the next replay, and an orphaned hash
-        # expires on its own ttl. The counter (incremented above) is
-        # deliberately never expired: tying its lifetime to ttl would restart
-        # EventIds from 1 after an idle gap longer than ttl, breaking the
-        # monotonic-ID guarantee — the same reason SQLite/Postgres keep their
-        # AUTOINCREMENT/IDENTITY sequence for the life of the table.
+        event_id = await self._write_event(stream_id, payload)
+
+        # Notify real-time subscribers after the event is durably written. Only
+        # for real events (priming events carry no message and are not delivered
+        # by subscribe). Best-effort: a publish failure must not fail the write.
+        if self._enable_streaming and message is not None:
+            await self._publish_notification(stream_id, event_id)
+
+        return event_id
+
+    def _scripting_possible(self) -> bool:
+        """Whether the single-round-trip write script may be used on this client.
+
+        Redis Cluster cannot run :data:`_STORE_EVENT_LUA`: the script builds keys
+        that span hash slots (the global counter versus the per-id event/stream
+        keys), which Redis rejects. Detected by class name to avoid importing the
+        cluster client (the dependency may not even be installed).
+        """
+        cls = type(self._redis)
+        return "cluster" not in cls.__module__.lower() and "cluster" not in cls.__name__.lower()
+
+    async def _write_event(self, stream_id: StreamId, payload: str) -> EventId:
+        """Persist one event, returning its id, via the fastest available path.
+
+        Prefers the single-``EVALSHA`` script on a scripting-capable standalone
+        Redis and falls back to the ``INCR`` + pipeline path otherwise. The first
+        write probes for script support; once a probe settles the result is cached
+        on the store, so steady-state writes take one branch with no extra calls.
+        """
+        if self._script_ok is False or not self._scripting_possible():
+            return await self._write_event_pipelined(stream_id, payload)
+
+        try:
+            event_id = await self._write_event_scripted(stream_id, payload)
+        except _scripting_error_types() as exc:
+            if self._script_ok is True:
+                # Scripting worked on an earlier write, so this is a genuine
+                # failure (not a "scripting unsupported" probe result): propagate.
+                raise
+            logger.debug("Redis server-side scripting unavailable (%s); using pipelined writes", exc)
+            self._script_ok = False
+            return await self._write_event_pipelined(stream_id, payload)
+        self._script_ok = True
+        return event_id
+
+    async def _write_event_scripted(self, stream_id: StreamId, payload: str) -> EventId:
+        """Single-round-trip write via :data:`_STORE_EVENT_LUA` (standalone Redis)."""
+        if self._write_script is None:
+            self._write_script = self._redis.register_script(_STORE_EVENT_LUA)
+        result = await self._write_script(
+            keys=[self._counter_key(), f"{self._prefix}event:", self._stream_key(stream_id)],
+            args=[
+                stream_id,
+                payload,
+                self._ttl if self._ttl is not None else -1,
+                self._max_stream_length if self._max_stream_length is not None else -1,
+            ],
+        )
+        return str(int(result))
+
+    async def _write_event_pipelined(self, stream_id: StreamId, payload: str) -> EventId:
+        """Two-round-trip write: ``INCR`` for the id, then a pipelined write.
+
+        The fallback for Redis Cluster (where the script's keys span slots) and any
+        server without scripting. ``transaction=False`` (no MULTI/EXEC) keeps the
+        pipeline valid on Cluster: the event hash and the stream index hash to
+        different slots, which a transactional pipeline would reject with
+        CROSSSLOT. The trade-off (losing cross-key atomicity) is bounded: a
+        stream-index entry left without its payload (e.g. a mid-write disconnect)
+        is pruned lazily on the next replay, and an orphaned hash expires on its
+        own ttl. The counter is deliberately never expired: tying its lifetime to
+        ttl would restart EventIds from 1 after an idle gap longer than ttl,
+        breaking the monotonic-ID guarantee (the same reason SQLite/Postgres keep
+        their AUTOINCREMENT/IDENTITY sequence for the life of the table).
+        """
+        event_id_int: int = await self._redis.incr(self._counter_key())
+        event_id: EventId = str(event_id_int)
+
         async with self._redis.pipeline(transaction=False) as pipe:
             pipe.hset(
                 self._event_key(event_id),
@@ -305,12 +477,6 @@ class RedisEventStore(EventStore):
                 pipe.expire(self._stream_key(stream_id), self._ttl)
             await pipe.execute()
 
-        # Notify real-time subscribers after the event is durably written. Only
-        # for real events (priming events carry no message and are not delivered
-        # by subscribe). Best-effort: a publish failure must not fail the write.
-        if self._enable_streaming and message is not None:
-            await self._publish_notification(stream_id, event_id)
-
         return event_id
 
     async def _allocate_event_ids(self, n: int) -> list[EventId]:
@@ -331,7 +497,7 @@ class RedisEventStore(EventStore):
             payload = ""
         else:
             payload = message.model_dump_json(by_alias=True, exclude_none=True)
-            payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
+            payload = self._encode_payload(payload)
 
         async with self._redis.pipeline(transaction=False) as pipe:
             pipe.hset(
@@ -494,7 +660,7 @@ class RedisEventStore(EventStore):
                 continue
 
             try:
-                message = jsonrpc_message_adapter.validate_json(decompress_payload(payload_str))
+                message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload_str))
             except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
                 # A single corrupt/unparseable payload must not abort the whole
                 # replay: a reconnecting client would otherwise lose every event
@@ -628,7 +794,7 @@ class RedisEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(decompress_payload(payload_str))
+                    message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload_str))
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "Skipping event %s on stream %s during migration: failed JSONRPC validation/decompression: %s",
@@ -707,7 +873,7 @@ class RedisEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(decompress_payload(payload_str))
+                    message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload_str))
                 except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
                     logger.warning(
                         "Skipping event %s on stream %s during subscribe: failed JSONRPC validation/decompression: %s",
