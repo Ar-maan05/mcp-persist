@@ -191,9 +191,7 @@ def test_env_single_key():
 
 
 def test_env_single_key_with_custom_id():
-    ring = keyring_from_env(
-        {"MCP_PERSIST_ENCRYPTION_KEY": generate_key(), "MCP_PERSIST_ENCRYPTION_KEY_ID": "primary"}
-    )
+    ring = keyring_from_env({"MCP_PERSIST_ENCRYPTION_KEY": generate_key(), "MCP_PERSIST_ENCRYPTION_KEY_ID": "primary"})
     assert ring is not None
     assert ring.active()[0] == "primary"
 
@@ -260,9 +258,7 @@ async def test_sqlite_encrypts_at_rest_and_replays():
         await store.store_event("s1", SAMPLE_MSG)
 
         # The raw column holds ciphertext, not the JSON payload.
-        async with store._conn.execute(
-            f"SELECT payload FROM {store._table} WHERE event_id = ?", (int(e1),)
-        ) as cur:
+        async with store._conn.execute(f"SELECT payload FROM {store._table} WHERE event_id = ?", (int(e1),)) as cur:
             raw = (await cur.fetchone())[0]
         assert raw.startswith(_ENC_PREFIX)
         assert "tools/list" not in raw

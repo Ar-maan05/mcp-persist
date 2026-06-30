@@ -218,9 +218,7 @@ def keyring_from_env(env: Mapping[str, str] | None = None) -> KeyRing | None:
             continue
         key_id, sep, value = entry.partition(":")
         if not sep:
-            raise ValueError(
-                f"MCP_PERSIST_ENCRYPTION_KEYS entry {entry!r} must be 'key_id:base64key'"
-            )
+            raise ValueError(f"MCP_PERSIST_ENCRYPTION_KEYS entry {entry!r} must be 'key_id:base64key'")
         key_id = key_id.strip()
         keys[key_id] = _decode_key(value.strip(), key_id=key_id)
     if not keys:
