@@ -14,8 +14,9 @@ flags, or the `MCP_PERSIST_*` environment variables when no flags are given.
 
 Before you debug a deployment, run the doctor. It is a pass/fail checklist for the
 things that usually explain a broken or silently growing store: the Python
-runtime, whether the backend's driver extra is installed, live connectivity, and
-config that lets events accumulate without bound.
+runtime, whether the backend's driver extra is installed, live connectivity,
+config that lets events accumulate without bound, and whether a configured
+compression codec or encryption keyring is actually usable.
 
 ```bash
 # Check a specific store:
@@ -35,9 +36,21 @@ mcp-persist doctor: redis (redis://localhost:6379)
 [ ok ] driver        redis is installed for the redis backend
 [ ok ] connectivity  connected to redis (redis 7.2.0)
 [warn] retention     ttl is not set: events accumulate in Redis indefinitely; set --ttl
+[ ok ] compression   compression is disabled
+[ ok ] encryption    encryption is disabled
 
 All checks passed with 1 warning(s).
 ```
+
+The `compression` check runs the same guard the stores run at construction, so
+`MCP_PERSIST_COMPRESSION=zstd` without the `zstd` extra (or an unknown codec)
+fails here with the pip hint instead of at the first write. The `encryption`
+check parses `MCP_PERSIST_ENCRYPTION_*` and fails on a malformed key set, or on a
+keyring configured while the `crypto` extra is not installed (the keyring builds
+without `cryptography`, so that gap otherwise stays silent until a write).
+
+Both CLIs also accept `--version`, which prints the installed `mcp-persist`
+version and exits.
 
 The runtime, driver, and retention checks read your resolved config, so they run
 even when the backend is unreachable (exactly when you reach for the doctor); a

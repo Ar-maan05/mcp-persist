@@ -53,6 +53,13 @@ def test_parse_args_defaults():
     assert args.upstream is None and command == []
 
 
+def test_version_flag_prints_and_exits_zero(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        _cli._parse_args(["--version"])
+    assert excinfo.value.code == 0
+    assert capsys.readouterr().out.startswith("mcp-persist ")
+
+
 def test_main_errors_without_a_mode(monkeypatch, capsys):
     monkeypatch.setattr(_cli.sys, "argv", ["mcp-persist-proxy"])
     with pytest.raises(SystemExit) as excinfo:

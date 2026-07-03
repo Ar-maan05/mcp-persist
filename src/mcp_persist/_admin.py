@@ -36,7 +36,9 @@ from contextlib import AbstractAsyncContextManager, contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 
+from mcp_persist.compression import validate_compression
 from mcp_persist.config import _PREFIX, _optional_int
+from mcp_persist.encryption import keyring_from_env
 from mcp_persist.migration import MigrationResult, migrate
 from mcp_persist.postgres import PostgresEventStore
 from mcp_persist.redis import RedisEventStore
@@ -44,7 +46,20 @@ from mcp_persist.sqlite import SQLiteEventStore
 from mcp_persist.stored import count_expired
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from mcp.server.streamable_http import EventStore
+
+
+def _package_version() -> str:
+    """Return the installed ``mcp-persist`` version, or a sentinel from a source tree."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("mcp-persist")
+    except PackageNotFoundError:  # pragma: no cover - running uninstalled
+        return "0.0.0+unknown"
+
 
 # The lowest Python the package supports (pyproject ``requires-python``).
 _MIN_PYTHON = (3, 10)
@@ -80,6 +95,7 @@ class StoreConfig:
     table_name: str | None = None
     key_prefix: str | None = None
     max_stream_length: int | None = None
+    compression: str | None = None
 
 
 # Config resolution
@@ -111,6 +127,7 @@ def _resolve_config(args: argparse.Namespace) -> StoreConfig:
     table_name = args.table or env.get(f"{_PREFIX}TABLE_NAME")
     key_prefix = env.get(f"{_PREFIX}KEY_PREFIX")
     max_stream_length = _optional_int(env, f"{_PREFIX}MAX_STREAM_LENGTH")
+    compression = env.get(f"{_PREFIX}COMPRESSION")
 
     return StoreConfig(
         backend=backend,
@@ -119,6 +136,7 @@ def _resolve_config(args: argparse.Namespace) -> StoreConfig:
         table_name=table_name,
         key_prefix=key_prefix or None,
         max_stream_length=max_stream_length,
+        compression=compression or None,
     )
 
 
@@ -272,6 +290,52 @@ def _check_retention(cfg: StoreConfig) -> list[Check]:
     return checks
 
 
+def _check_compression(cfg: StoreConfig) -> Check:
+    """Verify a configured ``MCP_PERSIST_COMPRESSION`` codec is usable.
+
+    Catches the two ways compression fails only once events start flowing: an
+    unknown codec, or ``zstd`` configured without the ``zstd`` extra installed.
+    Both raise from :func:`validate_compression` (the same guard the stores run
+    at construction), surfaced here as a ``fail`` with the pip hint so an operator
+    sees it before the first write instead of at it.
+    """
+    if cfg.compression is None:
+        return Check("compression", "pass", "compression is disabled")
+    try:
+        validate_compression(cfg.compression)
+    except ValueError as exc:
+        return Check("compression", "fail", str(exc))
+    return Check("compression", "pass", f"compression={cfg.compression}: payloads compressed before write")
+
+
+def _check_encryption(env: Mapping[str, str] | None = None) -> Check:
+    """Verify ``MCP_PERSIST_ENCRYPTION_*`` config parses and its driver is present.
+
+    Two failure modes that otherwise only surface at the first encrypted write:
+    a malformed key set (:func:`keyring_from_env` raises ``ValueError`` for a bad
+    base64 key, a wrong length, or an ambiguous active id), and a keyring that is
+    configured while the ``crypto`` extra is not installed (the keyring builds
+    without ``cryptography`` because AES-GCM is imported lazily, so the missing
+    driver stays silent until a write). Both are reported as a ``fail`` with the
+    fix; an unconfigured keyring is a ``pass`` (encryption is opt-in).
+    """
+    try:
+        keyring = keyring_from_env(env)
+    except ValueError as exc:
+        return Check("encryption", "fail", f"encryption config is invalid: {exc}")
+    if keyring is None:
+        return Check("encryption", "pass", "encryption is disabled")
+    if importlib.util.find_spec("cryptography") is None:
+        return Check(
+            "encryption",
+            "fail",
+            "encryption keys are configured but the crypto extra is not installed; "
+            "run: pip install 'mcp-persist[crypto]'",
+        )
+    active_id, _ = keyring.active()
+    return Check("encryption", "pass", f"encryption enabled (active key id {active_id!r})")
+
+
 async def diagnose(
     cfg: StoreConfig,
     *,
@@ -294,6 +358,8 @@ async def diagnose(
     else:
         checks.append(Check("connectivity", "fail", f"skipped: the {cfg.backend} driver is not installed"))
     checks.extend(_check_retention(cfg))
+    checks.append(_check_compression(cfg))
+    checks.append(_check_encryption())
     return checks
 
 
@@ -519,6 +585,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="mcp-persist",
         description="Inspect and diagnose an mcp-persist event store.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"mcp-persist {_package_version()}",
+        help="show the installed mcp-persist version and exit",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

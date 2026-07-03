@@ -5,6 +5,12 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.1] - 2026-07-03
+
+### Added
+- **`doctor` now checks compression and encryption config.** The diagnostic grew two checks so it covers the features added in 1.9 through 1.11, not just the 1.8 surface. The `compression` check runs the same `validate_compression` guard the stores run at construction, so `MCP_PERSIST_COMPRESSION=zstd` without the `zstd` extra (or an unknown codec) is reported up front with the pip hint instead of failing at the first write. The `encryption` check parses `MCP_PERSIST_ENCRYPTION_*` via `keyring_from_env` (surfacing a malformed key set as a `fail`) and, because a `KeyRing` builds without the `cryptography` package (AES-GCM is imported lazily), also flags a keyring configured while the `crypto` extra is not installed, another failure that otherwise stays silent until a write. Both are `pass` when unconfigured, since compression and encryption are opt-in. The checks appear in both the checklist and `--json` output.
+- **`--version` on both CLIs.** `mcp-persist --version` and `mcp-persist-proxy --version` print the installed version and exit.
+
 ## [1.11.0] - 2026-06-30
 
 ### Added

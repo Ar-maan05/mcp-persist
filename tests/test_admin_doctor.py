@@ -123,7 +123,7 @@ async def test_diagnose_all_pass_with_ttl():
     cfg = StoreConfig(backend="sqlite", url="e.db", ttl=60)
     checks = await _admin.diagnose(cfg, open_store=_fake_open(_FakeStore()))
     names = [c.name for c in checks]
-    assert names == ["python", "driver", "connectivity", "retention"]
+    assert names == ["python", "driver", "connectivity", "retention", "compression", "encryption"]
     assert all(c.status == "pass" for c in checks)
 
 
@@ -147,6 +147,69 @@ async def test_diagnose_skips_connectivity_when_driver_missing(monkeypatch):
     checks = await _admin.diagnose(cfg, open_store=_boom)
     conn = next(c for c in checks if c.name == "connectivity")
     assert conn.status == "fail" and "driver is not installed" in conn.detail
+
+
+# compression + encryption checks
+
+
+def test_check_compression_disabled_passes():
+    cfg = StoreConfig(backend="sqlite", url="e.db", compression=None)
+    c = _admin._check_compression(cfg)
+    assert c.status == "pass" and "disabled" in c.detail
+
+
+def test_check_compression_unknown_codec_fails():
+    cfg = StoreConfig(backend="sqlite", url="e.db", compression="lzo")
+    c = _admin._check_compression(cfg)
+    assert c.status == "fail" and "lzo" in c.detail
+
+
+def test_check_compression_zstd_without_extra_fails(monkeypatch):
+    monkeypatch.setattr(_admin, "validate_compression", _raise_missing_zstd)
+    cfg = StoreConfig(backend="sqlite", url="e.db", compression="zstd")
+    c = _admin._check_compression(cfg)
+    assert c.status == "fail" and "mcp-persist[zstd]" in c.detail
+
+
+def _raise_missing_zstd(codec):
+    raise ValueError('compression="zstd" requires the zstd extra: pip install "mcp-persist[zstd]"')
+
+
+def test_check_encryption_disabled_passes():
+    c = _admin._check_encryption(env={})
+    assert c.status == "pass" and "disabled" in c.detail
+
+
+def test_check_encryption_malformed_key_fails():
+    c = _admin._check_encryption(env={"MCP_PERSIST_ENCRYPTION_KEY": "not-base64!!"})
+    assert c.status == "fail" and "invalid" in c.detail
+
+
+def test_check_encryption_enabled_passes_when_driver_present(monkeypatch):
+    monkeypatch.setattr(_admin.importlib.util, "find_spec", lambda name: object())
+    env = {"MCP_PERSIST_ENCRYPTION_KEY": _valid_key(), "MCP_PERSIST_ENCRYPTION_KEY_ID": "k1"}
+    c = _admin._check_encryption(env=env)
+    assert c.status == "pass" and "k1" in c.detail
+
+
+def test_check_encryption_configured_without_crypto_extra_fails(monkeypatch):
+    monkeypatch.setattr(_admin.importlib.util, "find_spec", lambda name: None)
+    c = _admin._check_encryption(env={"MCP_PERSIST_ENCRYPTION_KEY": _valid_key()})
+    assert c.status == "fail" and "mcp-persist[crypto]" in c.detail
+
+
+def _valid_key() -> str:
+    import base64
+    import os
+
+    return base64.b64encode(os.urandom(32)).decode("ascii")
+
+
+def test_version_flag_prints_and_exits_zero(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        _admin._parse_args(["--version"])
+    assert excinfo.value.code == 0
+    assert capsys.readouterr().out.startswith("mcp-persist ")
 
 
 # Rendering

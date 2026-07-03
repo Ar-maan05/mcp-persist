@@ -33,6 +33,17 @@ import uvicorn
 
 from mcp_persist.proxy import PersistenceProxy
 
+
+def _package_version() -> str:
+    """Return the installed ``mcp-persist`` version, or a sentinel from a source tree."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("mcp-persist")
+    except PackageNotFoundError:  # pragma: no cover - running uninstalled
+        return "0.0.0+unknown"
+
+
 # A minimal MCP ``initialize`` request used by ``--check`` to confirm the upstream
 # speaks Streamable HTTP. The id/clientInfo are cosmetic; only the shape of the
 # response (JSON-RPC body or an SSE content-type) is inspected.
@@ -91,6 +102,12 @@ def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
         prog="mcp-persist-proxy",
         description="Add SSE resumability in front of an MCP server.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"mcp-persist {_package_version()}",
+        help="show the installed mcp-persist version and exit",
     )
     parser.add_argument("--upstream", help="URL of a running upstream MCP server (mode 1)")
     parser.add_argument("--backend", choices=("sqlite", "redis", "postgres"), help="event store backend")
