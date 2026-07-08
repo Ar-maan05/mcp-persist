@@ -158,8 +158,12 @@ mcp-persist doctor --backend sqlite --url events.db --ttl 3600
 # Per-stream event inventory + latency probe:
 mcp-persist stats --backend sqlite --url events.db
 
-# Force a purge of expired events (or --dry-run to count first):
+# Force a purge of expired events (--dry-run to count first, --older-than by age):
 mcp-persist purge --backend sqlite --url events.db --ttl 3600
+
+# Export one stream to portable JSON and load it into a fresh store:
+mcp-persist dump session-abc --backend sqlite --url events.db -o session.json
+mcp-persist load session.json --backend sqlite --url repro.db
 
 # Copy every stream from one backend to another:
 mcp-persist migrate --from-backend sqlite --from-url events.db \
@@ -257,7 +261,8 @@ Full API and examples in **[docs/api.md](docs/api.md)**.
 - **Metrics**: pass a `metrics=` collector (a `Protocol`, the built-in `LoggingMetricsCollector`, or `OTelMetricsCollector` for OpenTelemetry) to emit to Prometheus/Datadog/etc.; zero overhead when unused. The proxy adds an optional `on_proxy_replay` hook for reconnect/replay rates and blocked cross-session attempts.
 - **`PurgeScheduler`**: run `purge_expired()` on an interval for SQLite/Postgres (Redis expires natively).
 - **`event_store_from_env()`**: pick the backend at deploy time from `MCP_PERSIST_*` env vars, no branching in code.
-- **`ping()`**: backend liveness/readiness probe for health endpoints.
+- **`ping()`** and **`health()`**: backend liveness/readiness probes for health endpoints; `health()` adds latency and backend-specific detail (DB size, memory, pool) as a `HealthReport`.
+- **`export_stream()` / `import_stream()`** (and `mcp-persist dump` / `load`): capture one stream to portable JSON and restore it into a fresh store, for bug reports and test fixtures.
 
 ## Architecture & guarantees
 
@@ -307,8 +312,8 @@ Full methodology, environment spec, percentiles, and analysis in
 | Guide | What's in it |
 |---|---|
 | [docs/backends.md](docs/backends.md) | Manual wiring, per-backend config, write-behind commits, multi-tenant isolation, `create()` lifecycle |
-| [docs/cli.md](docs/cli.md) | `doctor`, `stats`, `purge` & `migrate` full reference: sample output, `--json`, exit codes |
-| [docs/api.md](docs/api.md) | `subscribe`, `migrate`, metrics + OpenTelemetry, compression, batching, tiered storage, `PurgeScheduler`, env config, `ping` |
+| [docs/cli.md](docs/cli.md) | `doctor`, `stats`, `purge` (incl. `--older-than`), `dump`/`load` & `migrate` full reference: sample output, `--json`, exit codes |
+| [docs/api.md](docs/api.md) | `subscribe`, `migrate`, `export_stream`/`import_stream`, metrics + OpenTelemetry + `DEBUG_PERSIST`, compression, batching, tiered storage, `PurgeScheduler`, env config, `ping`/`health` |
 | [docs/encryption.md](docs/encryption.md) | AES-256-GCM encryption at rest: `KeyRing`, env config, key rotation, composition with compression, threat model |
 | [docs/multi-tenancy.md](docs/multi-tenancy.md) | Per-tenant isolation: binding `tenant_id`, scoped reads/purge/metrics, how each backend isolates |
 | [docs/tiered-storage.md](docs/tiered-storage.md) | Archiving expired events to cold storage: `ArchiveScheduler`, `ChainedEventStore`, resume across tiers |

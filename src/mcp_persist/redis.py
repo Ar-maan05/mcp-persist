@@ -37,8 +37,10 @@ from mcp.server.streamable_http import (
 from mcp.types import JSONRPCMessage
 from pydantic import TypeAdapter
 
+from mcp_persist._debug import default_metrics_collector
 from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
 from mcp_persist.encryption import decrypt_payload, encrypt_payload
+from mcp_persist.health import HealthReport, probe_health
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 
 if TYPE_CHECKING:
@@ -207,7 +209,7 @@ class RedisEventStore(EventStore):
         self._prefix = f"{key_prefix}{tenant_id}:" if tenant_id else key_prefix
         self._ttl = ttl
         self._max_stream_length = max_stream_length
-        self._metrics: MetricsCollector = metrics if metrics is not None else NoOpMetricsCollector()
+        self._metrics: MetricsCollector = metrics if metrics is not None else default_metrics_collector()
         self._enable_streaming = enable_streaming
         self._compression = compression
         self._compress_min_bytes = compress_min_bytes
@@ -330,6 +332,27 @@ class RedisEventStore(EventStore):
         "not ready".
         """
         return bool(await self._redis.ping())
+
+    async def health(self) -> HealthReport:
+        """Return a :class:`~mcp_persist.health.HealthReport` for this Redis store.
+
+        Pings Redis for liveness/latency and, when healthy, records the server's
+        reported ``used_memory`` in ``detail['used_memory_bytes']`` (``None`` if
+        ``INFO`` is unavailable, e.g. a restricted or mock server). Never raises.
+        """
+        report = await probe_health(self, "redis")
+        if report.healthy:
+            report.detail["used_memory_bytes"] = await self._used_memory()
+        return report
+
+    async def _used_memory(self) -> int | None:
+        """Best-effort ``used_memory`` from ``INFO memory``, or ``None`` if unavailable."""
+        try:
+            info = await self._redis.info("memory")
+        except Exception:  # noqa: BLE001 - memory detail is optional, never fatal to a probe
+            return None
+        value = info.get("used_memory") if isinstance(info, dict) else None
+        return int(value) if value is not None else None
 
     # EventStore interface
 

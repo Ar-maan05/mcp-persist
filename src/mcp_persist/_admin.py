@@ -40,6 +40,7 @@ from mcp_persist.compression import validate_compression
 from mcp_persist.config import _PREFIX, _optional_int
 from mcp_persist.encryption import keyring_from_env
 from mcp_persist.migration import MigrationResult, migrate
+from mcp_persist.portability import export_stream, import_stream
 from mcp_persist.postgres import PostgresEventStore
 from mcp_persist.redis import RedisEventStore
 from mcp_persist.sqlite import SQLiteEventStore
@@ -578,6 +579,38 @@ def _render_stats_json(cfg: StoreConfig, report: StatsReport) -> str:
     )
 
 
+# Duration parsing (for `purge --older-than`)
+
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_duration(text: str) -> float:
+    """Parse a duration like ``30d`` / ``12h`` / ``45m`` / ``3600s`` into seconds.
+
+    A bare number is read as seconds, so ``--older-than 3600`` and
+    ``--older-than 1h`` are equivalent. Accepts ``s`` (seconds), ``m`` (minutes),
+    ``h`` (hours), ``d`` (days), and ``w`` (weeks). Raises ``ValueError`` with an
+    actionable message on anything else.
+    """
+    raw = text.strip().lower()
+    if not raw:
+        raise ValueError("empty duration")
+    unit = raw[-1]
+    if unit.isdigit():
+        value, multiplier = raw, 1
+    elif unit in _DURATION_UNITS:
+        value, multiplier = raw[:-1], _DURATION_UNITS[unit]
+    else:
+        raise ValueError(f"unknown duration unit {unit!r} in {text!r}; use s, m, h, d, or w")
+    try:
+        number = float(value)
+    except ValueError:
+        raise ValueError(f"invalid duration {text!r}: expected a number optionally suffixed with s/m/h/d/w") from None
+    if number < 0:
+        raise ValueError(f"duration must not be negative: {text!r}")
+    return number * multiplier
+
+
 # CLI
 
 
@@ -612,6 +645,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     _store_flags(purge)
     purge.add_argument("--batch-size", type=int, help="delete in chunks of N rows")
     purge.add_argument("--dry-run", action="store_true", help="count expired rows without deleting")
+    purge.add_argument(
+        "--older-than",
+        metavar="DURATION",
+        help="purge by age instead of ttl, e.g. 30d / 12h / 3600s (sqlite/postgres only)",
+    )
+
+    dump = sub.add_parser("dump", help="export one stream's events to portable JSON")
+    _store_flags(dump)
+    dump.add_argument("stream_id", help="the stream to export")
+    dump.add_argument("-o", "--output", help="write to this file instead of stdout")
+
+    load = sub.add_parser("load", help="import a stream dumped by `dump` into the configured store")
+    _store_flags(load)
+    load.add_argument("path", nargs="?", help="dump file to read (defaults to stdin)")
+    load.add_argument("--stream-id", help="restore into this stream instead of the one in the dump")
 
     migrate_p = sub.add_parser("migrate", help="copy events from one store to another")
     migrate_p.add_argument("--from-backend", choices=("sqlite", "redis", "postgres"), required=True)
@@ -656,23 +704,33 @@ def _run_stats(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _purge_store(cfg: StoreConfig, *, batch_size: int | None, dry_run: bool) -> int:
+async def _purge_store(cfg: StoreConfig, *, batch_size: int | None, dry_run: bool, older_than: float | None) -> int:
     with _quiet_package_log():
         async with _build_store(cfg) as store:
             if dry_run:
+                if older_than is not None:
+                    return await store.count_expired(older_than=older_than)  # type: ignore[attr-defined]
                 return await count_expired(store)
+            kwargs: dict[str, Any] = {}
             if batch_size is not None:
-                return await store.purge_expired(batch_size=batch_size)  # type: ignore[attr-defined]
-            return await store.purge_expired()  # type: ignore[attr-defined]
+                kwargs["batch_size"] = batch_size
+            if older_than is not None:
+                kwargs["older_than"] = older_than
+            return await store.purge_expired(**kwargs)  # type: ignore[attr-defined]
 
 
 def _run_purge(args: argparse.Namespace) -> int:
     try:
         cfg = _resolve_config(args)
+        older_than = parse_duration(args.older_than) if args.older_than else None
     except ValueError as exc:
         _die(str(exc))
+    if older_than is not None and cfg.backend == "redis":
+        _die("--older-than is not supported for redis (keys expire natively via ttl)")
     try:
-        removed = asyncio.run(_purge_store(cfg, batch_size=args.batch_size, dry_run=args.dry_run))
+        removed = asyncio.run(
+            _purge_store(cfg, batch_size=args.batch_size, dry_run=args.dry_run, older_than=older_than)
+        )
     except Exception as exc:
         print(f"mcp-persist: error: purge failed for {cfg.backend} at {cfg.url}: {exc}", file=sys.stderr)
         return 1
@@ -683,6 +741,76 @@ def _run_purge(args: argparse.Namespace) -> int:
     else:
         print(f"purged {removed} expired event(s)")
     return 0
+
+
+async def _dump_stream(cfg: StoreConfig, stream_id: str) -> dict[str, Any]:
+    with _quiet_package_log():
+        async with _build_store(cfg) as store:
+            return await export_stream(cast(Any, store), stream_id, backend=cfg.backend)
+
+
+def _run_dump(args: argparse.Namespace) -> int:
+    try:
+        cfg = _resolve_config(args)
+    except ValueError as exc:
+        _die(str(exc))
+    try:
+        document = asyncio.run(_dump_stream(cfg, args.stream_id))
+    except Exception as exc:
+        print(f"mcp-persist: error: dump failed for {cfg.backend} at {cfg.url}: {exc}", file=sys.stderr)
+        return 1
+    text = json.dumps(document, indent=None if args.json else 2)
+    if args.output:
+        try:
+            with open(args.output, "w", encoding="utf-8") as handle:
+                handle.write(text + "\n")
+        except OSError as exc:
+            print(f"mcp-persist: error: cannot write {args.output}: {exc}", file=sys.stderr)
+            return 1
+        print(f"wrote {len(document['events'])} event(s) to {args.output}", file=sys.stderr)
+    else:
+        print(text)
+    return 0
+
+
+async def _load_stream(cfg: StoreConfig, document: dict[str, Any], stream_id: str | None) -> int:
+    with _quiet_package_log():
+        async with _build_store(cfg) as store:
+            return await import_stream(cast(Any, store), document, stream_id=stream_id)
+
+
+def _run_load(args: argparse.Namespace) -> int:
+    try:
+        cfg = _resolve_config(args)
+    except ValueError as exc:
+        _die(str(exc))
+    try:
+        raw = _read_text(args.path)
+        document = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"mcp-persist: error: cannot read dump: {exc}", file=sys.stderr)
+        return 1
+    try:
+        written = asyncio.run(_load_stream(cfg, document, args.stream_id))
+    except ValueError as exc:
+        _die(str(exc))
+    except Exception as exc:
+        print(f"mcp-persist: error: load failed for {cfg.backend} at {cfg.url}: {exc}", file=sys.stderr)
+        return 1
+    target = args.stream_id or document.get("stream_id")
+    if args.json:
+        print(json.dumps({"loaded": written, "stream_id": target}))
+    else:
+        print(f"loaded {written} event(s) into stream {target}")
+    return 0
+
+
+def _read_text(path: str | None) -> str:
+    """Read a dump from ``path``, or from stdin when ``path`` is ``None``/``-``."""
+    if path is None or path == "-":
+        return sys.stdin.read()
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
 
 
 async def _migrate_stores(
@@ -742,6 +870,10 @@ def main() -> None:
         raise SystemExit(_run_stats(args))
     if args.command == "purge":
         raise SystemExit(_run_purge(args))
+    if args.command == "dump":
+        raise SystemExit(_run_dump(args))
+    if args.command == "load":
+        raise SystemExit(_run_load(args))
     if args.command == "migrate":
         raise SystemExit(_run_migrate(args))
     _die(f"unknown command {args.command!r}")  # pragma: no cover - argparse rejects first

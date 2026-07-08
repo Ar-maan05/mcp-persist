@@ -82,6 +82,27 @@ synchronous methods: `on_store_event(stream_id, event_id, duration_ms)`,
 (it's a `Protocol`). A collector that raises is logged and ignored rather than
 allowed to fail the underlying operation.
 
+### Developer mode: `DEBUG_PERSIST`
+
+For a quick look during development without wiring a collector, set the
+environment variable `DEBUG_PERSIST` to a truthy value (`1`, `true`, `yes`,
+`on`). Every store built afterward narrates its work to stderr:
+
+```
+mcp_persist.metrics store_event stream=abc event=42 in 0.31ms
+mcp_persist.metrics replay stream=abc events=17 in 1.02ms
+mcp_persist FLUSH events=5
+mcp_persist PURGE removed=128
+```
+
+The `SAVE`/`LOAD` lines come from a `LoggingMetricsCollector` installed as the
+default collector when the flag is set; the `FLUSH` (batching) and `PURGE` lines
+come from stores directly. It is honored as early as package import, so lines
+still appear for a store you constructed with your own `metrics=` collector. When
+the flag is unset the default stays the zero-overhead no-op, so there is no
+runtime cost. The stderr handler is attached only when your application has not
+already configured logging, so it never fights an existing logging setup.
+
 ### Proxy replay metric: `on_proxy_replay`
 
 `PersistenceProxy` accepts the same collector via `metrics=` and recognizes one
@@ -274,6 +295,52 @@ Every store exposes `await store.ping()` (Redis `PING`, Postgres/SQLite
 reachable and lets the driver error propagate otherwise, so a health endpoint can
 report "not ready" when the store's dependency is down. See
 [production.md](production.md#11-readiness-probes-ping).
+
+### Structured health: `health()`
+
+For a richer probe, `await store.health()` returns a `HealthReport` with
+`healthy`, `backend`, `latency_ms`, and a backend-specific `detail` map, plus an
+`as_dict()` for a `/healthz` body:
+
+```python
+report = await store.health()
+if not report.healthy:
+    return JSONResponse(report.as_dict(), status_code=503)
+# {'healthy': True, 'backend': 'sqlite', 'latency_ms': 0.06,
+#  'detail': {'size_bytes': 32768}}
+```
+
+It reuses the store's own `ping()` for the round trip, so `latency_ms` reflects
+the cost every real operation pays. Unlike `ping()`, it never raises: an
+unreachable backend comes back as `healthy=False` with the error in
+`detail['error']`, so you branch on the field rather than catch. `detail` carries
+`size_bytes` for SQLite (logical database size, no filesystem access),
+`used_memory_bytes` for Redis, and `pool_size` / `pool_idle` for Postgres.
+Complements `mcp-persist doctor` (one-shot pass/fail) and `MetricsCollector`
+(continuous per-operation).
+
+## Single-stream export/import: `export_stream()` and `import_stream()`
+
+Capture one stream's events as a portable, versioned JSON document and restore it
+elsewhere. The typical use is a bug report or a test fixture: dump a failing
+session, hand off the JSON, and load it into a fresh store to reproduce.
+
+```python
+from mcp_persist import export_stream, import_stream
+
+doc = await export_stream(source_store, "session-abc123")   # -> a JSON-able dict
+written = await import_stream(dest_store, doc)               # -> events restored
+```
+
+Events are read oldest-first and exported as decompressed, decrypted plaintext
+regardless of how the source persists them; a priming event round-trips as
+`{"message": null}`. `import_stream` validates the envelope before writing a
+single event (failing closed on an unrecognized `format`/`version`) and re-stores
+each event with `store_event`, so the destination assigns fresh IDs: content and
+ordering are reproduced, not the original resumability tokens (same trade-off as
+`migrate()`). Pass `stream_id=` to `import_stream` to restore under a different
+name. The `mcp-persist dump` / `mcp-persist load` CLI (see [cli.md](cli.md)) are
+thin front ends to these.
 
 ## Per-team retention policies
 

@@ -48,8 +48,10 @@ from mcp.server.streamable_http import (
 from mcp.types import JSONRPCMessage
 from pydantic import TypeAdapter
 
+from mcp_persist._debug import debug_log, default_metrics_collector
 from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
 from mcp_persist.encryption import decrypt_payload, encrypt_payload
+from mcp_persist.health import HealthReport, probe_health
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 from mcp_persist.stored import StoredEvent
 
@@ -198,7 +200,7 @@ class PostgresEventStore(EventStore):
         self._ttl = ttl
         self._timeout = timeout
         self._replay_batch_size = replay_batch_size
-        self._metrics: MetricsCollector = metrics if metrics is not None else NoOpMetricsCollector()
+        self._metrics: MetricsCollector = metrics if metrics is not None else default_metrics_collector()
         self._enable_streaming = enable_streaming
         self._compression = compression
         self._compress_min_bytes = compress_min_bytes
@@ -677,6 +679,31 @@ class PostgresEventStore(EventStore):
         await self._pool.fetchval("SELECT 1", timeout=self._timeout)
         return True
 
+    async def health(self) -> HealthReport:
+        """Return a :class:`~mcp_persist.health.HealthReport` for this Postgres store.
+
+        Pings the pool for liveness/latency and, when healthy, records connection
+        pool saturation in ``detail`` (``pool_size`` and ``pool_idle``, so
+        ``pool_size - pool_idle`` is the number of connections currently checked
+        out). Pool figures are ``None`` when the driver does not expose them.
+        Never raises.
+        """
+        report = await probe_health(self, self.backend_name)
+        if report.healthy:
+            report.detail["pool_size"] = self._pool_stat("get_size")
+            report.detail["pool_idle"] = self._pool_stat("get_idle_size")
+        return report
+
+    def _pool_stat(self, method: str) -> int | None:
+        """Read an asyncpg pool gauge by method name, tolerating driver differences."""
+        fn = getattr(self._pool, method, None)
+        if fn is None:
+            return None
+        try:
+            return int(fn())
+        except Exception:  # noqa: BLE001 - pool stats are optional detail, never fatal
+            return None
+
     async def select_expired(
         self,
         *,
@@ -706,13 +733,25 @@ class PostgresEventStore(EventStore):
                 created_at=record["created_at"],
             )
 
-    async def count_expired(self) -> int:
-        """Return the number of events older than ``ttl`` without deleting them."""
-        if self._ttl is None:
+    def _expiry_cutoff(self, older_than: float | None) -> float | None:
+        """Resolve the ``created_at`` cutoff for expiry/purge (see the SQLite twin)."""
+        if older_than is not None:
+            return time.time() - older_than
+        if self._ttl is not None:
+            return time.time() - self._ttl
+        return None
+
+    async def count_expired(self, *, older_than: float | None = None) -> int:
+        """Return the number of expired events without deleting them.
+
+        Counts events older than ``ttl`` by default, or older than ``older_than``
+        seconds when given (which does not require a configured ``ttl``).
+        """
+        cutoff = self._expiry_cutoff(older_than)
+        if cutoff is None:
             return 0
         if not self._initialized:
             await self.initialize()
-        cutoff = time.time() - self._ttl
         params: list[Any] = [cutoff]
         tenant_sql = self._tenant_clause(params)
         count = await self._pool.fetchval(
@@ -798,14 +837,17 @@ class PostgresEventStore(EventStore):
         )
         return row["stream_id"] if row is not None else None
 
-    async def purge_expired(self, *, batch_size: int | None = None) -> int:
-        """Delete events older than ``ttl`` and return the number removed.
+    async def purge_expired(self, *, batch_size: int | None = None, older_than: float | None = None) -> int:
+        """Delete expired events and return the number removed.
 
-        No-op returning ``0`` when ``ttl`` is ``None``. PostgreSQL has no
-        automatic row expiry, so schedule this (e.g. from a periodic background
-        task or ``pg_cron``) to keep the table from growing without bound.
-        (``pg_cron`` is a PostgreSQL extension that runs scheduled jobs inside
-        the database itself, so cleanup can run without an external scheduler.)
+        Deletes events older than ``ttl`` by default; pass ``older_than``
+        (seconds) to delete by an explicit age instead, which works even when no
+        ``ttl`` is configured. No-op returning ``0`` when neither applies.
+        PostgreSQL has no automatic row expiry, so schedule this (e.g. from a
+        periodic background task or ``pg_cron``) to keep the table from growing
+        without bound. (``pg_cron`` is a PostgreSQL extension that runs scheduled
+        jobs inside the database itself, so cleanup can run without an external
+        scheduler.)
 
         Args:
             batch_size: When ``None`` (the default) every expired row is removed
@@ -815,17 +857,18 @@ class PostgresEventStore(EventStore):
                 inserts and replay scans. The expiry cutoff is captured once up
                 front, so events that expire while the loop runs are left for the
                 next call.
+            older_than: Delete events older than this many seconds instead of
+                using ``ttl``. Takes precedence over ``ttl`` when both are set.
         """
-        if self._ttl is None:
-            return 0
-
         if batch_size is not None and batch_size < 1:
             raise ValueError(f"batch_size must be a positive integer or None, got {batch_size!r}")
 
+        cutoff = self._expiry_cutoff(older_than)
+        if cutoff is None:
+            return 0
+
         if not self._initialized:
             await self.initialize()
-
-        cutoff = time.time() - self._ttl
 
         # asyncpg returns a command tag like "DELETE 5"; the count is the last token.
         # The created_at index added in initialize() keeps this an index scan
@@ -838,7 +881,9 @@ class PostgresEventStore(EventStore):
                 *params,
                 timeout=self._timeout,
             )
-            return int(result.split()[-1])
+            removed = int(result.split()[-1])
+            debug_log("PURGE removed=%d", removed)
+            return removed
 
         total = 0
         while True:
@@ -856,6 +901,7 @@ class PostgresEventStore(EventStore):
             total += removed
             if removed < batch_size:
                 break
+        debug_log("PURGE removed=%d", total)
         return total
 
     @property

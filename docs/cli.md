@@ -115,6 +115,49 @@ mcp-persist purge --dry-run
 Purge is tenant-scoped when `MCP_PERSIST_TENANT_ID` is set. A store configured
 without a `ttl` purges nothing (there is no expiry to act on).
 
+```bash
+# Delete by an explicit age instead of the ttl (also 12h, 45m, 3600s, 2w, or a
+# bare number of seconds). Works even when no ttl is configured:
+mcp-persist purge --older-than 30d
+
+# Count what a 30-day cutoff would remove, without deleting:
+mcp-persist purge --older-than 30d --dry-run
+```
+
+`--older-than` deletes events older than the given duration regardless of the
+configured `ttl`, useful for a one-off cleanup or a store that keeps events
+indefinitely by default. It shares the same efficient bulk and `--batch-size`
+`DELETE` paths as the ttl-based purge. Supported on the SQLite and Postgres
+backends; Redis expires keys natively and rejects the flag.
+
+## `mcp-persist dump` and `mcp-persist load`
+
+`mcp-persist dump <stream>` exports a single stream's events to a portable,
+versioned JSON document; `mcp-persist load` reads one back into a store. The
+intended use is bug reports and test fixtures: capture a failing session and
+replay it into a fresh store to reproduce.
+
+```bash
+# Export one stream to a file (omit -o to write JSON to stdout):
+mcp-persist dump session-abc123 --backend sqlite --url events.db -o session.json
+
+# Load it into a fresh store (reads stdin when no path is given):
+mcp-persist load session.json --backend sqlite --url repro.db
+
+# Restore under a different stream name:
+mcp-persist load session.json --stream-id replayed
+```
+
+The document is `{"format": "mcp-persist-dump", "version": 1, "stream_id": ...,
+"events": [...]}`, with each event as `{"event_id": ..., "message": {...}}` (a
+priming event is `{"message": null}`). Payloads are exported as decompressed,
+decrypted plaintext regardless of how the source store persists them, and `load`
+validates the envelope before writing anything, failing closed on an
+unrecognized format or version. As with `migrate`, `load` re-stores each event
+with `store_event`, so the destination assigns fresh IDs: content and ordering
+are reproduced, not the original resumability tokens. Both subcommands are thin
+front ends to `export_stream()` / `import_stream()` (see `docs/api.md`).
+
 ## `mcp-persist migrate`
 
 `mcp-persist migrate` copies every stream from one backend to another, the CLI

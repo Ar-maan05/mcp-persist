@@ -46,8 +46,10 @@ from mcp.server.streamable_http import (
 from mcp.types import JSONRPCMessage
 from pydantic import TypeAdapter
 
+from mcp_persist._debug import debug_log, default_metrics_collector
 from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
 from mcp_persist.encryption import decrypt_payload, encrypt_payload
+from mcp_persist.health import HealthReport, probe_health
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 from mcp_persist.stored import StoredEvent
 
@@ -192,7 +194,7 @@ class SQLiteEventStore(EventStore):
         self._tenant_id = tenant_id
         self._tenant_column_ready = False
         self._timeout = timeout
-        self._metrics: MetricsCollector = metrics if metrics is not None else NoOpMetricsCollector()
+        self._metrics: MetricsCollector = metrics if metrics is not None else default_metrics_collector()
         self._enable_streaming = enable_streaming
         self._compression = compression
         self._compress_min_bytes = compress_min_bytes
@@ -721,6 +723,35 @@ class SQLiteEventStore(EventStore):
         async with self._conn.execute("SELECT 1"):
             return True
 
+    async def health(self) -> HealthReport:
+        """Return a :class:`~mcp_persist.health.HealthReport` for this database.
+
+        Pings the connection for liveness/latency and, when healthy, records the
+        database file's on-disk size in ``detail['disk_bytes']`` (``None`` for an
+        in-memory database or a path that cannot be stat'd). Never raises: a dead
+        connection comes back as ``healthy=False``.
+        """
+        report = await probe_health(self, self.backend_name)
+        if report.healthy:
+            report.detail["size_bytes"] = await self._size_bytes()
+        return report
+
+    async def _size_bytes(self) -> int | None:
+        """Logical database size in bytes (``page_count * page_size``).
+
+        Read straight from the connection with pragmas, so it works for a file,
+        an in-memory, or a shared-cache database without touching the filesystem
+        or needing the original path. ``None`` if the pragmas cannot be read.
+        """
+        try:
+            async with self._conn.execute("PRAGMA page_count") as cur:
+                (page_count,) = await cur.fetchone()
+            async with self._conn.execute("PRAGMA page_size") as cur:
+                (page_size,) = await cur.fetchone()
+        except Exception:  # noqa: BLE001 - size is best-effort detail, never fatal to a probe
+            return None
+        return int(page_count) * int(page_size)
+
     async def select_expired(
         self,
         *,
@@ -747,13 +778,31 @@ class SQLiteEventStore(EventStore):
                     created_at=created_at,
                 )
 
-    async def count_expired(self) -> int:
-        """Return the number of events older than ``ttl`` without deleting them."""
-        if self._ttl is None:
+    def _expiry_cutoff(self, older_than: float | None) -> float | None:
+        """Resolve the ``created_at`` cutoff for expiry/purge.
+
+        ``older_than`` (seconds) takes precedence and works even when no ``ttl``
+        is configured, so an operator can purge by an explicit age. Otherwise the
+        cutoff is derived from ``ttl``; with neither there is nothing to expire
+        and this returns ``None``.
+        """
+        if older_than is not None:
+            return time.time() - older_than
+        if self._ttl is not None:
+            return time.time() - self._ttl
+        return None
+
+    async def count_expired(self, *, older_than: float | None = None) -> int:
+        """Return the number of expired events without deleting them.
+
+        Counts events older than ``ttl`` by default, or older than ``older_than``
+        seconds when given (which does not require a configured ``ttl``).
+        """
+        cutoff = self._expiry_cutoff(older_than)
+        if cutoff is None:
             return 0
         if not self._initialized:
             await self.initialize()
-        cutoff = time.time() - self._ttl
         tenant_sql, tenant_params = self._tenant_filter_sql()
         async with self._conn.execute(
             f"SELECT COUNT(*) FROM {self._table} WHERE created_at < ?{tenant_sql}",
@@ -832,12 +881,14 @@ class SQLiteEventStore(EventStore):
             row = await cursor.fetchone()
             return row[0] if row is not None else None
 
-    async def purge_expired(self, *, batch_size: int | None = None) -> int:
-        """Delete events older than ``ttl`` and return the number removed.
+    async def purge_expired(self, *, batch_size: int | None = None, older_than: float | None = None) -> int:
+        """Delete expired events and return the number removed.
 
-        No-op returning ``0`` when ``ttl`` is ``None``. SQLite has no automatic
-        key expiry, so schedule this (e.g. from a periodic background task) to
-        keep the database from growing without bound.
+        Deletes events older than ``ttl`` by default; pass ``older_than``
+        (seconds) to delete by an explicit age instead, which works even when no
+        ``ttl`` is configured. No-op returning ``0`` when neither applies. SQLite
+        has no automatic key expiry, so schedule this (e.g. from a periodic
+        background task) to keep the database from growing without bound.
 
         Args:
             batch_size: When ``None`` (the default) every expired row is removed
@@ -847,17 +898,19 @@ class SQLiteEventStore(EventStore):
                 live inserts and replay scans. The expiry cutoff is captured once
                 up front, so events that expire while the loop runs are left for
                 the next call.
+            older_than: Delete events older than this many seconds instead of
+                using ``ttl``. Takes precedence over ``ttl`` when both are set.
         """
-        if self._ttl is None:
-            return 0
-
         if batch_size is not None and batch_size < 1:
             raise ValueError(f"batch_size must be a positive integer or None, got {batch_size!r}")
+
+        cutoff = self._expiry_cutoff(older_than)
+        if cutoff is None:
+            return 0
 
         if not self._initialized:
             await self.initialize()
 
-        cutoff = time.time() - self._ttl
         tenant_sql, tenant_params = self._tenant_filter_sql()
 
         if batch_size is None:
@@ -866,6 +919,7 @@ class SQLiteEventStore(EventStore):
                 (cutoff, *tenant_params),
             ) as cursor:
                 await self._conn.commit()
+                debug_log("PURGE removed=%d", cursor.rowcount)
                 return cursor.rowcount
 
         total = 0
@@ -883,6 +937,7 @@ class SQLiteEventStore(EventStore):
             total += removed
             if removed < batch_size:
                 break
+        debug_log("PURGE removed=%d", total)
         return total
 
     @property

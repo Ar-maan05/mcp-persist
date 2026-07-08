@@ -28,16 +28,19 @@ events (see :mod:`mcp_persist.proxy`).
 
 from importlib.metadata import PackageNotFoundError, version
 
+from mcp_persist._debug import configure_debug_logging
 from mcp_persist.batching import BatchingEventStore
 from mcp_persist.config import event_store_from_env, retention_policy_from_env
 from mcp_persist.encryption import KeyRing, generate_key, keyring_from_env
 from mcp_persist.fastmcp import with_persistence
+from mcp_persist.health import HealthReport
 from mcp_persist.metrics import (
     LoggingMetricsCollector,
     MetricsCollector,
     NoOpMetricsCollector,
 )
 from mcp_persist.migration import MigrationResult, migrate
+from mcp_persist.portability import export_stream, import_stream
 from mcp_persist.postgres import PostgresEventStore
 from mcp_persist.proxy import PersistenceProxy
 from mcp_persist.redis import RedisEventStore
@@ -59,6 +62,11 @@ try:
 except PackageNotFoundError:  # pragma: no cover - running from a source tree without install
     __version__ = "0.0.0+unknown"
 
+# Honour DEBUG_PERSIST as early as import so the FLUSH/PURGE lines from stores
+# built with a custom metrics collector still reach stderr. No-op unless the
+# flag is set (see mcp_persist._debug).
+configure_debug_logging()
+
 __all__ = [
     "ArchiveScheduler",
     "AuditSink",
@@ -66,6 +74,7 @@ __all__ = [
     "ChainedEventStore",
     "DatabaseAuditSink",
     "DeletionAuditEntry",
+    "HealthReport",
     "KeyRing",
     "LoggingAuditSink",
     "LoggingMetricsCollector",
@@ -85,7 +94,9 @@ __all__ = [
     "archive_expired_batch",
     "count_expired",
     "event_store_from_env",
+    "export_stream",
     "generate_key",
+    "import_stream",
     "keyring_from_env",
     "migrate",
     "retention_policy_from_env",

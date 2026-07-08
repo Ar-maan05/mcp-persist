@@ -16,6 +16,7 @@ from mcp.server.streamable_http import (
 )
 from mcp.types import JSONRPCMessage
 
+from mcp_persist._debug import debug_log
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 
 if TYPE_CHECKING:
@@ -139,6 +140,7 @@ class BatchingEventStore(EventStore):
             raise TypeError(f"{type(self._inner).__name__} has no _store_event_with_id()")
         for item in batch:
             await store_with_id(item.stream_id, item.message, item.event_id)
+        debug_log("FLUSH events=%d", len(batch))
 
         async with self._lock:
             if self._pending:
