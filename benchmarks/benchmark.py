@@ -3,6 +3,7 @@
 Measures, per backend:
   - store latency      — sequential store_event calls (mean / p50 / p95, microseconds)
   - store throughput   — concurrent store_event calls (events/second)
+  - batched throughput — concurrent writes including the final durable flush (Redis/Postgres)
   - replay latency     — time to replay a stream of N events (total ms + per-event us)
 
 SQLite is benchmarked against an on-disk file (its realistic durable mode), not
@@ -15,7 +16,7 @@ Backends are included only if reachable:
 
 Usage:
     uv run python benchmarks/benchmark.py
-    uv run python benchmarks/benchmark.py --events 5000 --concurrency 100
+    uv run python benchmarks/benchmark.py --events 5000 --concurrency 100 --batch-size 64
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from typing import Any
 
 from mcp.types import JSONRPCRequest
 
-from mcp_persist import PostgresEventStore, RedisEventStore, SQLiteEventStore
+from mcp_persist import BatchingEventStore, PostgresEventStore, RedisEventStore, SQLiteEventStore
 
 SAMPLE = JSONRPCRequest(jsonrpc="2.0", id="1", method="tools/list")
 
@@ -80,6 +81,29 @@ async def bench_store_throughput(store, n: int, concurrency: int) -> float:
     return n / elapsed
 
 
+async def bench_batched_throughput(store, n: int, concurrency: int, batch_size: int) -> float:
+    """Events/second through BatchingEventStore, including its final flush."""
+    batching = BatchingEventStore(
+        store,
+        flush_max_events=batch_size,
+        # Keep the timer-driven flush out of the benchmark. Size-triggered
+        # flushes still occur, and the explicit final flush below includes the
+        # durability cost of a short tail.
+        flush_max_latency_ms=60_000,
+    )
+    sem = asyncio.Semaphore(concurrency)
+
+    async def one() -> None:
+        async with sem:
+            await batching.store_event("batched-tput-stream", SAMPLE)
+
+    start = time.perf_counter()
+    await asyncio.gather(*(one() for _ in range(n)))
+    await batching.flush()
+    elapsed = time.perf_counter() - start
+    return n / elapsed
+
+
 async def bench_replay(store, n: int) -> dict[str, float]:
     """Time to replay a stream of n events."""
     anchor = await store.store_event("replay-stream", SAMPLE)
@@ -106,15 +130,15 @@ async def bench_replay(store, n: int) -> dict[str, float]:
 async def sqlite_store() -> AsyncIterator[SQLiteEventStore]:
     import aiosqlite
 
-    tmp = Path(tempfile.mkdtemp()) / "bench.db"
-    conn = await aiosqlite.connect(str(tmp))
-    try:
-        store = SQLiteEventStore(conn, ttl=TTL)
-        await store.initialize()
-        yield store
-    finally:
-        await conn.close()
-        tmp.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        path = Path(tmp_dir) / "bench.db"
+        conn = await aiosqlite.connect(str(path))
+        try:
+            store = SQLiteEventStore(conn, ttl=TTL)
+            await store.initialize()
+            yield store
+        finally:
+            await conn.close()
 
 
 @contextlib.asynccontextmanager
@@ -152,7 +176,7 @@ BACKENDS = {
 }
 
 
-async def run_backend(name: str, factory, events: int, concurrency: int) -> dict[str, Any] | None:
+async def run_backend(name: str, factory, events: int, concurrency: int, batch_size: int) -> dict[str, Any] | None:
     try:
         async with factory() as store:
             # Warm up so connection/pool/cache costs don't skew the first sample.
@@ -161,6 +185,9 @@ async def run_backend(name: str, factory, events: int, concurrency: int) -> dict
 
             seq = await bench_store_sequential(store, events)
             tput = await bench_store_throughput(store, events, concurrency)
+            batched_tput = None
+            if name != "SQLite":
+                batched_tput = await bench_batched_throughput(store, events, concurrency, batch_size)
 
             # Benchmark replay at multiple scales
             replay_100 = await bench_replay(store, 100)
@@ -170,6 +197,7 @@ async def run_backend(name: str, factory, events: int, concurrency: int) -> dict
             return {
                 **seq,
                 "throughput_eps": tput,
+                "batched_throughput_eps": batched_tput,
                 "replay_100_ms": replay_100["total_ms"],
                 "replay_1000_ms": replay_1000["total_ms"],
                 "replay_10000_ms": replay_10000["total_ms"],
@@ -198,6 +226,19 @@ def print_table(results: dict[str, dict[str, Any]]) -> None:
         )
     print("-" * len(header1))
 
+    batched = {name: r for name, r in results.items() if r["batched_throughput_eps"] is not None}
+    if batched:
+        header_batch = f"{'Backend':<10} {'unbatched':>15} {'batched':>15} {'speedup':>10}"
+        print("\nBatched Storage Performance (includes final flush):")
+        print("-" * len(header_batch))
+        print(header_batch)
+        print("-" * len(header_batch))
+        for name, r in batched.items():
+            raw = r["throughput_eps"]
+            batched_tput = r["batched_throughput_eps"]
+            print(f"{name:<10} {raw:>10,.0f} ev/s {batched_tput:>10,.0f} ev/s {batched_tput / raw:>9.2f}x")
+        print("-" * len(header_batch))
+
     # Table 2: Replay Latency
     header2 = f"{'Backend':<10} {'Replay 100':>15} {'Replay 1,000':>15} {'Replay 10,000':>15}"
     print("\nReplay Performance (Total Latency):")
@@ -216,12 +257,19 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark mcp-persist backends.")
     parser.add_argument("--events", type=int, default=2000, help="events per phase (default: 2000)")
     parser.add_argument("--concurrency", type=int, default=50, help="concurrent stores for throughput (default: 50)")
+    parser.add_argument("--batch-size", type=int, default=64, help="events per batched flush (default: 64)")
     args = parser.parse_args()
+    if args.events < 1:
+        parser.error("--events must be a positive integer")
+    if args.concurrency < 1:
+        parser.error("--concurrency must be a positive integer")
+    if args.batch_size < 1:
+        parser.error("--batch-size must be a positive integer")
 
-    print(f"Benchmarking {args.events} events, concurrency {args.concurrency}")
+    print(f"Benchmarking {args.events} events, concurrency {args.concurrency}, batch size {args.batch_size}")
     results: dict[str, dict[str, Any]] = {}
     for name, factory in BACKENDS.items():
-        result = await run_backend(name, factory, args.events, args.concurrency)
+        result = await run_backend(name, factory, args.events, args.concurrency, args.batch_size)
         if result is not None:
             results[name] = result
 

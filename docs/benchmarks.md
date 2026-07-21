@@ -1,13 +1,14 @@
 # Benchmarks
 
 [`benchmarks/benchmark.py`](../benchmarks/benchmark.py) measures `store_event`
-latency (sequential), `store_event` throughput (concurrent), and
+latency (sequential), unbatched `store_event` throughput (concurrent), durably
+flushed `BatchingEventStore` throughput for Redis and Postgres, and
 `replay_events_after` latency across all three backends. SQLite runs against an
 on-disk file (its realistic durable mode), and Redis/Postgres run over the
 network. Run it yourself:
 
 ```bash
-uv run python benchmarks/benchmark.py --events 5000 --concurrency 500
+uv run python benchmarks/benchmark.py --events 5000 --concurrency 500 --batch-size 64
 ```
 
 > **These numbers are indicative, not authoritative.** Absolute latency and
@@ -20,7 +21,10 @@ The table below was measured with the following configuration:
 - **Redis Version:** 8.8.0 (container on localhost)
 - **PostgreSQL Version:** 18.4 (container on localhost)
 
-Measured with `--events 5000 --concurrency 500`:
+The historical backend tables below were measured with `--events 5000
+--concurrency 500` before the batched-throughput phase was added. Run the command
+above to obtain raw versus batched results for the current release on your own
+Redis and Postgres services.
 
 ### Storage Performance
 
