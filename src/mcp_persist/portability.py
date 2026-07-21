@@ -128,15 +128,19 @@ async def import_stream(
     if not target:
         raise ValueError("no stream_id in the dump and none supplied; pass stream_id=")
 
-    written = 0
+    messages: list[JSONRPCMessage | None] = []
     for index, raw in enumerate(document["events"]):
         if not isinstance(raw, dict) or "message" not in raw:
             raise ValueError(f"event {index} is malformed: expected an object with a 'message' key")
         payload = raw["message"]
         message = None if payload is None else _message_adapter.validate_python(payload)
+        messages.append(message)
+
+    # Validate and parse the complete document before mutating the destination.
+    # A bad event near the end must not leave a partially restored stream.
+    for message in messages:
         await store.store_event(target, message)
-        written += 1
-    return written
+    return len(messages)
 
 
 def _validate_document(document: object) -> None:

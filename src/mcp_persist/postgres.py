@@ -472,6 +472,41 @@ class PostgresEventStore(EventStore):
         if self._enable_streaming and message is not None:
             await self._publish_notification(stream_id, event_id)
 
+    async def _store_events_with_ids(
+        self,
+        events: Sequence[tuple[StreamId, JSONRPCMessage | None, EventId]],
+    ) -> None:
+        """Store a pre-allocated event batch with one ``executemany`` call."""
+        if not events:
+            return
+        if not self._initialized:
+            await self.initialize()
+
+        now = time.time()
+        rows: list[tuple[int, StreamId, str, float, str | None]] = []
+        for stream_id, message, event_id in events:
+            payload = (
+                ""
+                if message is None
+                else self._encode_payload(message.model_dump_json(by_alias=True, exclude_none=True))
+            )
+            rows.append((int(event_id), stream_id, payload, now, self._tenant_id))
+
+        await self._pool.executemany(
+            f"INSERT INTO {self._table} (event_id, stream_id, payload, created_at, tenant_id) "
+            "OVERRIDING SYSTEM VALUE VALUES ($1, $2, $3, $4, $5) "
+            "ON CONFLICT (event_id) DO UPDATE SET "
+            "stream_id = EXCLUDED.stream_id, payload = EXCLUDED.payload, created_at = EXCLUDED.created_at, "
+            "tenant_id = EXCLUDED.tenant_id",
+            rows,
+            timeout=self._timeout,
+        )
+
+        if self._enable_streaming:
+            for stream_id, message, event_id in events:
+                if message is not None:
+                    await self._publish_notification(stream_id, event_id)
+
     async def replay_events_after(
         self,
         last_event_id: EventId,

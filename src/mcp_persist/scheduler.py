@@ -46,7 +46,7 @@ class PurgeScheduler:
     Args:
         store:       A store exposing ``purge_expired`` (SQLite or Postgres).
                      Passing a store without it (e.g. ``RedisEventStore``) raises
-                     ``TypeError`` — Redis expires keys natively, so a scheduler
+                     ``TypeError``: Redis expires keys natively, so a scheduler
                      would do nothing.
         interval:    Seconds between purges. Must be positive.
         jitter:      Maximum extra seconds added to each sleep, drawn uniformly
@@ -55,7 +55,7 @@ class PurgeScheduler:
                      periodic. Use it to de-synchronise replicas that start
                      together so they don't all purge a shared backend in the
                      same instant (a "thundering herd"). A good rule of thumb is
-                     10–20% of ``interval`` — e.g. ``interval=300, jitter=30``
+                     10 to 20% of ``interval`` (e.g. ``interval=300, jitter=30``)
                      spreads replicas across a 30s window.
         batch_size:  Forwarded to ``purge_expired(batch_size=...)`` when set, so a
                      large purge deletes in bounded chunks instead of one long
@@ -334,6 +334,7 @@ class RetentionScheduler:
             if self._jitter:
                 delay += random.uniform(0, self._jitter)
             await asyncio.sleep(delay)
+            strict_audit_failure = False
             try:
                 now = time.time()
                 tenants = await self._store.distinct_tenants()
@@ -360,10 +361,13 @@ class RetentionScheduler:
                     except Exception:
                         self._log.exception("audit sink failed to record deletion for tenant %r", tenant)
                         if self._strict_audit:
+                            strict_audit_failure = True
                             raise
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
+                if strict_audit_failure:
+                    raise
                 self._log.exception("RetentionScheduler cycle failed; the scheduler will retry next interval")
 
     async def __aenter__(self) -> RetentionScheduler:

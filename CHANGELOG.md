@@ -5,6 +5,13 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.1] - 2026-07-21
+
+### Fixed
+- **Batched writes are faster and survive transient partial flush failures.** Redis flushes now use one pipeline execution and Postgres flushes use one `executemany` call instead of one round trip per event. `BatchingEventStore` also retains the failed write and untouched tail, preserves their event-ID order ahead of concurrently accepted writes, and retries background flush failures after the configured latency window. Physical flushes are serialized, writes after `aclose()` fail clearly, and ID-block consumption no longer shifts a list on every event.
+- **Dump imports validate every event before writing.** A malformed event late in an `import_stream()` document can no longer leave the destination with a partially restored stream. The complete dump is parsed and validated before the first store mutation.
+- **Strict retention auditing now actually halts on failure.** An audit-sink exception with `strict_audit=True` now terminates the scheduler task and is propagated by `aclose()` or context exit, matching the documented contract. Previously the outer retry handler swallowed the re-raised exception. `strict_audit=False` continues to log and retry as before.
+
 ## [1.12.0] - 2026-07-08
 
 ### Added

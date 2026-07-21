@@ -475,6 +475,20 @@ async def test_scheduler_strict_audit_re_raises():
     scheduler = RetentionScheduler(store, policy, sink, interval=0.01, strict_audit=True)
     await scheduler.start()
     await asyncio.sleep(0.03)
+    with pytest.raises(RuntimeError, match="sink error"):
+        await scheduler.aclose()
+
+
+@pytest.mark.anyio
+async def test_scheduler_non_strict_audit_failure_keeps_running():
+    store = FakeSchedulerStore(tenants=["team-a"], deleted_count=5)
+    policy = RetentionPolicy(windows={"team-a": 3600})
+    sink = RecordingAuditSink(fail=True)
+
+    scheduler = RetentionScheduler(store, policy, sink, interval=0.01, strict_audit=False)
+    await scheduler.start()
+    await asyncio.sleep(0.03)
+    assert scheduler._task is not None and not scheduler._task.done()
     await scheduler.aclose()
 
 

@@ -142,3 +142,27 @@ def test_import_requires_a_stream_id(tmp_path):
             await conn.close()
 
     asyncio.run(run())
+
+
+def test_import_validates_every_event_before_writing(tmp_path):
+    dst_db = str(tmp_path / "dst.db")
+    doc = {
+        "format": DUMP_FORMAT,
+        "version": DUMP_VERSION,
+        "stream_id": "s",
+        "events": [
+            {"event_id": "1", "message": _msg(1).model_dump(mode="json", by_alias=True)},
+            {"event_id": "2"},
+        ],
+    }
+
+    async def run() -> list:
+        conn, store = await _make_store(dst_db)
+        try:
+            with pytest.raises(ValueError, match="event 1 is malformed"):
+                await import_stream(store, doc)
+            return [event async for event in store._iter_stream_events("s")]
+        finally:
+            await conn.close()
+
+    assert asyncio.run(run()) == []

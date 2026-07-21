@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
 
@@ -537,6 +537,39 @@ class RedisEventStore(EventStore):
 
         if self._enable_streaming and message is not None:
             await self._publish_notification(stream_id, event_id)
+
+    async def _store_events_with_ids(
+        self,
+        events: Sequence[tuple[StreamId, JSONRPCMessage | None, EventId]],
+    ) -> None:
+        """Store a pre-allocated event batch in one Redis pipeline round trip."""
+        if not events:
+            return
+
+        encoded: list[tuple[StreamId, JSONRPCMessage | None, EventId, int, str]] = []
+        for stream_id, message, event_id in events:
+            payload = (
+                ""
+                if message is None
+                else self._encode_payload(message.model_dump_json(by_alias=True, exclude_none=True))
+            )
+            encoded.append((stream_id, message, event_id, int(event_id), payload))
+
+        async with self._redis.pipeline(transaction=False) as pipe:
+            for stream_id, _message, event_id, event_id_int, payload in encoded:
+                pipe.hset(self._event_key(event_id), mapping={"stream_id": stream_id, "payload": payload})
+                pipe.zadd(self._stream_key(stream_id), {event_id: event_id_int})
+                if self._max_stream_length is not None:
+                    pipe.zremrangebyrank(self._stream_key(stream_id), 0, -(self._max_stream_length + 1))
+                if self._ttl is not None:
+                    pipe.expire(self._event_key(event_id), self._ttl)
+                    pipe.expire(self._stream_key(stream_id), self._ttl)
+            await pipe.execute()
+
+        if self._enable_streaming:
+            for stream_id, message, event_id, _event_id_int, _payload in encoded:
+                if message is not None:
+                    await self._publish_notification(stream_id, event_id)
 
     async def _store_event_raw(
         self,

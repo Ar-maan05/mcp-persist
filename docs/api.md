@@ -186,6 +186,15 @@ worst case for a process crash before a flush is that a client replays from one
 event earlier. `replay_events_after()` flushes pending writes first, so a
 reconnecting client never misses a buffered event.
 
+Flushes are serialized. If a backend fails partway through a flush, successfully
+written events are left alone and the failed event plus the untouched tail stay
+queued in event-ID order. Background flushes log the failure and retry after the
+latency window. An explicit `flush()`, size-triggered flush, replay-triggered
+flush, or `aclose()` still propagates the backend error so callers can react.
+After `aclose()` begins, new writes are rejected. Each flush uses one Redis
+pipeline execution or one Postgres `executemany` call, rather than a round trip
+per buffered event.
+
 SQLite is intentionally rejected (a `TypeError` at construction): its own
 write-behind (`commit_interval` / `commit_max_pending`) already batches the fsync
 that dominates SQLite's write cost, so a second batching layer would add nothing.
@@ -408,4 +417,3 @@ await store.replay_events_after("0", send_callback, "fork-stream")
 - **Ancestry resolution:** replaying or iterating over a child stream dynamically traverses all ancestor stream segments up to the root, only scanning the slice of events valid for that segment.
 - **Segment scope:** replaying handles boundary constraints (`min_id` and `max_id`) per segment segmentally.
 - **Unified interfaces:** supported natively by SQLite, Redis, and Postgres backends, as well as `BatchingEventStore` and `ChainedEventStore`.
-

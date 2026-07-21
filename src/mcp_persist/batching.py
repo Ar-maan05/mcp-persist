@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -78,10 +79,12 @@ class BatchingEventStore(EventStore):
         self._flush_max_latency_ms = flush_max_latency_ms
         self._metrics: MetricsCollector = metrics if metrics is not None else NoOpMetricsCollector()
         self._pending: list[_PendingWrite] = []
-        self._id_block: list[EventId] = []
+        self._id_block: deque[EventId] = deque()
         self._lock = asyncio.Lock()
+        self._flush_lock = asyncio.Lock()
         self._flush_task: asyncio.Task[None] | None = None
         self._next_flush_at: float | None = None
+        self._closed = False
 
     async def store_event(
         self,
@@ -101,9 +104,13 @@ class BatchingEventStore(EventStore):
 
     async def _store_event_impl(self, stream_id: StreamId, message: JSONRPCMessage | None) -> EventId:
         async with self._lock:
+            if self._closed:
+                raise RuntimeError("BatchingEventStore is closed")
             if not self._id_block:
-                self._id_block = await self._inner._allocate_event_ids(self._flush_max_events)  # type: ignore[attr-defined]
-            event_id = self._id_block.pop(0)
+                self._id_block.extend(
+                    await self._inner._allocate_event_ids(self._flush_max_events)  # type: ignore[attr-defined]
+                )
+            event_id = self._id_block.popleft()
             self._pending.append(_PendingWrite(stream_id, message, event_id))
             flush_now = len(self._pending) >= self._flush_max_events
             if self._next_flush_at is None:
@@ -126,30 +133,56 @@ class BatchingEventStore(EventStore):
                 return
             delay = max(0.0, deadline - time.monotonic())
             await asyncio.sleep(delay)
-            await self.flush()
+            try:
+                await self.flush()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - retain the batch and retry after the latency window
+                logger.exception("batched event flush failed; retrying after the latency window")
 
     async def flush(self) -> None:
-        async with self._lock:
-            if not self._pending:
-                return
-            batch = self._pending
-            self._pending = []
+        async with self._flush_lock:
+            async with self._lock:
+                if not self._pending:
+                    return
+                batch = self._pending
+                self._pending = []
 
-        store_with_id: Any = getattr(self._inner, "_store_event_with_id", None)
-        if store_with_id is None:
-            raise TypeError(f"{type(self._inner).__name__} has no _store_event_with_id()")
-        for item in batch:
-            await store_with_id(item.stream_id, item.message, item.event_id)
-        debug_log("FLUSH events=%d", len(batch))
+            store_with_id: Any = getattr(self._inner, "_store_event_with_id", None)
+            if store_with_id is None:
+                raise TypeError(f"{type(self._inner).__name__} has no _store_event_with_id()")
 
-        async with self._lock:
-            if self._pending:
-                self._next_flush_at = time.monotonic() + (self._flush_max_latency_ms / 1000.0)
-                self._ensure_flusher()
-            else:
-                self._next_flush_at = None
+            written = 0
+            try:
+                store_batch: Any = getattr(self._inner, "_store_events_with_ids", None)
+                if store_batch is not None:
+                    await store_batch([(item.stream_id, item.message, item.event_id) for item in batch])
+                    written = len(batch)
+                else:
+                    for item in batch:
+                        await store_with_id(item.stream_id, item.message, item.event_id)
+                        written += 1
+            except BaseException:
+                # Completed writes are idempotent and need no retry. Put the
+                # failed item and untouched tail back ahead of writes accepted
+                # concurrently, preserving global event-ID order.
+                async with self._lock:
+                    self._pending = batch[written:] + self._pending
+                    self._next_flush_at = time.monotonic() + (self._flush_max_latency_ms / 1000.0)
+                raise
+
+            debug_log("FLUSH events=%d", len(batch))
+
+            async with self._lock:
+                if self._pending:
+                    self._next_flush_at = time.monotonic() + (self._flush_max_latency_ms / 1000.0)
+                    self._ensure_flusher()
+                else:
+                    self._next_flush_at = None
 
     async def aclose(self) -> None:
+        async with self._lock:
+            self._closed = True
         task = self._flush_task
         self._flush_task = None
         if task is not None:

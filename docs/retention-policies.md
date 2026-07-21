@@ -55,7 +55,7 @@ The default `DatabaseAuditSink` writes audit rows into a dedicated database tabl
 
 ### Strict vs Best-Effort Audit
 The `RetentionScheduler` constructor accepts a `strict_audit` boolean flag:
-* `strict_audit=True` (default): If the audit sink raises an exception, the scheduler logs an ERROR and propagates the exception to halt operations. This ensures that deletions are never unrecorded.
+* `strict_audit=True` (default): If the audit sink raises an exception, the scheduler logs an ERROR and propagates the exception to halt future retention cycles. The deletion associated with the failed audit write has already occurred, so operators must treat the raised error as a compliance incident and reconcile it from backend records.
 * `strict_audit=False`: If the audit sink fails, the error is logged and swallowed, continuing to the next tenant.
 
 ## Configuration via Environment
