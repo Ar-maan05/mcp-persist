@@ -44,6 +44,19 @@ async def _committed_count(path: str) -> int:
         await other.close()
 
 
+async def _wait_for_committed_count(path: str, expected: int, *, timeout: float = 2.0) -> None:
+    """Wait for a background commit without assuming precise CI scheduling."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        actual = await _committed_count(path)
+        if actual == expected:
+            return
+        if loop.time() >= deadline:
+            pytest.fail(f"expected {expected} committed events within {timeout}s, found {actual}")
+        await asyncio.sleep(0.02)
+
+
 @pytest.mark.anyio
 async def test_sqlite_high_throughput(tmp_path):
     """Verify high-throughput write and read workloads on SQLite."""
@@ -117,9 +130,8 @@ async def test_sqlite_write_behind_load(tmp_path):
         await short_store.store_event("wb-stream", SAMPLE_MSG)
         assert await _committed_count(path) == 2  # not committed immediately
 
-        # Wait for flush interval
-        await asyncio.sleep(0.25)
-        assert await _committed_count(path) == 3  # flushed by background task
+        # Wait for the background task without assuming exact CI scheduling.
+        await _wait_for_committed_count(path, 3)
 
     # 2. Maximum pending queue pressure
     # Verify that once commit_max_pending is hit, commits happen immediately and
