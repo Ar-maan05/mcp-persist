@@ -112,12 +112,12 @@ One row per event:
 
 ```python
 SQLiteEventStore(
-    conn,                   # an open aiosqlite.Connection
+    conn,  # an open aiosqlite.Connection
     table_name="mcp_events",  # isolate multiple servers in one database file
-    ttl=3600,               # seconds; None = never expire (not recommended)
-    compression=None,       # "gzip" to compress large payloads (see "Large payloads" in api.md)
-    keyring=None,           # KeyRing to encrypt payloads at rest (see encryption.md)
-    commit_interval=None,   # seconds; set to batch commits (write-behind, see below)
+    ttl=3600,  # seconds; None = never expire (not recommended)
+    compression=None,  # "gzip" to compress large payloads (see "Large payloads" in api.md)
+    keyring=None,  # KeyRing to encrypt payloads at rest (see encryption.md)
+    commit_interval=None,  # seconds; set to batch commits (write-behind, see below)
     commit_max_pending=None,  # cap buffered events under write-behind
 )
 ```
@@ -184,12 +184,12 @@ Redis data layout:
 
 ```python
 RedisEventStore(
-    redis,                  # redis.asyncio.Redis instance
-    key_prefix="mcp:",      # isolate multiple servers on one Redis instance
-    ttl=3600,               # seconds; None = never expire (not recommended)
-    max_stream_length=None, # optional cap on how many event IDs each stream retains
-    compression=None,       # "gzip" to compress large payloads (see "Large payloads" in api.md)
-    keyring=None,           # KeyRing to encrypt payloads at rest (see encryption.md)
+    redis,  # redis.asyncio.Redis instance
+    key_prefix="mcp:",  # isolate multiple servers on one Redis instance
+    ttl=3600,  # seconds; None = never expire (not recommended)
+    max_stream_length=None,  # optional cap on how many event IDs each stream retains
+    compression=None,  # "gzip" to compress large payloads (see "Large payloads" in api.md)
+    keyring=None,  # KeyRing to encrypt payloads at rest (see encryption.md)
 )
 ```
 
@@ -262,12 +262,12 @@ One row per event:
 
 ```python
 PostgresEventStore(
-    pool,                     # an asyncpg.Pool
+    pool,  # an asyncpg.Pool
     table_name="mcp_events",  # isolate multiple servers in one database
-    ttl=3600,                 # seconds; None = never expire (not recommended)
-    replay_batch_size=500,    # rows fetched per round-trip on replay; lower for very large payloads
-    compression=None,         # "gzip" to compress large payloads (see "Large payloads" in api.md)
-    keyring=None,             # KeyRing to encrypt payloads at rest (see encryption.md)
+    ttl=3600,  # seconds; None = never expire (not recommended)
+    replay_batch_size=500,  # rows fetched per round-trip on replay; lower for very large payloads
+    compression=None,  # "gzip" to compress large payloads (see "Large payloads" in api.md)
+    keyring=None,  # KeyRing to encrypt payloads at rest (see encryption.md)
 )
 ```
 

@@ -63,7 +63,7 @@ If you want a custom loop instead of `ArchiveScheduler`:
 ```python
 from mcp_persist import archive_expired_batch, count_expired
 
-pending = await count_expired(hot)           # how many events are past ttl
+pending = await count_expired(hot)  # how many events are past ttl
 moved = await archive_expired_batch(hot, cold, batch_size=500)  # move one batch
 ```
 

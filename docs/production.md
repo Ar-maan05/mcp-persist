@@ -60,6 +60,7 @@ from mcp_persist import PostgresEventStore
 
 mcp = FastMCP(name="MyServer")
 
+
 @contextlib.asynccontextmanager
 async def lifespan(app):
     pool = await asyncpg.create_pool(DSN, min_size=2, max_size=10)
@@ -68,15 +69,15 @@ async def lifespan(app):
         await store.initialize()  # SQLite/Postgres only; Redis has no initialize()
 
         manager = StreamableHTTPSessionManager(
-            app=mcp._mcp_server,            # the low-level Server FastMCP wraps
+            app=mcp._mcp_server,  # the low-level Server FastMCP wraps
             event_store=store,
-            session_idle_timeout=300,       # seconds
+            session_idle_timeout=300,  # seconds
         )
         app.state.session_manager = manager
         async with manager.run():
             yield
     finally:
-        await pool.close()                  # you opened it, so you close it
+        await pool.close()  # you opened it, so you close it
 ```
 
 **Size `ttl` to your sessions.** Set `ttl` to **at least 2×
@@ -93,7 +94,7 @@ from mcp_persist import event_store_from_env
 # MCP_PERSIST_BACKEND=postgres
 # MCP_PERSIST_URL=postgresql://localhost/mydb
 # MCP_PERSIST_TTL=3600
-async with event_store_from_env() as store:   # opens + closes the connection
+async with event_store_from_env() as store:  # opens + closes the connection
     manager = StreamableHTTPSessionManager(app=mcp._mcp_server, event_store=store)
     async with manager.run():
         yield
@@ -178,8 +179,8 @@ expired rows in bounded chunks instead (committing per chunk), either directly o
 via the scheduler:
 
 ```python
-await store.purge_expired(batch_size=1000)          # one call, chunked
-PurgeScheduler(store, interval=300, batch_size=1000) # scheduled, chunked
+await store.purge_expired(batch_size=1000)  # one call, chunked
+PurgeScheduler(store, interval=300, batch_size=1000)  # scheduled, chunked
 ```
 
 The expiry cutoff is captured once per call, so rows that expire mid-purge are
@@ -600,9 +601,7 @@ immediately and a background task commits them on an interval.
 
 ```python
 # Commit at most every second, and never let more than 500 events buffer.
-async with SQLiteEventStore.create(
-    "events.db", ttl=3600, commit_interval=1.0, commit_max_pending=500
-) as store:
+async with SQLiteEventStore.create("events.db", ttl=3600, commit_interval=1.0, commit_max_pending=500) as store:
     ...
 ```
 

@@ -95,16 +95,21 @@ import asyncio
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
+
 async def main():
     async with streamablehttp_client("http://localhost:8000/mcp") as (r, w, _):
         async with ClientSession(r, w) as session:
             await session.initialize()
 
-            result = await session.call_tool("add_note", {
-                "title": "Hello",
-                "body": "My first persisted note.",
-            })
+            result = await session.call_tool(
+                "add_note",
+                {
+                    "title": "Hello",
+                    "body": "My first persisted note.",
+                },
+            )
             print(result.content[0].text)
+
 
 asyncio.run(main())
 ```

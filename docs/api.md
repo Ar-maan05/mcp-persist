@@ -109,8 +109,7 @@ already configured logging, so it never fights an existing logging setup.
 **optional** extra method:
 
 ```python
-def on_proxy_replay(self, stream_id, session_id, events_replayed, blocked, duration_ms):
-    ...
+def on_proxy_replay(self, stream_id, session_id, events_replayed, blocked, duration_ms): ...
 ```
 
 It fires whenever a client reconnect triggers a replay, and is distinct from
@@ -128,7 +127,10 @@ three-method collector keeps working unchanged; `NoOpMetricsCollector` and
 from mcp_persist import PersistenceProxy, LoggingMetricsCollector
 
 async with PersistenceProxy.create(
-    "http://localhost:8001", backend="sqlite", url="events.db", ttl=3600,
+    "http://localhost:8001",
+    backend="sqlite",
+    url="events.db",
+    ttl=3600,
     metrics=LoggingMetricsCollector(),
 ) as proxy:
     ...
@@ -347,8 +349,8 @@ session, hand off the JSON, and load it into a fresh store to reproduce.
 ```python
 from mcp_persist import export_stream, import_stream
 
-doc = await export_stream(source_store, "session-abc123")   # -> a JSON-able dict
-written = await import_stream(dest_store, doc)               # -> events restored
+doc = await export_stream(source_store, "session-abc123")  # -> a JSON-able dict
+written = await import_stream(dest_store, doc)  # -> events restored
 ```
 
 Events are read oldest-first and exported as decompressed, decrypted plaintext

@@ -13,7 +13,7 @@ Pass `tenant_id` to any backend (or `MCP_PERSIST_TENANT_ID` via
 ```python
 from mcp_persist import RedisEventStore, PostgresEventStore, SQLiteEventStore
 
-acme   = PostgresEventStore(pool, ttl=3600, tenant_id="acme")
+acme = PostgresEventStore(pool, ttl=3600, tenant_id="acme")
 globex = PostgresEventStore(pool, ttl=3600, tenant_id="globex")
 ```
 

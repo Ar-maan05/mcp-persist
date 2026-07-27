@@ -21,16 +21,17 @@ The fastest way to apply retention is to wire a `RetentionPolicy` and a `Databas
 import asyncio
 from mcp_persist import SQLiteEventStore, RetentionPolicy, DatabaseAuditSink, RetentionScheduler
 
+
 async def main():
     async with SQLiteEventStore.create("events.db") as store:
         # Define retention windows (in seconds) for each team
         policy = RetentionPolicy(
             windows={
-                "team-a": 86400,     # 1 day
-                "team-b": 604800,    # 7 days
-                None: 3600,          # untenanted events (1 hour)
+                "team-a": 86400,  # 1 day
+                "team-b": 604800,  # 7 days
+                None: 3600,  # untenanted events (1 hour)
             },
-            default=172800           # default for other teams (2 days)
+            default=172800,  # default for other teams (2 days)
         )
 
         # Audit logs will be stored in "mcp_events_retention_audit"
@@ -40,6 +41,7 @@ async def main():
         async with RetentionScheduler(store, policy, sink, interval=300.0):
             # Keep your application or session manager running here
             await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

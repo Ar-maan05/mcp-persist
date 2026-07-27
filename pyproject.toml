@@ -54,7 +54,7 @@ dev = [
     "lupa>=2.0",
     "pytest-anyio",
     "pyright>=1.1.400",
-    "ruff>=0.8.5",
+    "ruff==0.16.0",
 ]
 
 [build-system]

@@ -123,10 +123,9 @@ Or embed it as an ASGI app:
 import uvicorn
 from mcp_persist import PersistenceProxy
 
+
 async def serve():
-    async with PersistenceProxy.create(
-        "http://localhost:8001", backend="sqlite", url="events.db", ttl=3600
-    ) as proxy:
+    async with PersistenceProxy.create("http://localhost:8001", backend="sqlite", url="events.db", ttl=3600) as proxy:
         await uvicorn.Server(uvicorn.Config(proxy, port=8000)).serve()
 ```
 
