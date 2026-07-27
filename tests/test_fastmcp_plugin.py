@@ -22,7 +22,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import JSONRPCRequest
 from starlette.applications import Starlette
 
-from mcp_persist import SQLiteEventStore, with_persistence
+from mcp_persist import SQLiteEventStore, generate_key, keyring_from_env, with_persistence
+from mcp_persist.fastmcp import _build_store_ctx
 
 _SAMPLE_MSG = JSONRPCRequest(jsonrpc="2.0", id="probe", method="tools/list")
 
@@ -95,6 +96,31 @@ async def test_env_selects_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _serve(app) as url:
         result = await _call_shout(url, "env")
     assert result == {"shout": "ENV"}
+
+
+@pytest.mark.anyio
+async def test_explicit_backend_kwargs_forward_modern_store_options() -> None:
+    """The convenient FastMCP path must not lose security or isolation settings."""
+    key = generate_key()
+    ctx = _build_store_ctx(
+        "sqlite",
+        ":memory:",
+        ttl=3600,
+        table_name=None,
+        key_prefix=None,
+        max_stream_length=None,
+        tenant_id="acme",
+        compression="gzip",
+        compress_min_bytes=42,
+        keyring=keyring_from_env({"MCP_PERSIST_ENCRYPTION_KEY": key}),
+        batch_max_events=None,
+        batch_max_latency_ms=None,
+    )
+    async with ctx as store:
+        assert store._tenant_id == "acme"  # type: ignore[attr-defined]
+        assert store._compression == "gzip"  # type: ignore[attr-defined]
+        assert store._compress_min_bytes == 42  # type: ignore[attr-defined]
+        assert store._keyring is not None  # type: ignore[attr-defined]
 
 
 @pytest.mark.anyio

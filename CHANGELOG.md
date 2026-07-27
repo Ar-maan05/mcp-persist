@@ -5,6 +5,15 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.2] - 2026-07-27
+
+### Fixed
+- **Administrative commands now open the deployment's actual configured store.** `mcp-persist` forwards tenant binding, compression, and the environment keyring to every backend for `stats`, `purge`, `dump`, and `load`. An encrypted `dump` no longer skips every payload, `load` no longer writes plaintext into an encrypted deployment, and SQLite/Postgres commands stay scoped to `MCP_PERSIST_TENANT_ID` instead of reading every tenant. The non-secret `--tenant-id`, `--key-prefix`, `--max-stream-length`, and `--compression` flags can override their environment counterparts; encryption keys remain environment-only so they never appear in process arguments.
+- **Batched stores retain the optional operational API.** `BatchingEventStore` now delegates health, ping, stream enumeration/export, subscriptions, expiry maintenance, archival, and tenant-retention helpers to its inner Redis or Postgres store. Every read and maintenance operation flushes first, so environment-enabled batching cannot hide pending writes from `dump`, `migrate`, `PurgeScheduler`, or `ArchiveScheduler`. `health()` reports `backend="batching"`, the inner backend, and the current pending-write count.
+
+### Changed
+- **One shared store factory now powers environment configuration, the admin CLI, `with_persistence()`, and `PersistenceProxy.create()`.** The explicit FastMCP and proxy paths now accept `tenant_id`, `compression`, `compress_min_bytes`, `keyring`, `batch_max_events`, and `batch_max_latency_ms`, matching the production configuration surface and preventing option drift between integrations.
+
 ## [1.12.1] - 2026-07-21
 
 ### Fixed

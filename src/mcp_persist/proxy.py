@@ -41,16 +41,15 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from mcp_persist._stream_buffer import DEFAULT_DEQUE_MAXLEN, StreamBuffer
-from mcp_persist.config import event_store_from_env
+from mcp_persist.config import build_store_context, event_store_from_env
 from mcp_persist.metrics import dispatch_proxy_replay
-from mcp_persist.postgres import PostgresEventStore
-from mcp_persist.redis import RedisEventStore
-from mcp_persist.sqlite import SQLiteEventStore
 
 if TYPE_CHECKING:
     from contextlib import AbstractAsyncContextManager
 
     from mcp.server.streamable_http import EventId, EventMessage, EventStore
+
+    from mcp_persist.encryption import KeyRing
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +136,15 @@ class PersistenceProxy:
         backend: str | None = None,
         url: str | None = None,
         ttl: int | None = None,
+        table_name: str | None = None,
+        key_prefix: str | None = None,
+        max_stream_length: int | None = None,
+        tenant_id: str | None = None,
+        compression: str | None = None,
+        compress_min_bytes: int = 1024,
+        keyring: KeyRing | None = None,
+        batch_max_events: int | None = None,
+        batch_max_latency_ms: float | None = None,
         mcp_path: str = "/mcp",
         buffer_grace_ttl: float = 60.0,
         timeout: float = 300.0,
@@ -151,8 +159,24 @@ class PersistenceProxy:
         neither (``MCP_PERSIST_*`` environment variables). ``metrics=`` is an
         optional collector whose ``on_proxy_replay`` hook fires on each replay.
         ``cors=`` is an allowed origin (e.g. ``"*"``) that turns on CORS handling.
+        Explicit backend configuration supports the same tenancy, compression,
+        encryption, and batching options as :func:`with_persistence`.
         """
-        ctx, owned = _resolve_store(store, backend=backend, url=url, ttl=ttl)
+        ctx, owned = _resolve_store(
+            store,
+            backend=backend,
+            url=url,
+            ttl=ttl,
+            table_name=table_name,
+            key_prefix=key_prefix,
+            max_stream_length=max_stream_length,
+            tenant_id=tenant_id,
+            compression=compression,
+            compress_min_bytes=compress_min_bytes,
+            keyring=keyring,
+            batch_max_events=batch_max_events,
+            batch_max_latency_ms=batch_max_latency_ms,
+        )
         client = httpx.AsyncClient(timeout=httpx.Timeout(timeout, read=None), follow_redirects=True)
         proxy: PersistenceProxy | None = None
         kwargs: dict[str, Any] = {
@@ -598,6 +622,15 @@ def _resolve_store(
     backend: str | None,
     url: str | None,
     ttl: int | None,
+    table_name: str | None,
+    key_prefix: str | None,
+    max_stream_length: int | None,
+    tenant_id: str | None,
+    compression: str | None,
+    compress_min_bytes: int,
+    keyring: KeyRing | None,
+    batch_max_events: int | None,
+    batch_max_latency_ms: float | None,
 ) -> tuple[AbstractAsyncContextManager[EventStore] | None, EventStore | None]:
     """Resolve into ``(ctx, store)`` with exactly one non-None.
 
@@ -605,23 +638,71 @@ def _resolve_store(
     caller-owned store the proxy must not close.
     """
     if store is not None:
-        if backend is not None or url is not None:
-            raise ValueError("PersistenceProxy.create: pass either store= or backend=/url=, not both")
+        supplied = [
+            name
+            for name, value in (
+                ("backend", backend),
+                ("url", url),
+                ("ttl", ttl),
+                ("table_name", table_name),
+                ("key_prefix", key_prefix),
+                ("max_stream_length", max_stream_length),
+                ("tenant_id", tenant_id),
+                ("compression", compression),
+                ("keyring", keyring),
+                ("batch_max_events", batch_max_events),
+                ("batch_max_latency_ms", batch_max_latency_ms),
+            )
+            if value is not None
+        ]
+        if compress_min_bytes != 1024:
+            supplied.append("compress_min_bytes")
+        if supplied:
+            raise ValueError(
+                "PersistenceProxy.create: pass either store= or backend=/url= with configuration options, not both"
+            )
         return None, store
     if backend is not None:
         if not url:
             raise ValueError("PersistenceProxy.create: backend= requires url=")
         name = backend.strip().lower()
-        if name == "sqlite":
-            return SQLiteEventStore.create(url, ttl=ttl), None
-        if name == "redis":
-            return RedisEventStore.create(url, ttl=ttl), None
-        if name == "postgres":
-            return PostgresEventStore.create(url, ttl=ttl), None
-        raise ValueError(f"PersistenceProxy.create: unknown backend {name!r} (use sqlite, redis, or postgres)")
-    if url is not None or ttl is not None:
+        try:
+            return build_store_context(
+                name,
+                url,
+                ttl=ttl,
+                table_name=table_name,
+                key_prefix=key_prefix,
+                max_stream_length=max_stream_length,
+                tenant_id=tenant_id,
+                compression=compression,
+                compress_min_bytes=compress_min_bytes,
+                keyring=keyring,
+                batch_max_events=batch_max_events,
+                batch_max_latency_ms=batch_max_latency_ms,
+            ), None
+        except ValueError as exc:
+            raise ValueError(f"PersistenceProxy.create: {exc}") from None
+    if (
+        any(
+            value is not None
+            for value in (
+                url,
+                ttl,
+                table_name,
+                key_prefix,
+                max_stream_length,
+                tenant_id,
+                compression,
+                keyring,
+                batch_max_events,
+                batch_max_latency_ms,
+            )
+        )
+        or compress_min_bytes != 1024
+    ):
         raise ValueError(
-            "PersistenceProxy.create: url=/ttl= require backend=; with neither store= nor backend= set, "
+            "PersistenceProxy.create: explicit store settings require backend=; with neither store= nor backend= set, "
             "the store is configured from MCP_PERSIST_* environment variables"
         )
     return event_store_from_env(), None

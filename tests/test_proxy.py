@@ -25,7 +25,7 @@ import httpx
 import pytest
 from mcp.types import JSONRPCNotification
 
-from mcp_persist import SQLiteEventStore
+from mcp_persist import SQLiteEventStore, generate_key, keyring_from_env
 from mcp_persist._sse_parser import SSEFrame, SSEParser
 from mcp_persist.proxy import PersistenceProxy, _store_replay
 
@@ -166,6 +166,26 @@ class ControlledUpstream(httpx.AsyncBaseTransport):
             queue.put_nowait(sse(data))
         if end:
             queue.put_nowait(None)
+
+
+@pytest.mark.anyio
+async def test_explicit_store_options_reach_proxy_backend() -> None:
+    """Proxy factory parity keeps encrypted, tenant-bound deployments safe."""
+    key = generate_key()
+    async with PersistenceProxy.create(
+        "http://upstream",
+        backend="sqlite",
+        url=":memory:",
+        tenant_id="acme",
+        compression="gzip",
+        compress_min_bytes=42,
+        keyring=keyring_from_env({"MCP_PERSIST_ENCRYPTION_KEY": key}),
+    ) as proxy:
+        store = proxy._store
+        assert store._tenant_id == "acme"  # type: ignore[attr-defined]
+        assert store._compression == "gzip"  # type: ignore[attr-defined]
+        assert store._compress_min_bytes == 42  # type: ignore[attr-defined]
+        assert store._keyring is not None  # type: ignore[attr-defined]
 
 
 # ── client that drives the proxy ASGI app directly ───────────────────────────

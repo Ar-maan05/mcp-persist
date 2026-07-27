@@ -195,6 +195,13 @@ After `aclose()` begins, new writes are rejected. Each flush uses one Redis
 pipeline execution or one Postgres `executemany` call, rather than a round trip
 per buffered event.
 
+The wrapper preserves the inner store's operational surface. `ping()` and
+`health()` remain available, with batching health reporting the inner backend and
+`pending_writes`; `list_streams()`, `export_stream()`, `subscribe()`, migration,
+purge, archival, and tenant-retention helpers flush before reading or maintaining
+the inner store. Configuring batching from the environment therefore does not
+trade away observability or maintenance features.
+
 SQLite is intentionally rejected (a `TypeError` at construction): its own
 write-behind (`commit_interval` / `commit_max_pending`) already batches the fsync
 that dominates SQLite's write cost, so a second batching layer would add nothing.
@@ -289,6 +296,9 @@ plus optional:
 | `MCP_PERSIST_MAX_STREAM_LENGTH` | redis | per-stream cap |
 | `MCP_PERSIST_TENANT_ID` | all | bind the store to one tenant (see [multi-tenancy.md](multi-tenancy.md)) |
 | `MCP_PERSIST_COMPRESSION` | all | `gzip` or `zstd` payload codec |
+| `MCP_PERSIST_ENCRYPTION_KEY` | all | single base64 AES-256 encryption key |
+| `MCP_PERSIST_ENCRYPTION_KEYS` | all | rotation list in `id:base64,id:base64` form |
+| `MCP_PERSIST_ENCRYPTION_KEY_ID` | all | active key ID for a rotation list |
 | `MCP_PERSIST_BATCH_MAX_EVENTS` | redis, postgres | wrap in `BatchingEventStore` with this flush size |
 | `MCP_PERSIST_BATCH_MAX_LATENCY_MS` | redis, postgres | batching flush latency ceiling |
 

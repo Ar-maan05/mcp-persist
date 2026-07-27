@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from collections import deque
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +19,7 @@ from mcp.server.streamable_http import (
 from mcp.types import JSONRPCMessage
 
 from mcp_persist._debug import debug_log
+from mcp_persist.health import HealthReport
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 
 if TYPE_CHECKING:
@@ -216,3 +218,136 @@ class BatchingEventStore(EventStore):
         fork_method = getattr(self._inner, "fork_stream", None)
         if fork_method is not None:
             await fork_method(parent_stream_id, fork_event_id, new_stream_id)
+
+    # ── operational surface ─────────────────────────────────────────────────
+
+    # Batching is selected by event_store_from_env(), so it must preserve the
+    # optional operational APIs exposed by the concrete store rather than turn a
+    # configured production store into an EventStore-only object. Reads flush
+    # first: callers should never observe a partial view merely because writes
+    # happen to be in the short batching window.
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate backend metadata and future optional APIs to ``inner``.
+
+        Read/write operations that need flush-before-observe semantics are
+        defined explicitly below. This fallback keeps non-mutating metadata such
+        as ``table_name`` and ``_ttl`` available to existing integrations.
+        """
+        return getattr(self._inner, name)
+
+    async def ping(self) -> bool:
+        ping: Any = getattr(self._inner, "ping", None)
+        if ping is None:
+            raise AttributeError(f"{type(self._inner).__name__} has no ping()")
+        return await ping()
+
+    async def health(self) -> HealthReport:
+        health: Any = getattr(self._inner, "health", None)
+        if health is None:
+            raise AttributeError(f"{type(self._inner).__name__} has no health()")
+        report: HealthReport = await health()
+        async with self._lock:
+            pending = len(self._pending)
+        detail = dict(report.detail)
+        detail["inner_backend"] = report.backend
+        detail["pending_writes"] = pending
+        return HealthReport(
+            healthy=report.healthy,
+            backend="batching",
+            latency_ms=report.latency_ms,
+            detail=detail,
+        )
+
+    @property
+    def backend_name(self) -> str:
+        """Expose the wrapped backend to integrations that select by storage type."""
+        return str(getattr(self._inner, "backend_name", type(self._inner).__name__.lower()))
+
+    async def list_streams(self) -> AsyncIterator[StreamId]:
+        await self.flush()
+        list_streams: Any = getattr(self._inner, "list_streams", None)
+        if list_streams is None:
+            raise AttributeError(f"{type(self._inner).__name__} has no list_streams()")
+        async for stream_id in list_streams():
+            yield stream_id
+
+    async def _iter_stream_events(self, stream_id: StreamId) -> AsyncIterator[tuple[EventId, JSONRPCMessage | None]]:
+        await self.flush()
+        iterator: Any = getattr(self._inner, "_iter_stream_events", None)
+        if iterator is None:
+            raise AttributeError(f"{type(self._inner).__name__} has no _iter_stream_events()")
+        async for item in iterator(stream_id):
+            yield item
+
+    async def subscribe(self, stream_id: StreamId, **kwargs: Any) -> AsyncIterator[tuple[EventId, JSONRPCMessage]]:
+        await self.flush()
+        subscribe: Any = getattr(self._inner, "subscribe", None)
+        if subscribe is None:
+            raise AttributeError(f"{type(self._inner).__name__} has no subscribe()")
+        async for item in subscribe(stream_id, **kwargs):
+            yield item
+
+    async def purge_expired(self, **kwargs: Any) -> int:
+        await self.flush()
+        purge: Any = getattr(self._inner, "purge_expired", None)
+        if purge is None:
+            raise AttributeError(f"{type(self._inner).__name__} has no purge_expired()")
+        return await purge(**kwargs)
+
+    async def count_expired(self, **kwargs: Any) -> int:
+        await self.flush()
+        count: Any = getattr(self._inner, "count_expired", None)
+        if count is None:
+            raise AttributeError(f"{type(self._inner).__name__} has no count_expired()")
+        return await count(**kwargs)
+
+    async def select_expired(self, **kwargs: Any) -> AsyncIterator[Any]:
+        await self.flush()
+        select: Any = getattr(self._inner, "select_expired", None)
+        if select is None:
+            raise AttributeError(f"{type(self._inner).__name__} has no select_expired()")
+        async for item in select(**kwargs):
+            yield item
+
+    async def delete_events(self, events: Any) -> int:
+        await self.flush()
+        delete: Any = getattr(self._inner, "delete_events", None)
+        if delete is None:
+            raise AttributeError(f"{type(self._inner).__name__} has no delete_events()")
+        return await delete(events)
+
+    async def _store_event_raw(self, *args: Any, **kwargs: Any) -> None:
+        await self.flush()
+        store_raw: Any = getattr(self._inner, "_store_event_raw", None)
+        if store_raw is None:
+            raise AttributeError(f"{type(self._inner).__name__} has no _store_event_raw()")
+        await store_raw(*args, **kwargs)
+
+    async def _event_exists(self, event_id: EventId) -> bool:
+        await self.flush()
+        exists: Any = getattr(self._inner, "_event_exists", None)
+        if exists is None:
+            raise AttributeError(f"{type(self._inner).__name__} has no _event_exists()")
+        return await exists(event_id)
+
+    async def _stream_id_for_event(self, event_id: EventId) -> StreamId | None:
+        await self.flush()
+        lookup: Any = getattr(self._inner, "_stream_id_for_event", None)
+        if lookup is None:
+            raise AttributeError(f"{type(self._inner).__name__} has no _stream_id_for_event()")
+        return await lookup(event_id)
+
+    async def distinct_tenants(self) -> list[str | None]:
+        await self.flush()
+        tenants: Any = getattr(self._inner, "distinct_tenants", None)
+        if tenants is None:
+            raise AttributeError(f"{type(self._inner).__name__} has no distinct_tenants()")
+        return await tenants()
+
+    async def purge_tenant(self, tenant_id: str | None, **kwargs: Any) -> int:
+        await self.flush()
+        purge: Any = getattr(self._inner, "purge_tenant", None)
+        if purge is None:
+            raise AttributeError(f"{type(self._inner).__name__} has no purge_tenant()")
+        return await purge(tenant_id, **kwargs)

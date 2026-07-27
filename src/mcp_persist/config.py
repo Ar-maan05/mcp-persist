@@ -1,4 +1,4 @@
-"""Construct an event store from environment variables.
+"""Construct event stores from explicit settings or environment variables.
 
 :func:`event_store_from_env` reads a small set of ``MCP_PERSIST_*`` variables and
 returns the matching backend's :meth:`create` context manager, so a deployment
@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import os
 from contextlib import AbstractAsyncContextManager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from mcp_persist.batching import BatchingEventStore
 from mcp_persist.compression import validate_compression
@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 
     from mcp.server.streamable_http import EventStore
 
+    from mcp_persist.encryption import KeyRing
     from mcp_persist.retention import RetentionPolicy
 
 _PREFIX = "MCP_PERSIST_"
@@ -74,6 +75,73 @@ def _optional_int(env: Mapping[str, str], name: str) -> int | None:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
 
 
+def build_store_context(
+    backend: str,
+    url: str,
+    *,
+    ttl: int | None = None,
+    table_name: str | None = None,
+    key_prefix: str | None = None,
+    max_stream_length: int | None = None,
+    tenant_id: str | None = None,
+    compression: str | None = None,
+    compress_min_bytes: int = 1024,
+    keyring: KeyRing | None = None,
+    batch_max_events: int | None = None,
+    batch_max_latency_ms: float | None = None,
+) -> AbstractAsyncContextManager[EventStore]:
+    """Build an owned store context manager from normalized configuration.
+
+    This is the single construction path for environment configuration and the
+    higher-level FastMCP, proxy, and administrative entry points. Keeping the
+    backend mapping here prevents newer options such as encryption, tenancy,
+    compression, and batching from being silently lost in one integration.
+    """
+    name = backend.strip().lower()
+    if name not in _BACKENDS:
+        raise ValueError(f"backend must be one of {_BACKENDS}, got {backend!r}")
+    if not url:
+        raise ValueError("url is required to build an event store")
+    validate_compression(compression)
+
+    has_batch = batch_max_events is not None or batch_max_latency_ms is not None
+    common: dict[str, Any] = {
+        "ttl": ttl,
+        "tenant_id": tenant_id,
+        "compression": compression,
+        "compress_min_bytes": compress_min_bytes,
+        "keyring": keyring,
+    }
+
+    if name == "sqlite":
+        if key_prefix is not None or max_stream_length is not None:
+            raise ValueError("key_prefix and max_stream_length are only supported by the redis backend")
+        if has_batch:
+            raise ValueError(
+                "batching is not supported on the sqlite backend: SQLite's own write-behind "
+                "(commit_interval / commit_max_pending) already batches the fsync that dominates "
+                "its write cost. Drop MCP_PERSIST_BATCH_* or use the redis/postgres backend."
+            )
+        if table_name is not None:
+            common["table_name"] = table_name
+        return SQLiteEventStore.create(url, **common)  # type: ignore[arg-type]
+
+    if name == "redis":
+        if table_name is not None:
+            raise ValueError("table_name is only supported by the sqlite and postgres backends")
+        if key_prefix is not None:
+            common["key_prefix"] = key_prefix
+        if max_stream_length is not None:
+            common["max_stream_length"] = max_stream_length
+        return _maybe_batch(RedisEventStore.create(url, **common), batch_max_events, batch_max_latency_ms)  # type: ignore[arg-type]
+
+    if key_prefix is not None or max_stream_length is not None:
+        raise ValueError("key_prefix and max_stream_length are only supported by the redis backend")
+    if table_name is not None:
+        common["table_name"] = table_name
+    return _maybe_batch(PostgresEventStore.create(url, **common), batch_max_events, batch_max_latency_ms)  # type: ignore[arg-type]
+
+
 def event_store_from_env(env: Mapping[str, str] | None = None) -> AbstractAsyncContextManager[EventStore]:
     """Build an event store from ``MCP_PERSIST_*`` environment variables.
 
@@ -86,69 +154,25 @@ def event_store_from_env(env: Mapping[str, str] | None = None) -> AbstractAsyncC
     """
     env = os.environ if env is None else env
 
-    backend = _require(env, f"{_PREFIX}BACKEND").strip().lower()
-    url = _require(env, f"{_PREFIX}URL")
-    ttl = _optional_int(env, f"{_PREFIX}TTL")
-    tenant_id = env.get(f"{_PREFIX}TENANT_ID") or None
-    compression = env.get(f"{_PREFIX}COMPRESSION") or None
-    if compression:
-        validate_compression(compression)
-    keyring = keyring_from_env(env)
-    batch_max_events = _optional_int(env, f"{_PREFIX}BATCH_MAX_EVENTS")
     batch_max_latency_ms = env.get(f"{_PREFIX}BATCH_MAX_LATENCY_MS")
-    batch_latency = float(batch_max_latency_ms) if batch_max_latency_ms else None
+    try:
+        batch_latency = float(batch_max_latency_ms) if batch_max_latency_ms else None
+    except ValueError as exc:
+        raise ValueError(f"{_PREFIX}BATCH_MAX_LATENCY_MS must be a number, got {batch_max_latency_ms!r}") from exc
 
-    if backend == "sqlite":
-        if batch_max_events is not None or batch_latency is not None:
-            raise ValueError(
-                "batching is not supported on the sqlite backend: SQLite's own write-behind "
-                "(commit_interval / commit_max_pending) already batches the fsync that dominates "
-                "its write cost. Drop MCP_PERSIST_BATCH_* or use the redis/postgres backend."
-            )
-        kwargs: dict[str, object] = {"ttl": ttl}
-        table = env.get(f"{_PREFIX}TABLE_NAME")
-        if table:
-            kwargs["table_name"] = table
-        if tenant_id:
-            kwargs["tenant_id"] = tenant_id
-        if compression:
-            kwargs["compression"] = compression
-        if keyring is not None:
-            kwargs["keyring"] = keyring
-        return SQLiteEventStore.create(url, **kwargs)  # type: ignore[arg-type]
-
-    if backend == "redis":
-        kwargs = {"ttl": ttl}
-        prefix = env.get(f"{_PREFIX}KEY_PREFIX")
-        if prefix:
-            kwargs["key_prefix"] = prefix
-        if tenant_id:
-            kwargs["tenant_id"] = tenant_id
-        if compression:
-            kwargs["compression"] = compression
-        if keyring is not None:
-            kwargs["keyring"] = keyring
-        max_stream_length = _optional_int(env, f"{_PREFIX}MAX_STREAM_LENGTH")
-        if max_stream_length is not None:
-            kwargs["max_stream_length"] = max_stream_length
-        cm = RedisEventStore.create(url, **kwargs)  # type: ignore[arg-type]
-        return _maybe_batch(cm, batch_max_events, batch_latency)
-
-    if backend == "postgres":
-        kwargs = {"ttl": ttl}
-        table = env.get(f"{_PREFIX}TABLE_NAME")
-        if table:
-            kwargs["table_name"] = table
-        if tenant_id:
-            kwargs["tenant_id"] = tenant_id
-        if compression:
-            kwargs["compression"] = compression
-        if keyring is not None:
-            kwargs["keyring"] = keyring
-        cm = PostgresEventStore.create(url, **kwargs)  # type: ignore[arg-type]
-        return _maybe_batch(cm, batch_max_events, batch_latency)
-
-    raise ValueError(f"{_PREFIX}BACKEND must be one of {_BACKENDS}, got {backend!r}")
+    return build_store_context(
+        _require(env, f"{_PREFIX}BACKEND"),
+        _require(env, f"{_PREFIX}URL"),
+        ttl=_optional_int(env, f"{_PREFIX}TTL"),
+        table_name=env.get(f"{_PREFIX}TABLE_NAME") or None,
+        key_prefix=env.get(f"{_PREFIX}KEY_PREFIX") or None,
+        max_stream_length=_optional_int(env, f"{_PREFIX}MAX_STREAM_LENGTH"),
+        tenant_id=env.get(f"{_PREFIX}TENANT_ID") or None,
+        compression=env.get(f"{_PREFIX}COMPRESSION") or None,
+        keyring=keyring_from_env(env),
+        batch_max_events=_optional_int(env, f"{_PREFIX}BATCH_MAX_EVENTS"),
+        batch_max_latency_ms=batch_latency,
+    )
 
 
 def _maybe_batch(

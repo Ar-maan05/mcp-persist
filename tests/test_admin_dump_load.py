@@ -11,7 +11,8 @@ import aiosqlite
 import pytest
 from mcp.types import JSONRPCMessage, JSONRPCRequest
 
-from mcp_persist import SQLiteEventStore, _admin
+from mcp_persist import SQLiteEventStore, _admin, event_store_from_env, generate_key
+from mcp_persist.encryption import _ENC_PREFIX, keyring_from_env
 
 
 def _msg(i: int) -> JSONRPCMessage:
@@ -96,6 +97,65 @@ def test_load_with_stream_id_override(tmp_path, capsys):
     args = _admin._parse_args(["load", str(dump_path), "--backend", "sqlite", "--url", str(dst), "--stream-id", "new"])
     assert _admin._run_load(args) == 0
     assert "into stream new" in capsys.readouterr().out
+
+
+def test_dump_and_load_honor_encryption_and_tenant_config(tmp_path, capsys, monkeypatch):
+    """Admin operations must open the same scoped, encrypted store as the app."""
+    src = tmp_path / "source.db"
+    dst = tmp_path / "destination.db"
+    dump_path = tmp_path / "tenant.json"
+    key = generate_key()
+    env = {
+        "MCP_PERSIST_BACKEND": "sqlite",
+        "MCP_PERSIST_URL": str(src),
+        "MCP_PERSIST_TTL": "3600",
+        "MCP_PERSIST_TENANT_ID": "acme",
+        "MCP_PERSIST_COMPRESSION": "gzip",
+        "MCP_PERSIST_ENCRYPTION_KEY": key,
+    }
+
+    async def seed() -> None:
+        async with event_store_from_env(env) as acme:
+            await acme.store_event("shared-stream", _msg(1))
+        async with SQLiteEventStore.create(
+            str(src), tenant_id="other", compression="gzip", keyring=keyring_from_env(env)
+        ) as other:
+            await other.store_event("shared-stream", _msg(2))
+
+    asyncio.run(seed())
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    args = _admin._parse_args(["dump", "shared-stream", "-o", str(dump_path)])
+    assert _admin._run_dump(args) == 0
+    assert len(json.loads(dump_path.read_text())["events"]) == 1
+    capsys.readouterr()
+
+    monkeypatch.setenv("MCP_PERSIST_URL", str(dst))
+    args = _admin._parse_args(["load", str(dump_path)])
+    assert _admin._run_load(args) == 0
+    assert "loaded 1 event" in capsys.readouterr().out
+
+    async def verify() -> None:
+        destination_env = {**env, "MCP_PERSIST_URL": str(dst)}
+        async with event_store_from_env(destination_env) as store:
+            async with store._conn.execute("SELECT payload FROM mcp_events") as cursor:  # type: ignore[attr-defined]
+                (payload,) = await cursor.fetchone()
+            assert payload.startswith(_ENC_PREFIX)
+            doc = await _admin._dump_stream(
+                _admin.StoreConfig(
+                    backend="sqlite",
+                    url=str(dst),
+                    ttl=3600,
+                    tenant_id="acme",
+                    compression="gzip",
+                    keyring=keyring_from_env(destination_env),
+                ),
+                "shared-stream",
+            )
+            assert len(doc["events"]) == 1
+
+    asyncio.run(verify())
 
 
 def test_load_rejects_bad_dump(tmp_path):

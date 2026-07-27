@@ -47,6 +47,21 @@ async with SQLiteEventStore.create("events.db", ttl=3600) as store:
 app = with_persistence(mcp)
 ```
 
+The explicit form accepts the same production options as environment
+configuration, including `tenant_id`, `compression`, `keyring`, and Redis or
+Postgres batching. For example:
+
+```python
+app = with_persistence(
+    mcp,
+    backend="postgres",
+    url="postgresql://localhost/app",
+    tenant_id="team-a",
+    compression="zstd",
+    batch_max_events=128,
+)
+```
+
 The live store is exposed on `app.state.event_store`, so you can run a
 [`PurgeScheduler`](docs/api.md#scheduled-cleanup-purgescheduler) alongside the
 server. No extra dependency is required: `starlette` and the session manager ship

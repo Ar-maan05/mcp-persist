@@ -158,6 +158,27 @@ async def test_store_event_rejected_after_close(redis_store):
 
 
 @pytest.mark.anyio
+async def test_operational_apis_delegate_and_flush_pending_writes(redis_store):
+    batching = BatchingEventStore(redis_store, flush_max_events=1000, flush_max_latency_ms=10_000)
+    event_id = await batching.store_event("s", SAMPLE_MSG)
+
+    # Health is useful before a forced flush and exposes the batching state.
+    report = await batching.health()
+    assert report.healthy is True
+    assert report.backend == "batching"
+    assert report.detail["inner_backend"] == "redis"
+    assert report.detail["pending_writes"] == 1
+
+    # All operational reads flush first, so they observe the event immediately.
+    assert await batching._event_exists(event_id)
+    assert [stream async for stream in batching.list_streams()] == ["s"]
+    events = [item async for item in batching._iter_stream_events("s")]
+    assert [stored_id for stored_id, _message in events] == [event_id]
+    assert await batching.ping() is True
+    await batching.aclose()
+
+
+@pytest.mark.anyio
 async def test_validation_rejects_bad_args(redis_store):
     with pytest.raises(ValueError, match="flush_max_events"):
         BatchingEventStore(redis_store, flush_max_events=0)

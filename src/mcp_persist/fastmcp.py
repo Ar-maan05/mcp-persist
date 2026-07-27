@@ -42,10 +42,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
-from mcp_persist.config import event_store_from_env
-from mcp_persist.postgres import PostgresEventStore
-from mcp_persist.redis import RedisEventStore
-from mcp_persist.sqlite import SQLiteEventStore
+from mcp_persist.config import build_store_context, event_store_from_env
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -54,6 +51,7 @@ if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
     from mcp.server.streamable_http import EventStore
 
+    from mcp_persist.encryption import KeyRing
 _BACKENDS = ("sqlite", "redis", "postgres")
 
 
@@ -67,6 +65,12 @@ def with_persistence(
     table_name: str | None = None,  # sqlite / postgres
     key_prefix: str | None = None,  # redis
     max_stream_length: int | None = None,  # redis
+    tenant_id: str | None = None,
+    compression: str | None = None,
+    compress_min_bytes: int = 1024,
+    keyring: KeyRing | None = None,
+    batch_max_events: int | None = None,
+    batch_max_latency_ms: float | None = None,
     session_idle_timeout: float | None = None,
     mcp_path: str = "/mcp",
 ) -> Starlette:
@@ -84,8 +88,9 @@ def with_persistence(
        closed on app shutdown). Passing ``store=`` together with ``backend=`` or
        ``url=`` is an error.
     2. ``backend=`` (+ ``url=``) — built via the backend's ``create()`` context
-       manager and closed on app shutdown. ``ttl``/``table_name`` apply to
-       sqlite & postgres; ``key_prefix``/``max_stream_length`` apply to redis.
+       manager and closed on app shutdown. All store options accepted by the
+       shared factory are available here, including tenancy, compression,
+       encryption, and Redis/Postgres batching.
        Passing an option that does not apply to the chosen backend is an error.
     3. neither — falls back to :func:`~mcp_persist.event_store_from_env`, which
        reads ``MCP_PERSIST_*`` from the environment. In this case passing any of
@@ -114,6 +119,12 @@ def with_persistence(
         table_name=table_name,
         key_prefix=key_prefix,
         max_stream_length=max_stream_length,
+        tenant_id=tenant_id,
+        compression=compression,
+        compress_min_bytes=compress_min_bytes,
+        keyring=keyring,
+        batch_max_events=batch_max_events,
+        batch_max_latency_ms=batch_max_latency_ms,
     )
 
     @contextlib.asynccontextmanager
@@ -171,6 +182,12 @@ def _resolve_store(
     table_name: str | None,
     key_prefix: str | None,
     max_stream_length: int | None,
+    tenant_id: str | None,
+    compression: str | None,
+    compress_min_bytes: int,
+    keyring: KeyRing | None,
+    batch_max_events: int | None,
+    batch_max_latency_ms: float | None,
 ) -> tuple[AbstractAsyncContextManager[EventStore] | None, EventStore | None]:
     """Resolve the configuration into ``(ctx, store)`` with exactly one non-None.
 
@@ -178,8 +195,25 @@ def _resolve_store(
     ``store`` is a caller-owned store we must not close.
     """
     if store is not None:
-        if backend is not None or url is not None:
-            raise ValueError("with_persistence: pass either store= or backend=/url=, not both")
+        supplied = _names_set(
+            backend=backend,
+            url=url,
+            ttl=ttl,
+            table_name=table_name,
+            key_prefix=key_prefix,
+            max_stream_length=max_stream_length,
+            tenant_id=tenant_id,
+            compression=compression,
+            keyring=keyring,
+            batch_max_events=batch_max_events,
+            batch_max_latency_ms=batch_max_latency_ms,
+        )
+        if compress_min_bytes != 1024:
+            supplied.append("compress_min_bytes")
+        if supplied:
+            raise ValueError(
+                "with_persistence: pass either store= or backend=/url= with configuration options, not both"
+            )
         return None, store
 
     if backend is not None:
@@ -190,6 +224,12 @@ def _resolve_store(
             table_name=table_name,
             key_prefix=key_prefix,
             max_stream_length=max_stream_length,
+            tenant_id=tenant_id,
+            compression=compression,
+            compress_min_bytes=compress_min_bytes,
+            keyring=keyring,
+            batch_max_events=batch_max_events,
+            batch_max_latency_ms=batch_max_latency_ms,
         ), None
 
     # Neither store nor backend: configuration comes from MCP_PERSIST_* env vars.
@@ -200,7 +240,14 @@ def _resolve_store(
         table_name=table_name,
         key_prefix=key_prefix,
         max_stream_length=max_stream_length,
+        tenant_id=tenant_id,
+        compression=compression,
+        keyring=keyring,
+        batch_max_events=batch_max_events,
+        batch_max_latency_ms=batch_max_latency_ms,
     )
+    if compress_min_bytes != 1024:
+        stray.append("compress_min_bytes")
     if stray:
         raise ValueError(
             f"with_persistence: {', '.join(stray)} require backend=; with neither store= nor backend= "
@@ -217,35 +264,40 @@ def _build_store_ctx(
     table_name: str | None,
     key_prefix: str | None,
     max_stream_length: int | None,
+    tenant_id: str | None,
+    compression: str | None,
+    compress_min_bytes: int,
+    keyring: KeyRing | None,
+    batch_max_events: int | None,
+    batch_max_latency_ms: float | None,
 ) -> AbstractAsyncContextManager[EventStore]:
     if not url:
         raise ValueError("with_persistence: backend= requires url=")
     name = backend.strip().lower()
 
+    if name not in _BACKENDS:
+        raise ValueError(f"with_persistence: backend must be one of {_BACKENDS}, got {backend!r}")
     if name == "sqlite":
         _reject(name, key_prefix=key_prefix, max_stream_length=max_stream_length)
-        kwargs: dict[str, Any] = {"ttl": ttl}
-        if table_name is not None:
-            kwargs["table_name"] = table_name
-        return SQLiteEventStore.create(url, **kwargs)
-
-    if name == "redis":
+    elif name == "redis":
         _reject(name, table_name=table_name)
-        kwargs = {"ttl": ttl}
-        if key_prefix is not None:
-            kwargs["key_prefix"] = key_prefix
-        if max_stream_length is not None:
-            kwargs["max_stream_length"] = max_stream_length
-        return RedisEventStore.create(url, **kwargs)
-
-    if name == "postgres":
+    else:
         _reject(name, key_prefix=key_prefix, max_stream_length=max_stream_length)
-        kwargs = {"ttl": ttl}
-        if table_name is not None:
-            kwargs["table_name"] = table_name
-        return PostgresEventStore.create(url, **kwargs)
 
-    raise ValueError(f"with_persistence: backend must be one of {_BACKENDS}, got {backend!r}")
+    return build_store_context(
+        name,
+        url,
+        ttl=ttl,
+        table_name=table_name,
+        key_prefix=key_prefix,
+        max_stream_length=max_stream_length,
+        tenant_id=tenant_id,
+        compression=compression,
+        compress_min_bytes=compress_min_bytes,
+        keyring=keyring,
+        batch_max_events=batch_max_events,
+        batch_max_latency_ms=batch_max_latency_ms,
+    )
 
 
 def _reject(backend: str, **inapplicable: Any) -> None:

@@ -1,8 +1,11 @@
 # Command-line tools
 
-`mcp-persist` ships two diagnostic commands for operating a live store. Both
-resolve their target the same way as the proxy: explicit `--backend`/`--url`
-flags, or the `MCP_PERSIST_*` environment variables when no flags are given.
+`mcp-persist` ships administrative commands for operating a live store. They
+resolve their target the same way as the proxy: explicit non-secret flags or the
+`MCP_PERSIST_*` environment variables. In particular, every command honors
+tenant binding, compression, and `MCP_PERSIST_ENCRYPTION_*`, so a dump or load
+uses the same scoped, encrypted store as the running application. Encryption
+keys intentionally remain environment-only and are never accepted as CLI flags.
 
 - [`mcp-persist doctor`](#mcp-persist-doctor): pass/fail health checklist
 - [`mcp-persist stats`](#mcp-persist-stats): per-stream event inventory
@@ -157,6 +160,10 @@ unrecognized format or version. As with `migrate`, `load` re-stores each event
 with `store_event`, so the destination assigns fresh IDs: content and ordering
 are reproduced, not the original resumability tokens. Both subcommands are thin
 front ends to `export_stream()` / `import_stream()` (see `docs/api.md`).
+
+Use `--tenant-id`, `--key-prefix`, `--max-stream-length`, or `--compression` to
+override the matching non-secret environment setting for one invocation. Keys
+continue to come from `MCP_PERSIST_ENCRYPTION_*`.
 
 ## `mcp-persist migrate`
 

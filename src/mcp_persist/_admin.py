@@ -37,13 +37,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 
 from mcp_persist.compression import validate_compression
-from mcp_persist.config import _PREFIX, _optional_int
+from mcp_persist.config import _PREFIX, _optional_int, build_store_context
 from mcp_persist.encryption import keyring_from_env
 from mcp_persist.migration import MigrationResult, migrate
 from mcp_persist.portability import export_stream, import_stream
-from mcp_persist.postgres import PostgresEventStore
-from mcp_persist.redis import RedisEventStore
-from mcp_persist.sqlite import SQLiteEventStore
 from mcp_persist.stored import count_expired
 
 if TYPE_CHECKING:
@@ -96,7 +93,9 @@ class StoreConfig:
     table_name: str | None = None
     key_prefix: str | None = None
     max_stream_length: int | None = None
+    tenant_id: str | None = None
     compression: str | None = None
+    keyring: Any | None = None
 
 
 # Config resolution
@@ -105,11 +104,11 @@ class StoreConfig:
 def _resolve_config(args: argparse.Namespace) -> StoreConfig:
     """Build a :class:`StoreConfig` from CLI flags, falling back to ``MCP_PERSIST_*``.
 
-    ``--backend``/``--url``/``--ttl``/``--table`` win when given; anything not
-    passed is read from the environment, so ``mcp-persist doctor`` with no flags
-    checks exactly the store a deployment is configured for. Raises ``ValueError``
-    with an actionable message for a missing or unknown backend, a missing URL, or
-    a non-integer ttl.
+    Non-secret CLI flags win when given; everything else comes from the
+    environment, including encryption keys so secrets never need to appear in a
+    process list. This keeps every command pointed at the same effective store as
+    the application. Raises ``ValueError`` with an actionable message for invalid
+    configuration.
     """
     import os
 
@@ -126,9 +125,14 @@ def _resolve_config(args: argparse.Namespace) -> StoreConfig:
 
     ttl = args.ttl if args.ttl is not None else _optional_int(env, f"{_PREFIX}TTL")
     table_name = args.table or env.get(f"{_PREFIX}TABLE_NAME")
-    key_prefix = env.get(f"{_PREFIX}KEY_PREFIX")
-    max_stream_length = _optional_int(env, f"{_PREFIX}MAX_STREAM_LENGTH")
-    compression = env.get(f"{_PREFIX}COMPRESSION")
+    key_prefix = args.key_prefix or env.get(f"{_PREFIX}KEY_PREFIX")
+    max_stream_length = (
+        args.max_stream_length
+        if args.max_stream_length is not None
+        else _optional_int(env, f"{_PREFIX}MAX_STREAM_LENGTH")
+    )
+    tenant_id = args.tenant_id or env.get(f"{_PREFIX}TENANT_ID")
+    compression = args.compression or env.get(f"{_PREFIX}COMPRESSION")
 
     return StoreConfig(
         backend=backend,
@@ -137,7 +141,9 @@ def _resolve_config(args: argparse.Namespace) -> StoreConfig:
         table_name=table_name,
         key_prefix=key_prefix or None,
         max_stream_length=max_stream_length,
+        tenant_id=tenant_id or None,
         compression=compression or None,
+        keyring=keyring_from_env(env),
     )
 
 
@@ -161,27 +167,21 @@ def _quiet_package_log() -> Iterator[None]:
 def _build_store(cfg: StoreConfig) -> AbstractAsyncContextManager[EventStore]:
     """Open the configured store as an async context manager (connection closed on exit).
 
-    Mirrors how :func:`mcp_persist.config.event_store_from_env` maps settings to a
-    backend ``create``, passing only the fields doctor resolved. The connection is
-    established on ``__aenter__`` and closed on ``__aexit__``.
+    Uses the shared construction path, so commands honor the same tenancy,
+    compression, and encryption settings as an environment-configured app. The
+    connection is established on ``__aenter__`` and closed on ``__aexit__``.
     """
-    if cfg.backend == "sqlite":
-        kwargs: dict[str, object] = {"ttl": cfg.ttl}
-        if cfg.table_name:
-            kwargs["table_name"] = cfg.table_name
-        return SQLiteEventStore.create(cfg.url, **kwargs)  # type: ignore[arg-type]
-    if cfg.backend == "redis":
-        kwargs = {"ttl": cfg.ttl}
-        if cfg.key_prefix:
-            kwargs["key_prefix"] = cfg.key_prefix
-        if cfg.max_stream_length is not None:
-            kwargs["max_stream_length"] = cfg.max_stream_length
-        return RedisEventStore.create(cfg.url, **kwargs)  # type: ignore[arg-type]
-    # postgres (the only remaining value; _resolve_config validated the set)
-    kwargs = {"ttl": cfg.ttl}
-    if cfg.table_name:
-        kwargs["table_name"] = cfg.table_name
-    return PostgresEventStore.create(cfg.url, **kwargs)  # type: ignore[arg-type]
+    return build_store_context(
+        cfg.backend,
+        cfg.url,
+        ttl=cfg.ttl,
+        table_name=cfg.table_name,
+        key_prefix=cfg.key_prefix,
+        max_stream_length=cfg.max_stream_length,
+        tenant_id=cfg.tenant_id,
+        compression=cfg.compression,
+        keyring=cfg.keyring,
+    )
 
 
 # Individual checks
@@ -632,6 +632,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         p.add_argument("--url", help="store path / URL / DSN (defaults to MCP_PERSIST_URL)")
         p.add_argument("--ttl", type=int, help="event ttl in seconds (defaults to MCP_PERSIST_TTL)")
         p.add_argument("--table", help="table name for sqlite/postgres (defaults to MCP_PERSIST_TABLE_NAME)")
+        p.add_argument("--key-prefix", help="Redis key prefix (defaults to MCP_PERSIST_KEY_PREFIX)")
+        p.add_argument(
+            "--max-stream-length", type=int, help="Redis stream cap (defaults to MCP_PERSIST_MAX_STREAM_LENGTH)"
+        )
+        p.add_argument("--tenant-id", help="tenant namespace (defaults to MCP_PERSIST_TENANT_ID)")
+        p.add_argument(
+            "--compression", choices=("gzip", "zstd"), help="payload codec (defaults to MCP_PERSIST_COMPRESSION)"
+        )
         p.add_argument("--json", action="store_true", help="emit machine-readable JSON")
 
     doctor = sub.add_parser("doctor", help="run a pass/fail diagnostic on the configured store")
