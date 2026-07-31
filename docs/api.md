@@ -54,6 +54,13 @@ a failing stream is logged and recorded in `failed_streams`, not fatal. Pass
 `stream_id=` to migrate one stream, `batch_size=` and `on_progress=` to drive a
 progress bar.
 
+Check `result.skipped_events` as well as `failed_streams`. A store skips an event
+it can read from storage but cannot decode (a payload it has no key for, or
+genuine corruption) rather than raising, so those events are missing from the
+destination without any stream being marked failed. A non-zero count means the
+copy is incomplete; the usual cause is a source store constructed without the
+`keyring=` its payloads were written with.
+
 > **Caveats (read before migrating production data):** event IDs are *not*
 > preserved (the destination assigns fresh ones), timestamps reset (TTL clock
 > restarts), and resumability tokens are therefore invalidated: clients holding

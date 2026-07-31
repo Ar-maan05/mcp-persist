@@ -5,6 +5,18 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.3] - 2026-07-31
+
+### Fixed
+- **`migrate` now opens both stores with the deployment's real configuration.** 1.12.2 routed `stats`, `purge`, `dump`, and `load` through the shared store factory; `migrate` was left behind because it takes its own `--from-`/`--to-` flags, so it opened each side with nothing but a backend and a URL. Three things went wrong as a result, all of them silently: reading an encrypted source without its keyring skipped every event and still exited 0 (`migrated 0 event(s)`, no failures, no data at the destination); reading a multi-tenant source unscoped merged every tenant into one unbound destination; and a source using a non-default table name or Redis key prefix was read from the default location, so `migrate` found nothing and reported an empty store. Every store setting now has a per-side flag (`--from-ttl`, `--from-table`, `--from-key-prefix`, `--from-max-stream-length`, `--from-tenant-id`, `--from-compression`, and the `--to-` equivalents), each falling back to its `MCP_PERSIST_*` variable, so the common case (migrating the deployment the shell is already configured for) is correct with no extra flags. Encryption keys remain environment-only and one keyring serves both sides, which is also what makes a re-keying migration work: hold the old and new keys in `MCP_PERSIST_ENCRYPTION_KEYS` and select the new one with `MCP_PERSIST_ENCRYPTION_KEY_ID` to read with the old and write with the new.
+- **A migration that could not read the source no longer reports success.** The stores skip an event they can read from storage but cannot decode (no key, wrong key, or genuine corruption) instead of raising, which meant the loss was invisible above the log. `MigrationResult` gained `skipped_events`, `migrate()` counts them across the run and logs a warning, and the CLI prints an explicit error naming the count and exits non-zero (`skipped_events` under `--json`). A migration that copies nothing because it cannot read the source is now distinguishable from a migration of an empty store.
+- **`purge --dry-run --json` emits JSON.** It printed the prose line instead, the one flag combination in the CLI that ignored `--json`. The document is `{"purged": N, "dry_run": true}`, matching the real purge.
+- **Changelog release headings link again.** Every version from 1.9.0 through 1.12.2 was written as a `[x.y.z]` reference link with no matching definition at the foot of the file, so seven headings rendered as broken references.
+
+### Added
+- **`mcp-persist config`.** Prints the store settings resolved from `MCP_PERSIST_*` and any flags: backend, url, ttl, table name, key prefix, max stream length, tenant, compression, and encryption. It opens no connection, so it answers "which store am I actually pointed at?" even when that store is down, which is the question behind most of the failures above. Nothing secret is printed: a password inside the URL is masked, and encryption is reported as the active key id plus how many keys the ring can decrypt with (key ids already travel in the payload marker), never the keys themselves. `--json` for scripts. See `docs/cli.md`.
+- **`KeyRing.active_key_id` and `KeyRing.key_ids`.** The non-secret parts of a keyring are now readable without reaching into private attributes, which is what `config` reports.
+
 ## [1.12.2] - 2026-07-27
 
 ### Fixed
@@ -387,6 +399,14 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore`, a Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
+[1.12.3]: https://github.com/Ar-maan05/mcp-persist/compare/v1.12.2...v1.12.3
+[1.12.2]: https://github.com/Ar-maan05/mcp-persist/compare/v1.12.1...v1.12.2
+[1.12.1]: https://github.com/Ar-maan05/mcp-persist/compare/v1.12.0...v1.12.1
+[1.12.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.11.1...v1.12.0
+[1.11.1]: https://github.com/Ar-maan05/mcp-persist/compare/v1.11.0...v1.11.1
+[1.11.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.10.0...v1.11.0
+[1.10.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.9.0...v1.10.0
+[1.9.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.8.4...v1.9.0
 [1.8.4]: https://github.com/Ar-maan05/mcp-persist/compare/v1.8.3...v1.8.4
 [1.8.3]: https://github.com/Ar-maan05/mcp-persist/compare/v1.8.2...v1.8.3
 [1.8.2]: https://github.com/Ar-maan05/mcp-persist/compare/v1.8.1...v1.8.2

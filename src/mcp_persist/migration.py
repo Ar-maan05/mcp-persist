@@ -74,11 +74,20 @@ class MigrationResult:
         failed_streams:   Stream IDs whose migration raised; these were logged
                           and skipped so the rest of the migration could finish.
                           A failed stream may have been copied partially.
+        skipped_events:   Events the source could read from storage but could not
+                          decode into a message, so they were not copied. The
+                          usual cause is a payload the source store cannot
+                          decrypt (no keyring configured, or the wrong key), and
+                          the rest is genuine corruption. These do not raise, so
+                          without this count a migration that copied nothing
+                          would look like a migration of an empty store. Zero
+                          when the source does not track the count.
     """
 
     streams_migrated: int = 0
     events_migrated: int = 0
     failed_streams: list[str] = field(default_factory=list)
+    skipped_events: int = 0
 
 
 async def migrate(
@@ -113,11 +122,17 @@ async def migrate(
         A :class:`MigrationResult`. Each stream is migrated independently: if one
         stream raises it is logged, recorded in ``failed_streams``, and migration
         continues with the next stream rather than aborting the whole run.
+        Events the source cannot decode (undecryptable or corrupt payloads) are
+        skipped without raising and counted in ``skipped_events``.
     """
     if batch_size < 1:
         raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
 
     result = MigrationResult()
+    # The stores skip an undecodable event mid-iteration rather than raising, so
+    # the only way to see the loss is to sample their counter across the run.
+    # getattr keeps a source that predates the counter (or a custom one) working.
+    unreadable_before = getattr(source, "unreadable_events", 0)
 
     async def migrate_one(sid: StreamId) -> int:
         migrated = 0
@@ -148,4 +163,12 @@ async def migrate(
         async for sid in source.list_streams():
             await run(sid)
 
+    result.skipped_events = getattr(source, "unreadable_events", 0) - unreadable_before
+    if result.skipped_events:
+        logger.warning(
+            "Migration skipped %d event(s) the source could not decode; "
+            "they were not copied to the destination. If the source is encrypted, "
+            "check that the migration is configured with its keyring.",
+            result.skipped_events,
+        )
     return result

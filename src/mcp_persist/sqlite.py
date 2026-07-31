@@ -206,6 +206,7 @@ class SQLiteEventStore(EventStore):
         self._commit_lock = asyncio.Lock()
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self.unreadable_events = 0
 
         if ttl is None:
             logger.warning(
@@ -1061,6 +1062,7 @@ class SQLiteEventStore(EventStore):
                     try:
                         message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload))
                     except Exception as exc:  # noqa: BLE001
+                        self.unreadable_events += 1
                         logger.warning(
                             "Skipping event %s on stream %s: failed validation: %s", event_id, stream_id, exc
                         )

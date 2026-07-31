@@ -147,6 +147,57 @@ def _resolve_config(args: argparse.Namespace) -> StoreConfig:
     )
 
 
+def _resolve_migrate_side(args: argparse.Namespace, side: str) -> StoreConfig:
+    """Build the :class:`StoreConfig` for one side of ``migrate`` (``from`` or ``to``).
+
+    ``migrate`` names two stores, so it takes a ``--from-``/``--to-`` prefixed copy
+    of every store setting instead of the single set the other commands share.
+    Each setting falls back to its ``MCP_PERSIST_*`` variable when the flag is
+    absent, which is what makes the common case (migrating the deployment this
+    shell is already configured for onto a new backend) correct by default;
+    migrating between two differently configured deployments spells the
+    difference out with the per-side flags.
+
+    The encryption keyring comes from the environment for both sides, never from
+    a flag, so keys stay out of the process list. One keyring covers a rekeying
+    migration too: ``MCP_PERSIST_ENCRYPTION_KEYS`` can hold the source's old key
+    alongside the destination's new one, with ``MCP_PERSIST_ENCRYPTION_KEY_ID``
+    selecting which is written.
+    """
+    import os
+
+    env = os.environ
+
+    def flag(name: str) -> Any:
+        return getattr(args, f"{side}_{name}")
+
+    def env_str(suffix: str) -> str | None:
+        return env.get(f"{_PREFIX}{suffix}") or None
+
+    def env_int(suffix: str) -> int | None:
+        return _optional_int(env, f"{_PREFIX}{suffix}")
+
+    backend = flag("backend")
+    compression = flag("compression") or env_str("COMPRESSION")
+    if compression is not None:
+        # Fail before opening either store rather than at the first write.
+        validate_compression(compression)
+
+    ttl = flag("ttl")
+    max_stream_length = flag("max_stream_length")
+    return StoreConfig(
+        backend=backend,
+        url=flag("url"),
+        ttl=ttl if ttl is not None else env_int("TTL"),
+        table_name=flag("table") or env_str("TABLE_NAME"),
+        key_prefix=flag("key_prefix") or env_str("KEY_PREFIX"),
+        max_stream_length=max_stream_length if max_stream_length is not None else env_int("MAX_STREAM_LENGTH"),
+        tenant_id=flag("tenant_id") or env_str("TENANT_ID"),
+        compression=compression,
+        keyring=keyring_from_env(env),
+    )
+
+
 @contextmanager
 def _quiet_package_log() -> Iterator[None]:
     """Silence the ``mcp_persist`` logger below ERROR for the duration of the block.
@@ -579,6 +630,77 @@ def _render_stats_json(cfg: StoreConfig, report: StatsReport) -> str:
     )
 
 
+# Config
+
+
+def redact_url(url: str) -> str:
+    """Mask the password in a ``scheme://user:password@host`` URL.
+
+    ``config`` output is the kind of thing that gets pasted into a bug report, so
+    a Redis or Postgres DSN carrying inline credentials is printed with the
+    password replaced by ``***``. Anything without that shape (an SQLite path, a
+    DSN with no password) is returned unchanged.
+    """
+    scheme, sep, rest = url.partition("://")
+    if not sep or "@" not in rest:
+        return url
+    userinfo, _, hostpart = rest.rpartition("@")
+    user, colon, _password = userinfo.partition(":")
+    if not colon:
+        return url
+    return f"{scheme}://{user}:***@{hostpart}"
+
+
+def _config_fields(cfg: StoreConfig) -> list[tuple[str, str]]:
+    """The resolved settings as ordered ``(name, display value)`` pairs."""
+    keyring = cfg.keyring
+    if keyring is None:
+        encryption = "off"
+    else:
+        # Report the shape of the key set, never a key.
+        encryption = f"on (active key {keyring.active_key_id!r}, {len(keyring.key_ids)} key(s) available)"
+    return [
+        ("backend", cfg.backend),
+        ("url", redact_url(cfg.url)),
+        ("ttl", "unset (events never expire)" if cfg.ttl is None else f"{cfg.ttl}s"),
+        ("table_name", cfg.table_name or "default"),
+        ("key_prefix", cfg.key_prefix or "default"),
+        ("max_stream_length", "unset" if cfg.max_stream_length is None else str(cfg.max_stream_length)),
+        ("tenant_id", cfg.tenant_id or "unbound (sees every tenant)"),
+        ("compression", cfg.compression or "off"),
+        ("encryption", encryption),
+    ]
+
+
+def _render_config(cfg: StoreConfig) -> str:
+    fields = _config_fields(cfg)
+    width = max(len(name) for name, _ in fields)
+    lines = ["mcp-persist config: resolved from MCP_PERSIST_* and command-line flags", ""]
+    lines += [f"  {name.ljust(width)}  {value}" for name, value in fields]
+    return "\n".join(lines)
+
+
+def _render_config_json(cfg: StoreConfig) -> str:
+    keyring = cfg.keyring
+    return json.dumps(
+        {
+            "backend": cfg.backend,
+            "url": redact_url(cfg.url),
+            "ttl": cfg.ttl,
+            "table_name": cfg.table_name,
+            "key_prefix": cfg.key_prefix,
+            "max_stream_length": cfg.max_stream_length,
+            "tenant_id": cfg.tenant_id,
+            "compression": cfg.compression,
+            "encryption": {
+                "enabled": keyring is not None,
+                "active_key_id": None if keyring is None else keyring.active_key_id,
+                "key_ids": [] if keyring is None else list(keyring.key_ids),
+            },
+        }
+    )
+
+
 # Duration parsing (for `purge --older-than`)
 
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
@@ -642,6 +764,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         )
         p.add_argument("--json", action="store_true", help="emit machine-readable JSON")
 
+    config_p = sub.add_parser("config", help="print the resolved store configuration (secrets redacted)")
+    _store_flags(config_p)
+
     doctor = sub.add_parser("doctor", help="run a pass/fail diagnostic on the configured store")
     _store_flags(doctor)
 
@@ -670,14 +795,30 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     load.add_argument("--stream-id", help="restore into this stream instead of the one in the dump")
 
     migrate_p = sub.add_parser("migrate", help="copy events from one store to another")
-    migrate_p.add_argument("--from-backend", choices=("sqlite", "redis", "postgres"), required=True)
-    migrate_p.add_argument("--from-url", required=True)
-    migrate_p.add_argument("--to-backend", choices=("sqlite", "redis", "postgres"), required=True)
-    migrate_p.add_argument("--to-url", required=True)
+    for side, label in (("from", "source"), ("to", "destination")):
+        migrate_p.add_argument(f"--{side}-backend", choices=("sqlite", "redis", "postgres"), required=True)
+        migrate_p.add_argument(f"--{side}-url", required=True)
+        migrate_p.add_argument(f"--{side}-ttl", type=int, help=f"event ttl in seconds for the {label} store")
+        migrate_p.add_argument(f"--{side}-table", help=f"table name for the {label} sqlite/postgres store")
+        migrate_p.add_argument(f"--{side}-key-prefix", help=f"Redis key prefix for the {label} store")
+        migrate_p.add_argument(f"--{side}-max-stream-length", type=int, help=f"Redis stream cap for the {label} store")
+        migrate_p.add_argument(f"--{side}-tenant-id", help=f"tenant namespace to bind the {label} store to")
+        migrate_p.add_argument(
+            f"--{side}-compression", choices=("gzip", "zstd"), help=f"payload codec for the {label} store"
+        )
     migrate_p.add_argument("--batch-size", type=int, default=500)
     migrate_p.add_argument("--json", action="store_true")
 
     return parser.parse_args(argv)
+
+
+def _run_config(args: argparse.Namespace) -> int:
+    try:
+        cfg = _resolve_config(args)
+    except ValueError as exc:
+        _die(str(exc))
+    print(_render_config_json(cfg) if args.json else _render_config(cfg))
+    return 0
 
 
 def _run_doctor(args: argparse.Namespace) -> int:
@@ -742,10 +883,10 @@ def _run_purge(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"mcp-persist: error: purge failed for {cfg.backend} at {cfg.url}: {exc}", file=sys.stderr)
         return 1
-    if args.dry_run:
+    if args.json:
+        print(json.dumps({"purged": removed, "dry_run": args.dry_run}))
+    elif args.dry_run:
         print(f"would purge {removed} expired event(s)")
-    elif args.json:
-        print(json.dumps({"purged": removed, "dry_run": False}))
     else:
         print(f"purged {removed} expired event(s)")
     return 0
@@ -837,8 +978,11 @@ async def _migrate_stores(
 
 
 def _run_migrate(args: argparse.Namespace) -> int:
-    source = StoreConfig(backend=args.from_backend, url=args.from_url)
-    dest = StoreConfig(backend=args.to_backend, url=args.to_url)
+    try:
+        source = _resolve_migrate_side(args, "from")
+        dest = _resolve_migrate_side(args, "to")
+    except ValueError as exc:
+        _die(str(exc))
 
     def progress(sid: str, n: int) -> None:
         if not args.json:
@@ -859,6 +1003,7 @@ def _run_migrate(args: argparse.Namespace) -> int:
                     "streams_migrated": result.streams_migrated,
                     "events_migrated": result.events_migrated,
                     "failed_streams": result.failed_streams,
+                    "skipped_events": result.skipped_events,
                 }
             )
         )
@@ -867,11 +1012,22 @@ def _run_migrate(args: argparse.Namespace) -> int:
             f"migrated {result.events_migrated} event(s) across {result.streams_migrated} stream(s); "
             f"failed: {len(result.failed_streams)}"
         )
-    return 1 if result.failed_streams else 0
+    if result.skipped_events:
+        # Undecodable events are dropped silently by the read path, so a migration
+        # that lost data would otherwise exit 0 looking like a clean run.
+        print(
+            f"mcp-persist: error: skipped {result.skipped_events} event(s) the source could not decode; "
+            f"they were NOT copied. If the source store is encrypted, set MCP_PERSIST_ENCRYPTION_KEY(S) "
+            f"to its key and run again.",
+            file=sys.stderr,
+        )
+    return 1 if result.failed_streams or result.skipped_events else 0
 
 
 def main() -> None:
     args = _parse_args(sys.argv[1:])
+    if args.command == "config":
+        raise SystemExit(_run_config(args))
     if args.command == "doctor":
         raise SystemExit(_run_doctor(args))
     if args.command == "stats":

@@ -94,6 +94,20 @@ class KeyRing:
         self._keys = dict(keys)
         self._active_key_id = active_key_id
 
+    @property
+    def active_key_id(self) -> str:
+        """The id of the key new writes encrypt with."""
+        return self._active_key_id
+
+    @property
+    def key_ids(self) -> tuple[str, ...]:
+        """Every key id this ring can decrypt with, sorted.
+
+        Key ids are not secret (they are stored in the payload marker), so this
+        is safe to print; the keys themselves are never exposed as a group.
+        """
+        return tuple(sorted(self._keys))
+
     def active(self) -> tuple[str, bytes]:
         """Return ``(key_id, raw_key)`` for the key new writes encrypt with."""
         return self._active_key_id, self._keys[self._active_key_id]

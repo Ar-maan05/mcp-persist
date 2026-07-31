@@ -220,6 +220,7 @@ class RedisEventStore(EventStore):
         # See _write_event.
         self._write_script: Any = None
         self._script_ok: bool | None = None
+        self.unreadable_events = 0
 
         if ttl is None:
             logger.warning(
@@ -852,6 +853,7 @@ class RedisEventStore(EventStore):
                 try:
                     message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload_str))
                 except Exception as exc:  # noqa: BLE001
+                    self.unreadable_events += 1
                     logger.warning(
                         "Skipping event %s on stream %s during migration: failed JSONRPC validation/decompression: %s",
                         eid,
