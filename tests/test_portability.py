@@ -7,14 +7,14 @@ import asyncio
 
 import aiosqlite
 import pytest
-from mcp.types import JSONRPCMessage, JSONRPCRequest
+from mcp_types import JSONRPCMessage, JSONRPCRequest
 
 from mcp_persist import SQLiteEventStore, export_stream, import_stream
 from mcp_persist.portability import DUMP_FORMAT, DUMP_VERSION
 
 
 def _msg(i: int) -> JSONRPCMessage:
-    return JSONRPCMessage(JSONRPCRequest(jsonrpc="2.0", id=str(i), method="tools/call", params={"n": i}))
+    return JSONRPCRequest(jsonrpc="2.0", id=str(i), method="tools/call", params={"n": i})
 
 
 async def _make_store(path: str, ttl: int | None = 3600) -> tuple[aiosqlite.Connection, SQLiteEventStore]:
@@ -82,7 +82,7 @@ def test_round_trip_restores_content_and_order(tmp_path):
         return restored
 
     restored = asyncio.run(run())
-    assert [m.root.params["n"] for _eid, m in restored] == [0, 1, 2, 3, 4]  # type: ignore[union-attr]
+    assert [m.params["n"] for _eid, m in restored] == [0, 1, 2, 3, 4]  # type: ignore[union-attr]
     # IDs are reassigned by the destination, so they are a fresh monotonic run.
     assert [int(eid) for eid, _m in restored] == sorted(int(eid) for eid, _m in restored)
 

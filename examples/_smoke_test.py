@@ -4,16 +4,16 @@ import asyncio
 import json
 
 from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 
 def parse_tool_result(res) -> list[dict]:  # type: ignore[no-untyped-def]
-    """FastMCP serialises list items as one TextContent per element."""
+    """MCPServer serialises list items as one TextContent per element."""
     return [json.loads(c.text) for c in res.content]  # type: ignore[attr-defined]
 
 
 async def main() -> None:
-    async with streamablehttp_client("http://127.0.0.1:8000/mcp") as (r, w, _):
+    async with streamable_http_client("http://127.0.0.1:8000/mcp") as (r, w):
         async with ClientSession(r, w) as session:
             await session.initialize()
             print("✓ session initialized")
@@ -25,7 +25,7 @@ async def main() -> None:
             note_id = data["note_id"]
             print(f"✓ add_note → {data}")
 
-            # list notes — FastMCP yields one TextContent per list element
+            # list notes — MCPServer yields one TextContent per list element
             res = await session.call_tool("list_notes", {})
             notes = parse_tool_result(res)
             assert len(notes) >= 1, f"Expected at least 1 note, got {len(notes)}"

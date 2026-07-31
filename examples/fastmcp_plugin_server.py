@@ -1,7 +1,7 @@
 """
 examples/fastmcp_plugin_server.py
 =================================
-A FastMCP server made resumable in one line with ``with_persistence``.
+An MCPServer made resumable in one line with ``with_persistence``.
 
 This is the same kind of server as ``sqlite_server.py`` / ``redis_server.py``,
 but instead of hand-wiring an ``aiosqlite`` connection, a ``SQLiteEventStore``,
@@ -21,15 +21,15 @@ from __future__ import annotations
 import asyncio
 
 import uvicorn
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from mcp_persist import with_persistence
 
 # ---------------------------------------------------------------------------
-# MCP server — define tools exactly as you normally would with FastMCP
+# MCP server — define tools exactly as you normally would with MCPServer
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP(name="EchoServer")
+mcp = MCPServer(name="EchoServer")
 
 
 @mcp.tool()

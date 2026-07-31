@@ -10,7 +10,7 @@ same note-taking API; the plugin server is a minimal echo server.
 ## Prerequisites
 
 ```bash
-# FastMCP plugin example (SQLite): uvicorn ships with mcp, so one install is enough
+# MCPServer plugin example (SQLite): uvicorn ships with mcp, so one install is enough
 pip install "mcp-persist[sqlite]"
 
 # SQLite example
@@ -39,7 +39,7 @@ and `MCP_TEST_POSTGRES_URL` (see [`compose.yaml`](../compose.yaml)).
 
 ## fastmcp_plugin_server.py
 
-The simplest entry point: a FastMCP server made resumable with a single
+The simplest entry point: an MCPServer made resumable with a single
 `with_persistence()` call: no manual store, manager, or lifespan wiring. Uses
 SQLite (persists to `echo_events.db`) and exposes `shout` / `slow_echo` tools.
 
@@ -93,11 +93,11 @@ server call `shout` instead):
 ```python
 import asyncio
 from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 
 async def main():
-    async with streamablehttp_client("http://localhost:8000/mcp") as (r, w, _):
+    async with streamable_http_client("http://localhost:8000/mcp") as (r, w):
         async with ClientSession(r, w) as session:
             await session.initialize()
 

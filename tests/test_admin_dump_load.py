@@ -9,14 +9,14 @@ import time
 
 import aiosqlite
 import pytest
-from mcp.types import JSONRPCMessage, JSONRPCRequest
+from mcp_types import JSONRPCMessage, JSONRPCRequest
 
 from mcp_persist import SQLiteEventStore, _admin, event_store_from_env, generate_key
 from mcp_persist.encryption import _ENC_PREFIX, keyring_from_env
 
 
 def _msg(i: int) -> JSONRPCMessage:
-    return JSONRPCMessage(JSONRPCRequest(jsonrpc="2.0", id=str(i), method="ping", params={"n": i}))
+    return JSONRPCRequest(jsonrpc="2.0", id=str(i), method="ping", params={"n": i})
 
 
 async def _seed(path: str, stream: str, count: int, *, ttl: int | None = 3600) -> None:

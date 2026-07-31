@@ -29,7 +29,7 @@ from typing import Any
 
 import aiosqlite
 import uvicorn
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.routing import Mount
@@ -57,7 +57,7 @@ _notes: dict[str, Note] = {}
 # MCP server — tools and resources
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP(name="NoteServer")
+mcp = MCPServer(name="NoteServer")
 
 
 @mcp.tool()
@@ -128,7 +128,7 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         await store.initialize()
 
         session_manager = StreamableHTTPSessionManager(
-            app=mcp._mcp_server,
+            app=mcp._lowlevel_server,
             event_store=store,
             session_idle_timeout=300,
         )

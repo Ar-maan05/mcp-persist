@@ -25,7 +25,7 @@ import time
 
 import pytest
 from mcp.server.streamable_http import EventId, EventMessage, StreamId
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import PostgresEventStore
 
@@ -318,9 +318,9 @@ async def test_replay_message_content_round_trips(store):
 
     assert len(events) == 1
     replayed = events[0].message
-    assert isinstance(replayed.root, JSONRPCRequest)
-    assert replayed.root.method == "resources/list"
-    assert replayed.root.id == "99"
+    assert isinstance(replayed, JSONRPCRequest)
+    assert replayed.method == "resources/list"
+    assert replayed.id == "99"
 
 
 @pytest.mark.anyio
@@ -580,7 +580,7 @@ async def test_subscribe_delivers_new_events(pg_pool, clean_table):
 
     async def run():
         async for event_id, message in store.subscribe("stream-A"):
-            received.append(message.root.id)
+            received.append(message.id)
             if len(received) >= 2:
                 break
 
@@ -605,7 +605,7 @@ async def test_subscribe_is_forward_only(pg_pool, clean_table):
 
     async def run():
         async for event_id, message in store.subscribe("stream-A"):
-            received.append(message.root.id)
+            received.append(message.id)
             break
 
     task = asyncio.create_task(run())
@@ -661,7 +661,7 @@ async def test_long_stream_id_notify_channel_within_limit(pg_pool, clean_table):
 
     async def run():
         async for _event_id, message in store.subscribe(long_stream):
-            received.append(message.root.id)
+            received.append(message.id)
             break
 
     task = asyncio.create_task(run())
@@ -699,7 +699,7 @@ async def test_compression_roundtrips_large_payload(pg_pool, clean_table):
 
     events, _ = await collect_events(store, anchor)
     assert [e.event_id for e in events] == [eid]
-    assert events[0].message.root.params == {"data": "x" * 5000}
+    assert events[0].message.params == {"data": "x" * 5000}
 
 
 @pytest.mark.anyio
@@ -722,7 +722,7 @@ async def test_uncompressed_store_reads_compressed_payload(pg_pool, clean_table)
 
     reader = PostgresEventStore(pg_pool, table_name=TABLE, ttl=None)  # compression disabled
     events, _ = await collect_events(reader, anchor)
-    assert events[0].message.root.params == {"data": "y" * 3000}
+    assert events[0].message.params == {"data": "y" * 3000}
 
 
 def test_invalid_compression_codec_raises():

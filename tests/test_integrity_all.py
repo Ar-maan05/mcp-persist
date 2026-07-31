@@ -14,7 +14,7 @@ import aiosqlite
 import fakeredis.aioredis as fakeredis
 import pytest
 from mcp.server.streamable_http import EventMessage
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import PostgresEventStore, RedisEventStore, SQLiteEventStore, migrate
 
@@ -184,10 +184,10 @@ async def test_migration_repeated_execution_is_safe_but_duplicates():
 
         assert len(dst_events) == 4
         # Payloads are preserved
-        assert dst_events[0].root.id == "1"
-        assert dst_events[1].root.id == "2"
-        assert dst_events[2].root.id == "1"
-        assert dst_events[3].root.id == "2"
+        assert dst_events[0].id == "1"
+        assert dst_events[1].id == "2"
+        assert dst_events[2].id == "1"
+        assert dst_events[3].id == "2"
 
 
 @pytest.mark.anyio
@@ -231,7 +231,7 @@ async def test_sqlite_schema_evolution_robustness():
         assert stream_id == "stream-ev"
         # Should retrieve event 2 and 3
         assert len(events) == 2
-        assert [ev.message.root.id for ev in events] == ["2", "3"]
+        assert [ev.message.id for ev in events] == ["2", "3"]
 
         # 6. Downgrade schema: drop an index (SQLite has no DROP COLUMN before
         #    3.35; dropping an index is safe/standard).
@@ -267,7 +267,7 @@ async def test_replay_guarantees_exact_set():
         stream_id = await store.replay_events_after("3", cb)
         assert stream_id == "stream-A"
         assert len(events) == 7
-        assert [ev.message.root.id for ev in events] == [str(x) for x in range(4, 11)]
+        assert [ev.message.id for ev in events] == [str(x) for x in range(4, 11)]
         assert [ev.event_id for ev in events] == [str(x) for x in range(4, 11)]
 
 
@@ -314,7 +314,7 @@ async def test_replay_with_expired_and_missing_ids(caplog):
             stream_id = await store.replay_events_after(eid1, cb)
             assert stream_id == "stream-A"
             assert len(events) == 1
-            assert events[0].message.root.id == "3"
+            assert events[0].message.id == "3"
 
             # Check warning was logged
             assert any("Replay gap on stream stream-A" in record.message for record in caplog.records)
@@ -356,7 +356,7 @@ async def test_subscribe_streaming_in_order_no_loss():
         # 3. Check delivery guarantees
         assert len(received) == 20
         # Check in-order delivery and zero loss
-        ids = [int(msg.root.id) for _, msg in received]
+        ids = [int(msg.id) for _, msg in received]
         assert ids == list(range(1, 21))
 
 
@@ -395,8 +395,8 @@ async def test_store_handles_special_characters():
         stream_id = await store.replay_events_after(anchor_eid, cb)
         assert stream_id == special_stream
         assert len(events) == 1
-        assert events[0].message.root.id == "special_id"
-        assert events[0].message.root.params["value"] == "quote' \" \\ \x00 emoji 👍"
+        assert events[0].message.id == "special_id"
+        assert events[0].message.params["value"] == "quote' \" \\ \x00 emoji 👍"
 
 
 @pytest.mark.anyio
@@ -434,8 +434,8 @@ async def test_store_handles_extremely_large_payloads():
 
         await store.replay_events_after(anchor_eid, cb)
         assert len(events) == 1
-        assert events[0].message.root.id == "large_id"
-        assert len(events[0].message.root.params["data"]) == 2 * 1024 * 1024
+        assert events[0].message.id == "large_id"
+        assert len(events[0].message.params["data"]) == 2 * 1024 * 1024
 
 
 @pytest.mark.anyio
@@ -468,7 +468,7 @@ async def test_replay_handles_corrupted_payloads_gracefully(caplog):
 
             # Event 2 should be skipped, event 3 should be successfully delivered
             assert len(events) == 1
-            assert events[0].message.root.id == "3"
+            assert events[0].message.id == "3"
 
             # Verify warning was logged for skipped corrupt event
             assert any("failed JSONRPC validation" in record.message for record in caplog.records)
@@ -506,7 +506,7 @@ async def test_replay_handles_invalid_message_schema_gracefully(caplog):
 
             # Event 2 should be skipped, event 3 delivered
             assert len(events) == 1
-            assert events[0].message.root.id == "3"
+            assert events[0].message.id == "3"
 
             # Verify warning was logged for skipped event
             assert any("failed JSONRPC validation" in record.message for record in caplog.records)

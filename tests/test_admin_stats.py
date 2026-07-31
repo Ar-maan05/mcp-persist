@@ -12,7 +12,7 @@ import json
 import aiosqlite
 import fakeredis.aioredis as fakeredis
 import pytest
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import RedisEventStore, SQLiteEventStore
 from mcp_persist._admin import (

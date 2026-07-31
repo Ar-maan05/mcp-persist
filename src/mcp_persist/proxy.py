@@ -38,7 +38,9 @@ from contextlib import asynccontextmanager
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
-import httpx
+# mcp 2.0 moved from httpx to httpx2, which is API-compatible for everything
+# used here. Aliased so the call sites below read as ordinary httpx usage.
+import httpx2 as httpx
 
 from mcp_persist._stream_buffer import DEFAULT_DEQUE_MAXLEN, StreamBuffer
 from mcp_persist.config import build_store_context, event_store_from_env

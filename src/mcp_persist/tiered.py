@@ -13,7 +13,7 @@ from mcp.server.streamable_http import (
     EventStore,
     StreamId,
 )
-from mcp.types import JSONRPCMessage
+from mcp_types import JSONRPCMessage
 
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 

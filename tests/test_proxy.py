@@ -21,9 +21,9 @@ import json
 from collections.abc import AsyncIterator
 
 import aiosqlite
-import httpx
+import httpx2 as httpx
 import pytest
-from mcp.types import JSONRPCNotification
+from mcp_types import JSONRPCNotification
 
 from mcp_persist import SQLiteEventStore, generate_key, keyring_from_env
 from mcp_persist._sse_parser import SSEFrame, SSEParser

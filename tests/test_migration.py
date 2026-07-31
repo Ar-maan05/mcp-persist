@@ -16,7 +16,7 @@ from __future__ import annotations
 import aiosqlite
 import fakeredis.aioredis as fakeredis
 import pytest
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import MigrationResult, RedisEventStore, SQLiteEventStore, migrate
 

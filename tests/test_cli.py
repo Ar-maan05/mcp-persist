@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 
-import httpx
+import httpx2 as httpx
 import pytest
 
 from mcp_persist import _cli

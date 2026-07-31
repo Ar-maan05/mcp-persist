@@ -3,7 +3,7 @@ examples/resume_demo.py
 =======================
 A self-contained, recordable terminal demo of mcp-persist resumability.
 
-It runs a *real* MCP server (FastMCP + SQLiteEventStore, the same wiring as
+It runs a *real* MCP server (MCPServer + SQLiteEventStore, the same wiring as
 ``sqlite_server.py``) in a background thread, then drives a *real* HTTP client
 against it that:
 
@@ -42,9 +42,9 @@ from typing import Any
 import aiosqlite
 import httpx
 import uvicorn
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp.types import LATEST_PROTOCOL_VERSION
+from mcp_types import LATEST_PROTOCOL_VERSION
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
@@ -108,7 +108,7 @@ def banner(text: str) -> None:
 # The server: a real MCP server backed by SQLiteEventStore
 # --------------------------------------------------------------------------- #
 
-mcp = FastMCP(name="ResumeDemo")
+mcp = MCPServer(name="ResumeDemo")
 
 
 @mcp.tool()
@@ -131,7 +131,7 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         store = SQLiteEventStore(conn, ttl=3600)
         await store.initialize()
         manager = StreamableHTTPSessionManager(
-            app=mcp._mcp_server,
+            app=mcp._lowlevel_server,
             event_store=store,
             session_idle_timeout=300,
         )

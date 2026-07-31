@@ -18,7 +18,7 @@ import time
 import aiosqlite
 import pytest
 from mcp.server.streamable_http import EventId, EventMessage, StreamId
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import SQLiteEventStore
 
@@ -298,9 +298,9 @@ async def test_replay_message_content_round_trips(store):
 
     assert len(events) == 1
     replayed = events[0].message
-    assert isinstance(replayed.root, JSONRPCRequest)
-    assert replayed.root.method == "resources/list"
-    assert replayed.root.id == "99"
+    assert isinstance(replayed, JSONRPCRequest)
+    assert replayed.method == "resources/list"
+    assert replayed.id == "99"
 
 
 @pytest.mark.anyio
@@ -478,7 +478,7 @@ async def test_compression_roundtrips_large_payload(conn):
 
     events, _ = await collect_events(store, anchor)
     assert [e.event_id for e in events] == [eid]
-    assert events[0].message.root.params == {"data": "x" * 5000}
+    assert events[0].message.params == {"data": "x" * 5000}
 
 
 @pytest.mark.anyio
@@ -502,7 +502,7 @@ async def test_uncompressed_store_reads_compressed_payload(conn):
 
     reader = SQLiteEventStore(conn, table_name=TABLE, ttl=None)  # compression disabled
     events, _ = await collect_events(reader, anchor)
-    assert events[0].message.root.params == {"data": "y" * 3000}
+    assert events[0].message.params == {"data": "y" * 3000}
 
 
 def test_invalid_compression_codec_raises():

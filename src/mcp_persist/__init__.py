@@ -14,7 +14,7 @@ Usage:
 
     from mcp_persist import RedisEventStore, SQLiteEventStore, PostgresEventStore
 
-For FastMCP servers, ``with_persistence`` wires a store into a runnable ASGI app
+For MCPServer servers, ``with_persistence`` wires a store into a runnable ASGI app
 in one call (see :mod:`mcp_persist.fastmcp`):
 
     from mcp_persist import with_persistence

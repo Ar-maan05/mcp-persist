@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 
 def _msg(i: int) -> JSONRPCRequest:

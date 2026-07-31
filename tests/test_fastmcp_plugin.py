@@ -1,4 +1,4 @@
-"""Tests for the FastMCP plugin (mcp_persist.fastmcp.with_persistence).
+"""Tests for the MCPServer plugin (mcp_persist.fastmcp.with_persistence).
 
 The plugin is exercised end-to-end: the returned Starlette app is run under an
 in-process uvicorn server on an ephemeral port and driven with the real MCP
@@ -18,8 +18,8 @@ import pytest
 import uvicorn
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-from mcp.server.fastmcp import FastMCP
-from mcp.types import JSONRPCRequest
+from mcp.server.mcpserver import MCPServer
+from mcp_types import JSONRPCRequest
 from starlette.applications import Starlette
 
 from mcp_persist import SQLiteEventStore, generate_key, keyring_from_env, with_persistence
@@ -28,8 +28,8 @@ from mcp_persist.fastmcp import _build_store_ctx
 _SAMPLE_MSG = JSONRPCRequest(jsonrpc="2.0", id="probe", method="tools/list")
 
 
-def _make_mcp() -> FastMCP:
-    mcp = FastMCP(name="PluginTestServer")
+def _make_mcp() -> MCPServer:
+    mcp = MCPServer(name="PluginTestServer")
 
     @mcp.tool()
     def shout(message: str) -> dict[str, str]:
@@ -67,7 +67,7 @@ async def _serve(app: Starlette) -> AsyncIterator[str]:
 
 async def _call_shout(url: str, message: str = "hi") -> dict[str, str]:
     """Run a full MCP session against ``url`` and return the shout tool result."""
-    async with streamable_http_client(url) as (r, w, _):
+    async with streamable_http_client(url) as (r, w):
         async with ClientSession(r, w) as session:
             await session.initialize()
             res = await session.call_tool("shout", {"message": message})
@@ -100,7 +100,7 @@ async def test_env_selects_backend(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.anyio
 async def test_explicit_backend_kwargs_forward_modern_store_options() -> None:
-    """The convenient FastMCP path must not lose security or isolation settings."""
+    """The convenient MCPServer path must not lose security or isolation settings."""
     key = generate_key()
     ctx = _build_store_ctx(
         "sqlite",

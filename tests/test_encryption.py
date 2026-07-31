@@ -14,7 +14,7 @@ import os
 
 import fakeredis.aioredis as fakeredis
 import pytest
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import KeyRing, RedisEventStore, SQLiteEventStore, generate_key, keyring_from_env
 from mcp_persist.compression import compress_payload, decompress_payload
@@ -266,7 +266,7 @@ async def test_sqlite_encrypts_at_rest_and_replays():
         # Replay decrypts transparently.
         resolved, events = await _replay(store, e1, "s1")
         assert resolved == "s1"
-        assert [e.message.root.method for e in events] == ["tools/list"]
+        assert [e.message.method for e in events] == ["tools/list"]
 
 
 @pytest.mark.anyio
@@ -321,7 +321,7 @@ async def test_redis_encrypts_at_rest_and_replays():
 
     resolved, events = await _replay(store, e1, "s1")
     assert resolved == "s1"
-    assert [e.message.root.method for e in events] == ["tools/list"]
+    assert [e.message.method for e in events] == ["tools/list"]
 
 
 @pytest.mark.anyio
@@ -336,4 +336,4 @@ async def test_redis_encryption_works_on_both_write_paths():
         await store.store_event("s1", SAMPLE_MSG)
         resolved, events = await _replay(store, e1, "s1")
         assert resolved == "s1"
-        assert [e.message.root.method for e in events] == ["tools/list"]
+        assert [e.message.method for e in events] == ["tools/list"]

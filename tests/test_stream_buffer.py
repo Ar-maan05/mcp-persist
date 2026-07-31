@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator
 
 import aiosqlite
 import pytest
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import SQLiteEventStore
 from mcp_persist._sse_parser import SSEFrame

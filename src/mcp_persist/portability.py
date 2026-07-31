@@ -31,7 +31,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Any, Protocol
 
-from mcp.types import JSONRPCMessage
+from mcp_types import JSONRPCMessage
 from pydantic import TypeAdapter
 
 if TYPE_CHECKING:

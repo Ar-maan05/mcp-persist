@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 import aiosqlite
 import fakeredis.aioredis as fakeredis
 import pytest
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import PostgresEventStore, RedisEventStore, SQLiteEventStore
 
@@ -33,7 +33,7 @@ def _msg(i: int) -> JSONRPCRequest:
 
 
 def _id(message) -> str:
-    return message.root.id
+    return message.id
 
 
 @pytest.fixture

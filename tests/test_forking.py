@@ -14,7 +14,7 @@ import aiosqlite
 import fakeredis.aioredis as fakeredis
 import pytest
 from mcp.server.streamable_http import EventMessage
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import PostgresEventStore, RedisEventStore, SQLiteEventStore
 
@@ -82,7 +82,7 @@ async def run_forking_scenario(store):
 
     await store.replay_events_after("0", cb_a, "fork-model-a")
 
-    ids_a = [e.message.root.id for e in events_a]
+    ids_a = [e.message.id for e in events_a]
     assert ids_a == ["1", "2", "3", "4", "51", "52"]
 
     # Step 4: Replay from fork-model-b and verify history (should contain 1, 2, 3, 4, 61, 62)
@@ -93,7 +93,7 @@ async def run_forking_scenario(store):
 
     await store.replay_events_after("0", cb_b, "fork-model-b")
 
-    ids_b = [e.message.root.id for e in events_b]
+    ids_b = [e.message.id for e in events_b]
     assert ids_b == ["1", "2", "3", "4", "61", "62"]
 
     # Step 5: Replay from fork-model-a starting *after* step 2 (should yield 3, 4, 51, 52)
@@ -104,14 +104,14 @@ async def run_forking_scenario(store):
 
     await store.replay_events_after(eid2, cb_after_2, "fork-model-a")
 
-    ids_after_2 = [e.message.root.id for e in events_after_2]
+    ids_after_2 = [e.message.id for e in events_after_2]
     assert ids_after_2 == ["3", "4", "51", "52"]
 
     # Step 6: Test migration iteration (_iter_stream_events) on fork-model-a
     iter_events = []
     async for _, message in store._iter_stream_events("fork-model-a"):
         if message is not None:
-            iter_events.append(message.root.id)
+            iter_events.append(message.id)
     assert iter_events == ["1", "2", "3", "4", "51", "52"]
 
 
@@ -172,7 +172,7 @@ async def run_deep_forking_stress(store):
         events.append(event)
 
     await store.replay_events_after("0", cb, current_stream)
-    assert [e.message.root.id for e in events] == expected_ids
+    assert [e.message.id for e in events] == expected_ids
 
 
 async def run_wide_forking_stress(store):
@@ -197,7 +197,7 @@ async def run_wide_forking_stress(store):
 
         child_stream = child_streams[child_idx]
         await store.replay_events_after("0", cb, child_stream)
-        assert [e.message.root.id for e in events] == ["0", str(child_idx + 1)]
+        assert [e.message.id for e in events] == ["0", str(child_idx + 1)]
 
     tasks = [verify_child(i) for i in range(100)]
     await asyncio.gather(*tasks)

@@ -10,21 +10,30 @@ When an MCP client reconnects, the server has to replay the events it missed, an
 
 > 📚 This README is the quick tour. Full reference lives in **[`docs/`](#-documentation)**: backends, CLI, the programmatic API, architecture, benchmarks, and the production guide.
 
+> ⚠️ **Requires the MCP Python SDK 2.0 or newer.** The 2.0 release renamed
+> `FastMCP` to `MCPServer`, moved the wire types to the `mcp_types` package, and
+> replaced `httpx` with `httpx2`. Supporting both SDK majors would mean import
+> shims through all of it, so mcp-persist 1.12.3 and later target 2.x only.
+> **Still on mcp 1.x? Pin `mcp-persist==1.12.2`**, which is feature-identical
+> apart from the fixes in 1.12.3. Stored events are unaffected either way: the
+> on-disk JSON is byte-identical across both SDK majors, so an existing store
+> keeps replaying correctly after you upgrade.
+
 ## Quickstart: `with_persistence()`
 
-The fastest way to add resumability to a FastMCP server. Wiring it by hand means
+The fastest way to add resumability to an MCPServer. Wiring it by hand means
 an event store, a `StreamableHTTPSessionManager`, a Starlette lifespan to open and
 close them, and a `Mount`. `with_persistence()` collapses all of it to two lines:
-pass your `FastMCP` instance and get back a runnable Starlette ASGI app with the
+pass your `MCPServer` instance and get back a runnable Starlette ASGI app with the
 store and session manager already wired in, opened on startup and closed on
 shutdown.
 
 ```python
 import uvicorn
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp_persist import with_persistence
 
-mcp = FastMCP(name="MyServer")
+mcp = MCPServer(name="MyServer")
 
 # Swap backend="redis" / "postgres" with the matching url:
 app = with_persistence(mcp, backend="sqlite", url="events.db", ttl=3600)
@@ -83,9 +92,9 @@ EventStore
  └─ PostgreSQL
 ```
 
-> **Not on FastMCP, or want to own the wiring yourself?** Build a store and pass
+> **Not using MCPServer, or want to own the wiring yourself?** Build a store and pass
 > it to `StreamableHTTPSessionManager` directly; see
-> [Manual wiring](docs/backends.md#manual-wiring-advanced-or-non-fastmcp).
+> [Manual wiring](docs/backends.md#manual-wiring-advanced-or-non-mcpserver).
 
 ## Resumability without touching the server: `PersistenceProxy`
 
@@ -107,8 +116,8 @@ rides the standard SSE `Last-Event-ID` header, so any MCP client that reconnects
 after a drop gets its missed events back automatically.
 
 ```bash
-# Point at a running MCP server (no extra install needed: httpx & uvicorn
-# already ship with mcp):
+# Point at a running MCP server (no extra install needed: httpx2 is a
+# dependency and uvicorn ships with mcp):
 mcp-persist-proxy --upstream http://localhost:8001 \
     --backend sqlite --url events.db --port 8000
 

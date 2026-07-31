@@ -16,7 +16,7 @@ import aiosqlite
 import fakeredis.aioredis as fakeredis
 import pytest
 from mcp.server.streamable_http import EventMessage
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import PostgresEventStore, RedisEventStore, SQLiteEventStore
 
@@ -139,7 +139,7 @@ async def run_production_stress_test(store, num_forks=30, writes_per_fork=50):
             events.append(event)
 
         await store.replay_events_after("0", cb, stream_name)
-        event_ids = [int(e.message.root.id) for e in events]
+        event_ids = [int(e.message.id) for e in events]
 
         # Verify shared prefix (0 to 9)
         assert event_ids[:10] == list(range(10))

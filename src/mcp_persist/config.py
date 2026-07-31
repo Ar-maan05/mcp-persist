@@ -93,7 +93,7 @@ def build_store_context(
     """Build an owned store context manager from normalized configuration.
 
     This is the single construction path for environment configuration and the
-    higher-level FastMCP, proxy, and administrative entry points. Keeping the
+    higher-level MCPServer, proxy, and administrative entry points. Keeping the
     backend mapping here prevents newer options such as encryption, tenancy,
     compression, and batching from being silently lost in one integration.
     """

@@ -72,7 +72,7 @@ async def test_server_smoke(backend: str):
                 conn = http.client.HTTPConnection("127.0.0.1", 8000, timeout=1.0)
                 conn.request("GET", "/mcp")
                 res = conn.getresponse()
-                # FastMCP SSE handler redirects or responds on this path
+                # MCPServer SSE handler redirects or responds on this path
                 if res.status in (200, 307, 400, 404, 405):
                     connected = True
                     conn.close()

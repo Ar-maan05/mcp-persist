@@ -28,7 +28,8 @@ import asyncio
 import sys
 from typing import Protocol
 
-import httpx
+# See the note in proxy.py: mcp 2.0 replaced httpx with the API-compatible httpx2.
+import httpx2 as httpx
 import uvicorn
 
 from mcp_persist.proxy import PersistenceProxy

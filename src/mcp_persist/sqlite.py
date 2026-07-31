@@ -5,17 +5,17 @@ Requires the sqlite extra:
 
 Quickstart:
     import aiosqlite
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from mcp_persist import SQLiteEventStore
 
-    mcp = FastMCP(name="MyServer")
+    mcp = MCPServer(name="MyServer")
     conn = await aiosqlite.connect("mcp_events.db")
     store = SQLiteEventStore(conn, ttl=3600)
     await store.initialize()
 
     session_manager = StreamableHTTPSessionManager(
-        app=mcp._mcp_server,  # the low-level Server that FastMCP wraps
+        app=mcp._lowlevel_server,  # the low-level Server that MCPServer wraps
         event_store=store,
     )
 
@@ -43,7 +43,7 @@ from mcp.server.streamable_http import (
     EventStore,
     StreamId,
 )
-from mcp.types import JSONRPCMessage
+from mcp_types import JSONRPCMessage
 from pydantic import TypeAdapter
 
 from mcp_persist._debug import debug_log, default_metrics_collector

@@ -5,15 +5,15 @@ the connection-lifecycle helper. For the high-level "which backend should I use?
 decision and the `with_persistence()` one-liner, see the
 [README](../README.md#backends--choosing-one).
 
-- [Manual wiring (advanced or non-FastMCP)](#manual-wiring-advanced-or-non-fastmcp)
+- [Manual wiring (advanced or non-MCPServer)](#manual-wiring-advanced-or-non-mcpserver)
 - [SQLiteEventStore](#sqliteeventstore)
 - [RedisEventStore](#rediseventstore)
 - [PostgresEventStore](#postgreseventstore)
 - [Connection lifecycle: `create()`](#connection-lifecycle-create)
 
-## Manual wiring (advanced or non-FastMCP)
+## Manual wiring (advanced or non-MCPServer)
 
-`with_persistence()` is the fast path on FastMCP. When you're not on FastMCP, or
+`with_persistence()` is the fast path on MCPServer. When you are not on MCPServer, or
 you want to own the wiring yourself, construct a store and hand it to
 `StreamableHTTPSessionManager`. The backends are interchangeable; pick per
 [Choosing a backend](../README.md#backends--choosing-one).
@@ -22,18 +22,18 @@ you want to own the wiring yourself, construct a store and hand it to
 
 ```python
 import aiosqlite
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp_persist import SQLiteEventStore
 
-mcp = FastMCP(name="MyServer")
+mcp = MCPServer(name="MyServer")
 
 conn = await aiosqlite.connect("events.db")
 store = SQLiteEventStore(conn, ttl=3600)  # 1 hour TTL
 await store.initialize()
 
 session_manager = StreamableHTTPSessionManager(
-    app=mcp._mcp_server,  # the low-level Server that FastMCP wraps
+    app=mcp._lowlevel_server,  # the low-level Server that MCPServer wraps
     event_store=store,
 )
 ```
@@ -42,17 +42,17 @@ session_manager = StreamableHTTPSessionManager(
 
 ```python
 import redis.asyncio as aioredis
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp_persist import RedisEventStore
 
-mcp = FastMCP(name="MyServer")
+mcp = MCPServer(name="MyServer")
 
 redis_client = aioredis.from_url("redis://localhost:6379")
 store = RedisEventStore(redis_client, ttl=3600)  # 1 hour TTL
 
 session_manager = StreamableHTTPSessionManager(
-    app=mcp._mcp_server,  # the low-level Server that FastMCP wraps
+    app=mcp._lowlevel_server,  # the low-level Server that MCPServer wraps
     event_store=store,
 )
 ```
@@ -61,18 +61,18 @@ session_manager = StreamableHTTPSessionManager(
 
 ```python
 import asyncpg
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp_persist import PostgresEventStore
 
-mcp = FastMCP(name="MyServer")
+mcp = MCPServer(name="MyServer")
 
 pool = await asyncpg.create_pool("postgresql://localhost/mydb")
 store = PostgresEventStore(pool, ttl=3600)  # 1 hour TTL
 await store.initialize()
 
 session_manager = StreamableHTTPSessionManager(
-    app=mcp._mcp_server,  # the low-level Server that FastMCP wraps
+    app=mcp._lowlevel_server,  # the low-level Server that MCPServer wraps
     event_store=store,
 )
 ```
@@ -314,4 +314,4 @@ async with PostgresEventStore.create("postgresql://localhost/mydb", ttl=3600) as
 Extra keyword arguments are forwarded to the driver (`aiosqlite.connect`,
 `redis.asyncio.from_url`, `asyncpg.create_pool`). To share one client/pool across
 stores or manage its lifecycle yourself, construct the store directly as shown in
-[Manual wiring](#manual-wiring-advanced-or-non-fastmcp).
+[Manual wiring](#manual-wiring-advanced-or-non-mcpserver).

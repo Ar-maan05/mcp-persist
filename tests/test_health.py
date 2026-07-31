@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 
 import aiosqlite
-from mcp.types import JSONRPCMessage, JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import SQLiteEventStore
 from mcp_persist.health import HealthReport, probe_health
@@ -19,7 +19,7 @@ def test_sqlite_health_reports_healthy_with_size(tmp_path):
         conn = await aiosqlite.connect(db)
         store = SQLiteEventStore(conn, ttl=None)
         await store.initialize()
-        await store.store_event("s", JSONRPCMessage(JSONRPCRequest(jsonrpc="2.0", id="1", method="ping")))
+        await store.store_event("s", JSONRPCRequest(jsonrpc="2.0", id="1", method="ping"))
         report = await store.health()
         await conn.close()
         return report

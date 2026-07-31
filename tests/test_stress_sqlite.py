@@ -15,7 +15,7 @@ import time
 import aiosqlite
 import pytest
 from mcp.server.streamable_http import EventMessage
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import SQLiteEventStore
 

@@ -23,7 +23,7 @@ from time import perf_counter
 from typing import Protocol
 
 from mcp.server.streamable_http import EventId, EventMessage, EventStore
-from mcp.types import JSONRPCMessage
+from mcp_types import JSONRPCMessage
 from pydantic import TypeAdapter
 
 from mcp_persist._sse_parser import SSEFrame, SSEParser

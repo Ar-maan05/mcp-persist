@@ -18,7 +18,7 @@ import os
 
 import fakeredis.aioredis as fakeredis
 import pytest
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import RedisEventStore
 
@@ -145,7 +145,7 @@ async def test_script_and_pipeline_produce_identical_results(client):
         resolved, events = await _replay(store, e1, "s1")
         assert resolved == "s1"
         assert [e.event_id for e in events] == ["2"]
-        assert [e.message.root.method for e in events] == ["tools/list"]
+        assert [e.message.method for e in events] == ["tools/list"]
 
     assert scripted._script_ok is True
     assert pipelined._script_ok is False

@@ -5,17 +5,17 @@ Requires the postgres extra:
 
 Quickstart:
     import asyncpg
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from mcp_persist import PostgresEventStore
 
-    mcp = FastMCP(name="MyServer")
+    mcp = MCPServer(name="MyServer")
     pool = await asyncpg.create_pool("postgresql://localhost/mydb")
     store = PostgresEventStore(pool, ttl=3600)
     await store.initialize()
 
     session_manager = StreamableHTTPSessionManager(
-        app=mcp._mcp_server,  # the low-level Server that FastMCP wraps
+        app=mcp._lowlevel_server,  # the low-level Server that MCPServer wraps
         event_store=store,
     )
 
@@ -45,7 +45,7 @@ from mcp.server.streamable_http import (
     EventStore,
     StreamId,
 )
-from mcp.types import JSONRPCMessage
+from mcp_types import JSONRPCMessage
 from pydantic import TypeAdapter
 
 from mcp_persist._debug import debug_log, default_metrics_collector

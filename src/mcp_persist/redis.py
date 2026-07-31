@@ -5,16 +5,16 @@ Requires the redis extra:
 
 Quickstart:
     import redis.asyncio as aioredis
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from mcp_persist import RedisEventStore
 
-    mcp = FastMCP(name="MyServer")
+    mcp = MCPServer(name="MyServer")
     redis_client = aioredis.from_url("redis://localhost:6379")
     store = RedisEventStore(redis_client, ttl=3600)
 
     session_manager = StreamableHTTPSessionManager(
-        app=mcp._mcp_server,  # the low-level Server that FastMCP wraps
+        app=mcp._lowlevel_server,  # the low-level Server that MCPServer wraps
         event_store=store,
     )
 """
@@ -34,7 +34,7 @@ from mcp.server.streamable_http import (
     EventStore,
     StreamId,
 )
-from mcp.types import JSONRPCMessage
+from mcp_types import JSONRPCMessage
 from pydantic import TypeAdapter
 
 from mcp_persist._debug import default_metrics_collector

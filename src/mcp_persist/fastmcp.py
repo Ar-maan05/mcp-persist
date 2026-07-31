@@ -1,7 +1,7 @@
-"""FastMCP plugin for mcp-persist.
+"""MCPServer plugin for mcp-persist.
 
-Wire SSE stream resumability into a :class:`~mcp.server.fastmcp.FastMCP` server
-with a single call. :func:`with_persistence` takes the ``FastMCP`` instance and
+Wire SSE stream resumability into a :class:`~mcp.server.mcpserver.MCPServer`
+with a single call. :func:`with_persistence` takes the ``MCPServer`` instance and
 returns a runnable Starlette ASGI app with a
 :class:`~mcp.server.streamable_http_manager.StreamableHTTPSessionManager`
 already wired to an :class:`~mcp.server.streamable_http.EventStore`, managing the
@@ -11,10 +11,10 @@ Three ways to supply the store, in resolution order:
 
 Pattern A — config kwargs (most common)::
 
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
     from mcp_persist import with_persistence
 
-    mcp = FastMCP(name="MyServer")
+    mcp = MCPServer(name="MyServer")
     app = with_persistence(mcp, backend="sqlite", url="events.db", ttl=3600)
     # `app` is a Starlette ASGI app — run it with uvicorn:
     #   uvicorn.run(app, host="127.0.0.1", port=8000)
@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from contextlib import AbstractAsyncContextManager
 
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
     from mcp.server.streamable_http import EventStore
 
     from mcp_persist.encryption import KeyRing
@@ -56,7 +56,7 @@ _BACKENDS = ("sqlite", "redis", "postgres")
 
 
 def with_persistence(
-    mcp: FastMCP,
+    mcp: MCPServer,
     store: EventStore | None = None,
     *,
     backend: str | None = None,
@@ -98,7 +98,7 @@ def with_persistence(
        error, since configuration comes from the environment.
 
     Args:
-        mcp: The ``FastMCP`` server to serve.
+        mcp: The ``MCPServer`` to serve.
         store: A pre-built event store (Pattern B). Mutually exclusive with
             ``backend``/``url``.
         backend: ``"sqlite"``, ``"redis"`` or ``"postgres"`` (Pattern A).
@@ -147,7 +147,7 @@ def with_persistence(
 @contextlib.asynccontextmanager
 async def _run_manager(
     app: Starlette,
-    mcp: FastMCP,
+    mcp: MCPServer,
     store: EventStore,
     session_idle_timeout: float | None,
 ) -> AsyncIterator[None]:
@@ -162,7 +162,7 @@ async def _run_manager(
     kwargs: dict[str, Any] = {}
     if session_idle_timeout is not None:
         kwargs["session_idle_timeout"] = session_idle_timeout
-    manager = StreamableHTTPSessionManager(app=mcp._mcp_server, event_store=store, **kwargs)
+    manager = StreamableHTTPSessionManager(app=mcp._lowlevel_server, event_store=store, **kwargs)
     app.state.session_manager = manager
     app.state.event_store = store
     async with manager.run():

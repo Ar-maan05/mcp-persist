@@ -54,11 +54,11 @@ examples):
 import contextlib
 
 import asyncpg
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp_persist import PostgresEventStore
 
-mcp = FastMCP(name="MyServer")
+mcp = MCPServer(name="MyServer")
 
 
 @contextlib.asynccontextmanager
@@ -69,7 +69,7 @@ async def lifespan(app):
         await store.initialize()  # SQLite/Postgres only; Redis has no initialize()
 
         manager = StreamableHTTPSessionManager(
-            app=mcp._mcp_server,  # the low-level Server FastMCP wraps
+            app=mcp._lowlevel_server,  # the low-level Server MCPServer wraps
             event_store=store,
             session_idle_timeout=300,  # seconds
         )
@@ -95,7 +95,7 @@ from mcp_persist import event_store_from_env
 # MCP_PERSIST_URL=postgresql://localhost/mydb
 # MCP_PERSIST_TTL=3600
 async with event_store_from_env() as store:  # opens + closes the connection
-    manager = StreamableHTTPSessionManager(app=mcp._mcp_server, event_store=store)
+    manager = StreamableHTTPSessionManager(app=mcp._lowlevel_server, event_store=store)
     async with manager.run():
         yield
 ```
@@ -143,8 +143,8 @@ this in mind:
   can replay what it already stored but cannot bridge the old stream to the
   restarted server. This is the same boundary as
   [scope](#scope-what-resumability-does-and-does-not-cover), one hop out.
-- **No extra dependency**: `httpx` and `uvicorn` already ship transitively with
-  `mcp`.
+- **No extra install**: `httpx2` is a direct dependency of `mcp-persist` and
+  `uvicorn` ships transitively with `mcp`.
 
 ## 2. Reclaiming space: schedule `purge_expired()`
 

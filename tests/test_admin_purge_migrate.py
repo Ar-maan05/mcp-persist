@@ -10,7 +10,7 @@ import time
 
 import aiosqlite
 import pytest
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import SQLiteEventStore, _admin
 from mcp_persist.encryption import KeyRing, generate_key

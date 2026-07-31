@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from typing import Protocol
 
     from mcp.server.streamable_http import EventId, StreamId
-    from mcp.types import JSONRPCMessage
+    from mcp_types import JSONRPCMessage
 
     class _MigrationSource(Protocol):
         def list_streams(self) -> AsyncIterator[StreamId]: ...

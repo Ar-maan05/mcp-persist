@@ -16,7 +16,7 @@ import time
 
 import aiosqlite
 import pytest
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import (
     DatabaseAuditSink,

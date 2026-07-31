@@ -19,7 +19,7 @@ import aiosqlite
 import fakeredis.aioredis as fakeredis
 import pytest
 from mcp.server.streamable_http import EventMessage
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import PostgresEventStore, RedisEventStore, SQLiteEventStore
 

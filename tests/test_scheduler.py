@@ -14,7 +14,7 @@ import time
 import aiosqlite
 import fakeredis.aioredis as fakeredis
 import pytest
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import PurgeScheduler, RedisEventStore, SQLiteEventStore
 
