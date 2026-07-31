@@ -32,7 +32,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from mcp.types import JSONRPCRequest
+from mcp_types import JSONRPCRequest
 
 from mcp_persist import BatchingEventStore, PostgresEventStore, RedisEventStore, SQLiteEventStore
 

@@ -19,7 +19,14 @@ SSE stream with mcp-persist's own ``SSEParser``.
 
 Run it (one command, made to be screen-recorded):
 
-    python examples/resume_demo.py
+    python examples/resume_demo.py 2>/dev/null
+
+Everything the demo prints goes to stdout; stderr carries the server's request
+log. Deliberately dropping a connection mid-body also makes httpcore2 (new in
+httpx2) occasionally print a "generator didn't stop after athrow()" traceback
+from its own async-generator finalizer, at garbage-collection time and after the
+work is done. It is harmless noise (the demo still exits 0 and still reports zero
+loss), but redirecting stderr keeps a recording clean.
 
 Only the [sqlite] extra is needed (uvicorn + httpx ship with mcp):
 
@@ -40,7 +47,7 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
-import httpx
+import httpx2 as httpx
 import uvicorn
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -215,12 +222,25 @@ async def initialize(client: httpx.AsyncClient) -> tuple[str, str]:
     return session_id, version
 
 
-async def fire_tool(client: httpx.AsyncClient, auth: dict[str, str]) -> dict[str, Any] | None:
-    """POST the streaming tool call and return its final result.
+async def stream_tool_call(
+    client: httpx.AsyncClient,
+    auth: dict[str, str],
+    *,
+    label: str,
+    paint: Any,
+    seen: list[int],
+    stop_after: int,
+) -> str | None:
+    """POST the streaming tool call and read progress off its own SSE stream.
 
-    Progress notifications travel on the standalone GET stream (that is the
-    server→client channel resumability is built for); this POST stream carries
-    only the tool's final result.
+    Returns the last event id seen, then abandons the connection: leaving the
+    ``async with`` closes the socket mid-stream, which is the simulated crash.
+
+    Progress notifications ride the POST response stream, the same stream the
+    tool's final result arrives on. (Under the 1.x SDK they were routed to the
+    standalone GET stream instead.) Resumability is unaffected either way: the
+    server assigns an event id to every event it sends on any stream, and a
+    reconnect quotes the last one it saw.
     """
     headers = {"Content-Type": "application/json", "Accept": JSON_SSE, **auth}
     call = {
@@ -229,47 +249,10 @@ async def fire_tool(client: httpx.AsyncClient, auth: dict[str, str]) -> dict[str
         "method": "tools/call",
         "params": {"name": "slow_count", "arguments": {"n": STEPS}, "_meta": {"progressToken": "demo"}},
     }
+    last_id = None
+    got = 0
     async with client.stream("POST", URL, headers=headers, json=call) as resp:
         resp.raise_for_status()
-        parser = SSEParser()
-        async for chunk in resp.aiter_text():
-            for frame in parser.feed(chunk):
-                if frame.data == "":
-                    continue
-                msg = json.loads(frame.data)
-                if "result" in msg and msg.get("id") == 2:
-                    return msg["result"]
-    return None
-
-
-async def read_get(
-    client: httpx.AsyncClient,
-    auth: dict[str, str],
-    *,
-    label: str,
-    paint: Any,
-    seen: list[int],
-    last_event_id: str | None = None,
-    stop_after: int | None = None,
-    stop_value: int | None = None,
-    on_attached: Any = None,
-) -> str | None:
-    """Open the standalone GET stream and print progress events as they arrive.
-
-    Returns the last event id seen. Stops after ``stop_after`` events (the
-    simulated crash) or once a progress value reaches ``stop_value``. If
-    ``on_attached`` is given it is launched once the stream is open — used to
-    kick off the tool only after the GET channel is registered server-side.
-    """
-    headers = {"Accept": "text/event-stream", **auth}
-    if last_event_id is not None:
-        headers["Last-Event-ID"] = str(last_event_id)
-    last_id = last_event_id
-    got = 0
-    async with client.stream("GET", URL, headers=headers) as resp:
-        resp.raise_for_status()
-        if on_attached is not None:
-            asyncio.create_task(on_attached())  # noqa: RUF006 — fire-and-forget, short-lived
         parser = SSEParser()
         async for chunk in resp.aiter_text():
             for frame in parser.feed(chunk):
@@ -283,11 +266,43 @@ async def read_get(
                 seen.append(value)
                 got += 1
                 print(f"  {paint(label)} {dim('id=' + str(last_id)):<14} {_short(msg)}")
-                if stop_after is not None and got >= stop_after:
-                    return last_id
-                if stop_value is not None and value >= stop_value:
+                if got >= stop_after:
                     return last_id
     return last_id
+
+
+async def resume_after(
+    client: httpx.AsyncClient,
+    auth: dict[str, str],
+    *,
+    last_event_id: str | None,
+    label: str,
+    paint: Any,
+    seen: list[int],
+) -> dict[str, Any] | None:
+    """Reconnect with ``Last-Event-ID`` and consume everything that was missed.
+
+    The server replays the events the dropped stream never delivered, in order,
+    and finishes with the tool's result. Returns that result.
+    """
+    headers = {"Accept": "text/event-stream", **auth}
+    if last_event_id is not None:
+        headers["Last-Event-ID"] = str(last_event_id)
+    async with client.stream("GET", URL, headers=headers) as resp:
+        resp.raise_for_status()
+        parser = SSEParser()
+        async for chunk in resp.aiter_text():
+            for frame in parser.feed(chunk):
+                if frame.data == "":
+                    continue
+                msg = json.loads(frame.data)
+                if msg.get("method") == "notifications/progress":
+                    value = int(msg["params"]["progress"])
+                    seen.append(value)
+                    print(f"  {paint(label)} {dim('id=' + str(frame.original_id)):<14} {_short(msg)}")
+                elif msg.get("id") == 2 and "result" in msg:
+                    return msg["result"]
+    return None
 
 
 def _result_text(result: dict[str, Any] | None) -> Any:
@@ -300,7 +315,6 @@ def _result_text(result: dict[str, Any] | None) -> Any:
 
 async def run_client() -> None:
     seen: list[int] = []  # steps received, across both connections
-    holder: dict[str, Any] = {}
 
     # follow_redirects: the server mounts at /mcp and 307-redirects to /mcp/.
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
@@ -309,33 +323,22 @@ async def run_client() -> None:
         auth = {"mcp-session-id": session_id, "MCP-Protocol-Version": version}
 
         banner("streaming a long tool call")
-        print(dim("open the server→client event stream, then call slow_count" + f"(n={STEPS})"))
+        print(dim(f"call slow_count(n={STEPS}) and read its progress stream"))
         print(dim(f"we drop the connection after {DROP_AFTER} events\n"))
 
-        async def on_attached() -> None:
-            await asyncio.sleep(0.3)  # let the GET stream register before progress starts
-            holder["task"] = asyncio.create_task(fire_tool(client, auth))
-
-        last_id = await read_get(
-            client, auth, label="recv", paint=green, seen=seen, stop_after=DROP_AFTER, on_attached=on_attached
-        )
+        last_id = await stream_tool_call(client, auth, label="recv", paint=green, seen=seen, stop_after=DROP_AFTER)
         print()
         print(red(bold("  ✗ CONNECTION DROPPED")) + dim(f"  (client crashed after id={last_id})"))
 
         banner("offline — server keeps working")
         print(dim("the client is gone, but the tool runs on and every event is persisted to SQLite…"))
         await asyncio.sleep(STEPS * STEP_DELAY + 0.6)
-        result = await holder["task"]
-        print(
-            dim(
-                f"meanwhile {count_events()} events are durable in {DB_PATH}; "
-                f"the tool result returned on its own stream → {json.dumps(_result_text(result))}"
-            )
-        )
+        print(dim(f"meanwhile {count_events()} events are durable in {DB_PATH}"))
 
         banner("reconnect with Last-Event-ID")
         print(dim(f"GET {URL}  →  Last-Event-ID: {last_id}\n"))
-        await read_get(client, auth, label="replay", paint=yellow, seen=seen, last_event_id=last_id, stop_value=STEPS)
+        result = await resume_after(client, auth, last_event_id=last_id, label="replay", paint=yellow, seen=seen)
+        print(dim(f"\n  the tool result arrives on the resumed stream → {json.dumps(_result_text(result))}"))
 
         banner("result")
         if seen == list(range(1, STEPS + 1)):
