@@ -13,9 +13,9 @@ When an MCP client reconnects, the server has to replay the events it missed, an
 > ⚠️ **Requires the MCP Python SDK 2.0 or newer.** The 2.0 release renamed
 > `FastMCP` to `MCPServer`, moved the wire types to the `mcp_types` package, and
 > replaced `httpx` with `httpx2`. Supporting both SDK majors would mean import
-> shims through all of it, so mcp-persist 1.12.3 and later target 2.x only.
+> shims through all of it, so mcp-persist 2.0 and later target 2.x only.
 > **Still on mcp 1.x? Pin `mcp-persist==1.12.2`**, which is feature-identical
-> apart from the fixes in 1.12.3. Stored events are unaffected either way: the
+> apart from the fixes in 2.0.0. Stored events are unaffected either way: the
 > on-disk JSON is byte-identical across both SDK majors, so an existing store
 > keeps replaying correctly after you upgrade.
 
@@ -95,6 +95,51 @@ EventStore
 > **Not using MCPServer, or want to own the wiring yourself?** Build a store and pass
 > it to `StreamableHTTPSessionManager` directly; see
 > [Manual wiring](docs/backends.md#manual-wiring-advanced-or-non-mcpserver).
+
+## Surviving a restart: `durable_sessions=True`
+
+A persistent event store keeps the events. It does not keep the *session*. The
+SDK holds live sessions in an in-process dict, so after a restart the client's
+`Mcp-Session-Id` is unknown and every request 404s: the events are still on disk
+and the client cannot reach them. A request landing on a second worker hits the
+same wall, which is why resumability across a load balancer has needed sticky
+routing.
+
+```python
+app = with_persistence(mcp, backend="sqlite", url="events.db", durable_sessions=True)
+```
+
+Session ids are now recorded next to the events, and a process that meets an id
+it did not create resumes it instead of rejecting it. Restarts, rolling deploys
+and non-sticky load balancing keep working; the credential bound to a session is
+still enforced, and a terminated session is never resumed.
+
+```bash
+mcp-persist sessions list                    # who is connected
+mcp-persist sessions terminate <session-id>  # cut one off, permanently
+```
+
+What it restores is the session's identity and its event history, which is what
+stream resumability means. It does not restore server-side state from a tool call
+that was mid-flight when the process died. Off by default; see
+**[docs/sessions.md](docs/sessions.md)**.
+
+## Seeing what is actually in there: `mcp-persist dashboard`
+
+```bash
+mcp-persist dashboard        # http://localhost:8765
+```
+
+One self-contained page, refreshing itself: totals and a health dot, every
+stream with its event counts and id range, the events of a stream you click
+(newest first, labelled by JSON-RPC method or result/error, click to expand the
+raw message), and the durable sessions. Payloads are shown decompressed and
+decrypted, because it reads through the same store your server uses.
+
+Read-only, no external assets, and no authentication, which is why it binds
+`127.0.0.1` and refuses a public address unless you insist. `--redact-payloads`
+drops message bodies for a shared screen. See
+**[docs/cli.md](docs/cli.md#mcp-persist-dashboard)**.
 
 ## Resumability without touching the server: `PersistenceProxy`
 
@@ -337,6 +382,7 @@ Full methodology, environment spec, percentiles, and analysis in
 | [docs/backends.md](docs/backends.md) | Manual wiring, per-backend config, write-behind commits, multi-tenant isolation, `create()` lifecycle |
 | [docs/cli.md](docs/cli.md) | `doctor`, `stats`, `purge` (incl. `--older-than`), `dump`/`load` & `migrate` full reference: sample output, `--json`, exit codes |
 | [docs/api.md](docs/api.md) | `subscribe`, `migrate`, `export_stream`/`import_stream`, metrics + OpenTelemetry + `DEBUG_PERSIST`, compression, batching, tiered storage, `PurgeScheduler`, env config, `ping`/`health` |
+| [docs/sessions.md](docs/sessions.md) | Durable sessions: surviving a restart or a non-sticky worker, the registry, credential enforcement, `mcp-persist sessions` |
 | [docs/encryption.md](docs/encryption.md) | AES-256-GCM encryption at rest: `KeyRing`, env config, key rotation, composition with compression, threat model |
 | [docs/multi-tenancy.md](docs/multi-tenancy.md) | Per-tenant isolation: binding `tenant_id`, scoped reads/purge/metrics, how each backend isolates |
 | [docs/tiered-storage.md](docs/tiered-storage.md) | Archiving expired events to cold storage: `ArchiveScheduler`, `ChainedEventStore`, resume across tiers |

@@ -34,6 +34,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import AbstractAsyncContextManager, contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 
 from mcp_persist.compression import validate_compression
@@ -794,6 +795,43 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     load.add_argument("path", nargs="?", help="dump file to read (defaults to stdin)")
     load.add_argument("--stream-id", help="restore into this stream instead of the one in the dump")
 
+    sessions = sub.add_parser("sessions", help="inspect and end durable sessions (durable_sessions=True)")
+    _store_flags(sessions)
+    sessions.add_argument(
+        "action",
+        choices=("list", "show", "terminate", "purge"),
+        help="list live sessions, show one, end one, or delete stale records",
+    )
+    sessions.add_argument("session_id", nargs="?", help="required by show and terminate")
+    sessions.add_argument("--limit", type=int, default=50, help="maximum sessions to list (default 50)")
+    sessions.add_argument(
+        "--all", action="store_true", dest="include_terminated", help="include terminated sessions in list"
+    )
+    sessions.add_argument(
+        "--older-than",
+        metavar="DURATION",
+        help="for purge: delete sessions not seen for this long, e.g. 30d / 12h / 3600s",
+    )
+
+    dash = sub.add_parser("dashboard", help="serve a local read-only web view of the store")
+    _store_flags(dash)
+    dash.add_argument("--port", type=int, default=8765, help="port to listen on (default 8765)")
+    dash.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="address to bind (default 127.0.0.1; the dashboard has no authentication)",
+    )
+    dash.add_argument(
+        "--unsafe-bind",
+        action="store_true",
+        help="allow binding a non-loopback address, exposing store contents to the network",
+    )
+    dash.add_argument(
+        "--redact-payloads",
+        action="store_true",
+        help="hide message bodies, showing only counts, ids and method names",
+    )
+
     migrate_p = sub.add_parser("migrate", help="copy events from one store to another")
     for side, label in (("from", "source"), ("to", "destination")):
         migrate_p.add_argument(f"--{side}-backend", choices=("sqlite", "redis", "postgres"), required=True)
@@ -1024,6 +1062,124 @@ def _run_migrate(args: argparse.Namespace) -> int:
     return 1 if result.failed_streams or result.skipped_events else 0
 
 
+async def _session_action(cfg: StoreConfig, args: argparse.Namespace) -> Any:
+    from mcp_persist.sessions import session_registry_for
+
+    with _quiet_package_log():
+        async with _build_store(cfg) as store:
+            registry = session_registry_for(store)
+            await registry.initialize()
+            if args.action == "list":
+                return await registry.list_sessions(include_terminated=args.include_terminated, limit=args.limit)
+            if args.action == "show":
+                return await registry.get(args.session_id)
+            if args.action == "terminate":
+                # Report whether there was anything to end, so a typo in the id
+                # is not indistinguishable from a session that really was ended.
+                existing = await registry.get(args.session_id)
+                if existing is None:
+                    return None
+                await registry.terminate(args.session_id)
+                return await registry.get(args.session_id)
+            return await registry.purge(older_than=parse_duration(args.older_than))
+
+
+def _run_sessions(args: argparse.Namespace) -> int:
+    if args.action in ("show", "terminate") and not args.session_id:
+        _die(f"sessions {args.action} requires a session id")
+    if args.action == "purge" and not args.older_than:
+        _die("sessions purge requires --older-than, e.g. --older-than 30d")
+    if args.action != "purge" and args.older_than:
+        _die("--older-than only applies to `sessions purge`")
+
+    try:
+        cfg = _resolve_config(args)
+        if args.action == "purge":
+            parse_duration(args.older_than)
+    except ValueError as exc:
+        _die(str(exc))
+
+    try:
+        result = asyncio.run(_session_action(cfg, args))
+    except TypeError as exc:
+        # session_registry_for() rejects a backend with no registry.
+        _die(str(exc))
+    except Exception as exc:
+        print(
+            f"mcp-persist: error: cannot read sessions from {cfg.backend} at {cfg.url}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.action == "purge":
+        print(json.dumps({"purged": result}) if args.json else f"purged {result} session record(s)")
+        return 0
+
+    if args.action == "list":
+        records = [r.as_dict() for r in result]
+        if args.json:
+            print(json.dumps({"sessions": records}, indent=2))
+        elif not records:
+            print("no sessions recorded (is durable_sessions enabled on the server?)")
+        else:
+            print(f"{'SESSION ID':<34} {'LAST SEEN (UTC)':<26} STATE")
+            for record in records:
+                seen = datetime.fromtimestamp(record["last_seen_at"], tz=timezone.utc).isoformat(timespec="seconds")
+                state = "terminated" if record["terminated"] else "live"
+                print(f"{record['session_id']:<34} {seen:<26} {state}")
+        return 0
+
+    # show / terminate
+    if result is None:
+        print(f"mcp-persist: error: no such session {args.session_id!r}", file=sys.stderr)
+        return 1
+    print(json.dumps(result.as_dict(), indent=2))
+    return 0
+
+
+def _is_loopback(host: str) -> bool:
+    import ipaddress
+
+    if host in ("localhost", ""):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # A hostname we cannot classify is treated as exposed, which is the
+        # safe direction for a page that has no authentication.
+        return False
+
+
+def _run_dashboard(args: argparse.Namespace) -> int:
+    try:
+        cfg = _resolve_config(args)
+    except ValueError as exc:
+        _die(str(exc))
+
+    if not _is_loopback(args.host) and not args.unsafe_bind:
+        _die(
+            f"refusing to bind {args.host}: the dashboard has no authentication and would expose "
+            "the store's contents, including message payloads, to anyone who can reach that "
+            "address. Pass --unsafe-bind if that is genuinely what you want, and consider "
+            "--redact-payloads."
+        )
+
+    try:
+        import uvicorn
+    except ImportError:  # pragma: no cover - uvicorn ships with mcp today
+        _die("the dashboard needs uvicorn: pip install uvicorn")
+
+    from mcp_persist.dashboard import create_dashboard
+
+    app = create_dashboard(cfg, redact_payloads=args.redact_payloads)
+    shown = "localhost" if args.host in ("127.0.0.1", "::1", "") else args.host
+    print(f"mcp-persist dashboard: http://{shown}:{args.port}  ({cfg.backend} at {cfg.url})")
+    if args.redact_payloads:
+        print("message payloads are redacted")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    return 0
+
+
 def main() -> None:
     args = _parse_args(sys.argv[1:])
     if args.command == "config":
@@ -1040,6 +1196,10 @@ def main() -> None:
         raise SystemExit(_run_load(args))
     if args.command == "migrate":
         raise SystemExit(_run_migrate(args))
+    if args.command == "sessions":
+        raise SystemExit(_run_sessions(args))
+    if args.command == "dashboard":
+        raise SystemExit(_run_dashboard(args))
     _die(f"unknown command {args.command!r}")  # pragma: no cover - argparse rejects first
 
 

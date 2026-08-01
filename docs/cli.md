@@ -11,6 +11,8 @@ keys intentionally remain environment-only and are never accepted as CLI flags.
 - [`mcp-persist doctor`](#mcp-persist-doctor): pass/fail health checklist
 - [`mcp-persist stats`](#mcp-persist-stats): per-stream event inventory
 - [`mcp-persist purge`](#mcp-persist-purge): force a purge of expired events
+- [`mcp-persist sessions`](#mcp-persist-sessions): list, inspect and end durable sessions
+- [`mcp-persist dashboard`](#mcp-persist-dashboard): local read-only web view of the store
 - [`mcp-persist migrate`](#mcp-persist-migrate): copy events between backends
 - [`mcp-persist-proxy --check`](#mcp-persist-proxy---check): upstream pre-flight probe
 
@@ -165,6 +167,45 @@ indefinitely by default. It shares the same efficient bulk and `--batch-size`
 `DELETE` paths as the ttl-based purge. Supported on the SQLite and Postgres
 backends; Redis expires keys natively and rejects the flag.
 
+## `mcp-persist sessions`
+
+`sessions` operates the durable session registry written when a server runs with
+`durable_sessions=True` (see [sessions.md](sessions.md)). It answers who is
+connected, and it is how a session gets cut off for good.
+
+```bash
+# Live sessions, most recently seen first:
+mcp-persist sessions list
+
+# Include terminated ones, and emit JSON for scripting:
+mcp-persist sessions list --all --json
+
+# Everything recorded about one session:
+mcp-persist sessions show 9f2c1e04c7b64a1e8d3f5a6b7c8d9e0f
+
+# End a session permanently: no worker will resume it again.
+mcp-persist sessions terminate 9f2c1e04c7b64a1e8d3f5a6b7c8d9e0f
+
+# Delete records for sessions not seen in 30 days (also 12h, 45m, 3600s, 2w):
+mcp-persist sessions purge --older-than 30d
+```
+
+```
+SESSION ID                         LAST SEEN (UTC)            STATE
+9f2c1e04c7b64a1e8d3f5a6b7c8d9e0f   2026-08-01T09:41:12+00:00  live
+1a7b3c5d9e2f4068b1c3d5e7f9a0b2c4   2026-08-01T09:12:55+00:00  live
+```
+
+`list` shows only live sessions unless `--all` is passed, and defaults to 50
+(`--limit`). `show` and `terminate` exit non-zero when the id does not exist, so
+a typo is distinguishable from a session that really was ended. `purge` requires
+`--older-than` rather than defaulting to a window, and counts from when the
+session was last seen.
+
+An empty `list` on a server you expect to be busy almost always means
+`durable_sessions` was never enabled; the command says so rather than printing
+nothing.
+
 ## `mcp-persist dump` and `mcp-persist load`
 
 `mcp-persist dump <stream>` exports a single stream's events to a portable,
@@ -196,6 +237,41 @@ front ends to `export_stream()` / `import_stream()` (see `docs/api.md`).
 Use `--tenant-id`, `--key-prefix`, `--max-stream-length`, or `--compression` to
 override the matching non-secret environment setting for one invocation. Keys
 continue to come from `MCP_PERSIST_ENCRYPTION_*`.
+
+## `mcp-persist dashboard`
+
+`stats` answers "how many events" and `dump` answers "what is in this one
+stream". `dashboard` is for the vaguer question you actually have when something
+is wrong: is anything arriving, and does it look right?
+
+```bash
+mcp-persist dashboard                  # http://localhost:8765
+mcp-persist dashboard --port 9000
+mcp-persist dashboard --redact-payloads
+```
+
+It serves one self-contained page that polls every two seconds: totals and a
+health dot, the streams with their event counts and id ranges, the events of a
+stream you click (newest first, labelled by JSON-RPC method or result/error,
+click one to expand the raw message), and the durable sessions with their state.
+The store is opened once for the life of the process, not per request.
+
+Everything is read through the same store the server uses, so payloads are shown
+decompressed and decrypted. There are no writes and no external assets: the CSS
+and JS are inline, so it works offline and there is no CDN to trust.
+
+**It has no authentication.** That is why it binds `127.0.0.1` and refuses a
+non-loopback address unless you pass `--unsafe-bind`; a hostname it cannot
+classify counts as exposed. Anyone who can reach the port can read every stored
+message. Prefer an SSH tunnel over `--unsafe-bind`:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 you@server   # then run the dashboard on the server
+```
+
+`--redact-payloads` drops message bodies server-side (not merely hides them in
+the page), keeping counts, event ids and method names. Use it when sharing a
+screen, or when the events carry data you would rather not render.
 
 ## `mcp-persist migrate`
 

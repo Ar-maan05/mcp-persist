@@ -27,6 +27,7 @@ Variables:
 ``MCP_PERSIST_ENCRYPTION_KEY_ID``   active key id when more than one key is listed (optional)
 ``MCP_PERSIST_BATCH_MAX_EVENTS``    batching wrapper flush size (optional integer)
 ``MCP_PERSIST_BATCH_MAX_LATENCY_MS`` batching wrapper flush latency (optional integer)
+``MCP_PERSIST_DURABLE_SESSIONS``    record session ids so they survive a restart (optional bool)
 
 ``MCP_PERSIST_URL`` maps to the first positional argument of each backend's
 :meth:`create` (``path`` for SQLite, ``url`` for Redis, ``dsn`` for Postgres), so
@@ -63,6 +64,25 @@ def _require(env: Mapping[str, str], name: str) -> str:
     if not value:
         raise ValueError(f"{name} is required to build an event store from the environment")
     return value
+
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSEY = frozenset({"0", "false", "no", "off", ""})
+
+
+def env_flag(name: str, env: Mapping[str, str] | None = None) -> bool:
+    """Read a boolean ``MCP_PERSIST_*`` flag, rejecting values that mean neither.
+
+    A typo like ``MCP_PERSIST_DURABLE_SESSIONS=ture`` silently reading as False
+    would disable the feature it was meant to turn on, so it raises instead.
+    """
+    target = os.environ if env is None else env
+    raw = (target.get(name) or "").strip().lower()
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSEY:
+        return False
+    raise ValueError(f"{name} must be one of {sorted(_TRUTHY)} or {sorted(_FALSEY - {''})}, got {target.get(name)!r}")
 
 
 def _optional_int(env: Mapping[str, str], name: str) -> int | None:

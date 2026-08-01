@@ -53,6 +53,15 @@ from mcp_persist.retention import (
     RetentionPolicy,
 )
 from mcp_persist.scheduler import ArchiveScheduler, PurgeScheduler, RetentionScheduler
+from mcp_persist.session_manager import ResumableSessionManager
+from mcp_persist.sessions import (
+    PostgresSessionRegistry,
+    RedisSessionRegistry,
+    SessionRecord,
+    SessionRegistry,
+    SQLiteSessionRegistry,
+    session_registry_for,
+)
 from mcp_persist.sqlite import SQLiteEventStore
 from mcp_persist.stored import StoredEvent, archive_expired_batch, count_expired
 from mcp_persist.tiered import ChainedEventStore
@@ -84,11 +93,17 @@ __all__ = [
     "NoOpMetricsCollector",
     "PersistenceProxy",
     "PostgresEventStore",
+    "PostgresSessionRegistry",
     "PurgeScheduler",
     "RedisEventStore",
+    "RedisSessionRegistry",
+    "ResumableSessionManager",
     "RetentionPolicy",
     "RetentionScheduler",
     "SQLiteEventStore",
+    "SQLiteSessionRegistry",
+    "SessionRecord",
+    "SessionRegistry",
     "StoredEvent",
     "__version__",
     "archive_expired_batch",
@@ -100,5 +115,6 @@ __all__ = [
     "keyring_from_env",
     "migrate",
     "retention_policy_from_env",
+    "session_registry_for",
     "with_persistence",
 ]

@@ -36,13 +36,14 @@ No new dependencies: ``starlette`` and the session manager ship with ``mcp``.
 from __future__ import annotations
 
 import contextlib
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
-from mcp_persist.config import build_store_context, event_store_from_env
+from mcp_persist.config import build_store_context, env_flag, event_store_from_env
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -72,6 +73,8 @@ def with_persistence(
     batch_max_events: int | None = None,
     batch_max_latency_ms: float | None = None,
     session_idle_timeout: float | None = None,
+    durable_sessions: bool | None = None,
+    session_table_name: str | None = None,
     mcp_path: str = "/mcp",
 ) -> Starlette:
     """Return a Starlette ASGI app serving ``mcp`` with SSE resumability.
@@ -109,8 +112,21 @@ def with_persistence(
         max_stream_length: Redis per-stream cap.
         session_idle_timeout: Optional idle timeout in seconds for stateful
             sessions, forwarded to ``StreamableHTTPSessionManager``.
+        durable_sessions: Record session ids in the store alongside the events,
+            and resume a session this process did not create instead of
+            answering 404. This is what makes resumability survive a restart or
+            a worker without sticky routing; see
+            :mod:`mcp_persist.session_manager`. Left unset it reads
+            ``MCP_PERSIST_DURABLE_SESSIONS`` and otherwise defaults to False,
+            which keeps the upstream behaviour exactly.
+        session_table_name: Table for the session registry on the SQL backends
+            (default ``"mcp_sessions"``). Requires ``durable_sessions=True``.
         mcp_path: Mount path for the MCP endpoint (default ``"/mcp"``).
     """
+    if durable_sessions is None:
+        durable_sessions = env_flag("MCP_PERSIST_DURABLE_SESSIONS")
+    if session_table_name is not None and not durable_sessions:
+        raise ValueError("with_persistence: session_table_name requires durable_sessions=True")
     ctx, owned_store = _resolve_store(
         store,
         backend=backend,
@@ -126,6 +142,7 @@ def with_persistence(
         batch_max_events=batch_max_events,
         batch_max_latency_ms=batch_max_latency_ms,
     )
+    opts = _SessionOptions(durable=durable_sessions, table_name=session_table_name)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -134,14 +151,20 @@ def with_persistence(
         # was passed in (Pattern B), ctx is None and we leave it untouched.
         if ctx is not None:
             async with ctx as resolved_store:
-                async with _run_manager(app, mcp, resolved_store, session_idle_timeout):
+                async with _run_manager(app, mcp, resolved_store, session_idle_timeout, opts):
                     yield
         else:
             assert owned_store is not None
-            async with _run_manager(app, mcp, owned_store, session_idle_timeout):
+            async with _run_manager(app, mcp, owned_store, session_idle_timeout, opts):
                 yield
 
     return Starlette(lifespan=lifespan, routes=[Mount(mcp_path, app=_handle_mcp)])
+
+
+@dataclass(frozen=True)
+class _SessionOptions:
+    durable: bool
+    table_name: str | None
 
 
 @contextlib.asynccontextmanager
@@ -150,6 +173,7 @@ async def _run_manager(
     mcp: MCPServer,
     store: EventStore,
     session_idle_timeout: float | None,
+    sessions: _SessionOptions,
 ) -> AsyncIterator[None]:
     """Run a session manager bound to ``store`` and publish it on ``app.state``.
 
@@ -157,14 +181,28 @@ async def _run_manager(
     rather than closing over the manager, because the manager must be built
     inside the lifespan once the store is open. ``app.state.event_store`` is
     exposed too so callers can reach the live store (e.g. to run a
-    :class:`~mcp_persist.PurgeScheduler` alongside the server).
+    :class:`~mcp_persist.PurgeScheduler` alongside the server), and
+    ``app.state.session_registry`` when durable sessions are on.
     """
     kwargs: dict[str, Any] = {}
     if session_idle_timeout is not None:
         kwargs["session_idle_timeout"] = session_idle_timeout
-    manager = StreamableHTTPSessionManager(app=mcp._lowlevel_server, event_store=store, **kwargs)
+
+    manager: StreamableHTTPSessionManager
+    registry = None
+    if sessions.durable:
+        from mcp_persist.session_manager import ResumableSessionManager
+        from mcp_persist.sessions import DEFAULT_SESSION_TABLE, session_registry_for
+
+        registry = session_registry_for(store, table_name=sessions.table_name or DEFAULT_SESSION_TABLE)
+        await registry.initialize()
+        manager = ResumableSessionManager(app=mcp._lowlevel_server, event_store=store, registry=registry, **kwargs)
+    else:
+        manager = StreamableHTTPSessionManager(app=mcp._lowlevel_server, event_store=store, **kwargs)
+
     app.state.session_manager = manager
     app.state.event_store = store
+    app.state.session_registry = registry
     async with manager.run():
         yield
 
