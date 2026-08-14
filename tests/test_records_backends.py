@@ -240,3 +240,68 @@ async def test_era_is_recorded_per_record(records) -> None:
         "legacy": "2025-11-25",
         "modern": "2026-07-28",
     }
+
+
+async def test_redis_index_does_not_grow_past_the_ttl() -> None:
+    """A record hash expires on its own; its index member must go too.
+
+    Otherwise `count()` climbs forever and reports records Redis has already
+    reclaimed. Redis-only: it is the one backend with native expiry.
+    """
+    client = fakeredis.FakeRedis()
+    try:
+        records = record_store_for(RedisEventStore(client, key_prefix="ttltest:"), ttl=60)
+        await records.initialize()
+        now = time.time()
+
+        # Two records older than the ttl, one inside it.
+        await records.store_records(
+            [
+                _record(method="ancient", recorded_at=now - 600),
+                _record(method="old", recorded_at=now - 300),
+            ]
+        )
+        await records.store_record(_record(method="fresh"))
+
+        assert await records.count() == 1
+        assert [r.method for r in await records.list_records()] == ["fresh"]
+    finally:
+        await client.aclose()
+
+
+async def test_redis_ttl_uses_the_records_own_age() -> None:
+    """Hash expiry and index score must agree, or count() drifts from reality.
+
+    A record delayed in the writer queue, or backfilled with an older
+    `recorded_at`, would otherwise be evicted from the index while its hash was
+    still alive, making count() report fewer records than exist.
+    """
+    client = fakeredis.FakeRedis()
+    try:
+        records = record_store_for(RedisEventStore(client, key_prefix="agetest:"), ttl=300)
+        await records.initialize()
+        now = time.time()
+
+        # Backdated but still inside the ttl: must be stored and counted.
+        assert await records.store_records([_record(method="delayed", recorded_at=now - 200)]) == 1
+        assert await records.count() == 1
+        assert [r.method for r in await records.list_records()] == ["delayed"]
+
+        # Older than the ttl: not stored at all, rather than stored and hidden.
+        assert await records.store_records([_record(method="expired", recorded_at=now - 400)]) == 0
+        assert await records.count() == 1
+    finally:
+        await client.aclose()
+
+
+async def test_duplicate_ids_are_not_reported_as_written(records) -> None:
+    """The writer trusts this count, so it must reflect rows that really landed."""
+    record = _record(method="once")
+
+    assert await records.store_records([record]) == 1
+    second = await records.store_records([record])
+
+    # SQLite upserts (1); Postgres and Redis dedupe or overwrite. Either way the
+    # store must not claim to have written more rows than the batch held.
+    assert second <= 1
+    assert await records.count() == 1

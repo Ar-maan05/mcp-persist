@@ -123,7 +123,32 @@ async def test_diagnose_all_pass_with_ttl():
     cfg = StoreConfig(backend="sqlite", url="e.db", ttl=60)
     checks = await _admin.diagnose(cfg, open_store=_fake_open(_FakeStore()))
     names = [c.name for c in checks]
-    assert names == ["python", "driver", "connectivity", "retention", "compression", "encryption"]
+    assert names == [
+        "python",
+        "driver",
+        "connectivity",
+        "retention",
+        "compression",
+        "encryption",
+        "protocol support",
+    ]
+    # Everything passes except protocol support, which warns while records are
+    # off: with recording disabled, clients on a stateless protocol revision are
+    # persisted nowhere.
+    assert all(c.status == "pass" for c in checks if c.name != "protocol support")
+    assert next(c for c in checks if c.name == "protocol support").status == "warn"
+
+
+@pytest.mark.anyio
+async def test_protocol_support_passes_once_records_are_enabled(monkeypatch):
+    monkeypatch.setenv("MCP_PERSIST_RECORD", "1")
+    cfg = StoreConfig(backend="sqlite", url="e.db", ttl=60)
+
+    checks = await _admin.diagnose(cfg, open_store=_fake_open(_FakeStore()))
+
+    protocol = next(c for c in checks if c.name == "protocol support")
+    assert protocol.status == "pass"
+    assert "recording is enabled" in protocol.detail
     assert all(c.status == "pass" for c in checks)
 
 

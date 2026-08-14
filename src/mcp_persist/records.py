@@ -290,6 +290,13 @@ def _resolve_path(source: Mapping[str, Any], name: str) -> tuple[Any, bool]:
     return current, True
 
 
+PLAINTEXT_PAYLOAD_ERROR = (
+    "payload capture is configured but no keyring is available, so params would be written in "
+    "plaintext; pass a keyring= (see docs/encryption.md), turn capture off, or pass "
+    "allow_plaintext=True to accept plaintext records"
+)
+
+
 def require_payload_encryption(store: Any, policy: PayloadPolicy, *, allow_plaintext: bool = False) -> None:
     """Refuse to capture payloads into a store that cannot encrypt them.
 
@@ -305,11 +312,7 @@ def require_payload_encryption(store: Any, policy: PayloadPolicy, *, allow_plain
     if policy.is_off or allow_plaintext:
         return
     if getattr(_unwrap(store), "_keyring", None) is None:
-        raise ValueError(
-            "payload capture is configured but the store has no keyring, so params would be "
-            "written in plaintext; pass a keyring= to the store (see docs/encryption.md), "
-            "turn capture off, or pass allow_plaintext=True to accept plaintext records"
-        )
+        raise ValueError(PLAINTEXT_PAYLOAD_ERROR)
 
 
 class RecordStore(ABC):
@@ -399,13 +402,23 @@ class SQLiteRecordStore(_SQLRecordStore):
         self._table = f'"{table_name}"'
         self._index = f'"{table_name}_recorded_at_idx"'
 
+    @property
+    def _tenant_key(self) -> str:
+        """ "" for "no tenant".
+
+        SQLite treats NULLs as distinct in a PRIMARY KEY, so a NULL tenant would
+        let two rows share a record_id and silently defeat the upsert. Matches
+        what the Postgres store already does for the same reason.
+        """
+        return self._tenant_id or ""
+
     async def initialize(self) -> None:
         if self._ready:
             return
         await self._conn.execute(
             f"CREATE TABLE IF NOT EXISTS {self._table} ("
             "  record_id TEXT NOT NULL,"
-            "  tenant_id TEXT,"
+            "  tenant_id TEXT NOT NULL DEFAULT '',"
             "  recorded_at REAL NOT NULL,"
             "  protocol_version TEXT NOT NULL,"
             "  method TEXT NOT NULL,"
@@ -430,7 +443,7 @@ class SQLiteRecordStore(_SQLRecordStore):
     def _row(self, record: Record) -> tuple[Any, ...]:
         return (
             record.record_id,
-            self._tenant_id,
+            self._tenant_key,
             record.recorded_at,
             record.protocol_version,
             record.method,
@@ -476,8 +489,8 @@ class SQLiteRecordStore(_SQLRecordStore):
         since: float | None = None,
     ) -> list[Record]:
         await self.initialize()
-        query = f"SELECT {_COLUMNS} FROM {self._table} WHERE tenant_id IS ?"
-        params: list[Any] = [self._tenant_id]
+        query = f"SELECT {_COLUMNS} FROM {self._table} WHERE tenant_id = ?"
+        params: list[Any] = [self._tenant_key]
         if method is not None:
             query += " AND method = ?"
             params.append(method)
@@ -496,7 +509,7 @@ class SQLiteRecordStore(_SQLRecordStore):
     async def count(self) -> int:
         await self.initialize()
         async with self._conn.execute(
-            f"SELECT COUNT(*) FROM {self._table} WHERE tenant_id IS ?", (self._tenant_id,)
+            f"SELECT COUNT(*) FROM {self._table} WHERE tenant_id = ?", (self._tenant_key,)
         ) as cursor:
             row = await cursor.fetchone()
         return int(row[0]) if row else 0
@@ -505,8 +518,8 @@ class SQLiteRecordStore(_SQLRecordStore):
         await self.initialize()
         cutoff = time.time() - older_than
         cursor = await self._conn.execute(
-            f"DELETE FROM {self._table} WHERE recorded_at < ? AND tenant_id IS ?",
-            (cutoff, self._tenant_id),
+            f"DELETE FROM {self._table} WHERE recorded_at < ? AND tenant_id = ?",
+            (cutoff, self._tenant_key),
         )
         await self._conn.commit()
         return int(cursor.rowcount or 0)
@@ -600,26 +613,57 @@ class PostgresRecordStore(_SQLRecordStore):
             record.payload_truncated,
         )
 
+    _COLUMN_TYPES = (
+        "text[]",  # record_id
+        "text[]",  # tenant_id
+        "double precision[]",  # recorded_at
+        "text[]",  # protocol_version
+        "text[]",  # method
+        "text[]",  # kind
+        "text[]",  # outcome
+        "text[]",  # carrier
+        "double precision[]",  # duration_ms
+        "text[]",  # request_id
+        "text[]",  # tool_name
+        "integer[]",  # error_code
+        "text[]",  # payload
+        "boolean[]",  # payload_truncated
+    )
+
     @property
     def _insert_sql(self) -> str:
+        """Insert a whole batch from parallel arrays, one statement.
+
+        ``unnest`` keeps the batch a single round trip while still letting
+        ``RETURNING`` report how many rows actually landed, which
+        ``executemany`` cannot do.
+        """
+        unnest = ", ".join(f"${i + 1}::{t}" for i, t in enumerate(self._COLUMN_TYPES))
         return (
             f"INSERT INTO {self._table} ("
             "  record_id, tenant_id, recorded_at, protocol_version, method, kind, outcome,"
             "  carrier, duration_ms, request_id, tool_name, error_code, payload, payload_truncated"
-            ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) "
+            f") SELECT * FROM unnest({unnest}) "
             "ON CONFLICT (record_id, tenant_id) DO NOTHING"
         )
 
     async def store_record(self, record: Record) -> None:
-        await self.initialize()
-        await self._pool.execute(self._insert_sql, *self._row(record))
+        await self.store_records([record])
 
     async def store_records(self, records: Sequence[Record]) -> int:
         if not records:
             return 0
         await self.initialize()
-        await self._pool.executemany(self._insert_sql, [self._row(r) for r in records])
-        return len(records)
+        # `executemany` reports nothing, and `ON CONFLICT DO NOTHING` means the
+        # row count can be lower than the batch (a duplicate id, or a retry of a
+        # batch that partly landed). `RETURNING` makes the real count available,
+        # so the writer's `written` figure is measured rather than assumed.
+        rows = await self._pool.fetch(f"{self._insert_sql} RETURNING 1", *self._columns(records))
+        return len(rows)
+
+    def _columns(self, records: Sequence[Record]) -> tuple[list[Any], ...]:
+        """Transpose rows into one array per column, for the unnest insert."""
+        return tuple(list(values) for values in zip(*(self._row(r) for r in records), strict=True))
 
     async def list_records(
         self,
@@ -735,15 +779,36 @@ class RedisRecordStore(RecordStore):
     async def store_records(self, records: Sequence[Record]) -> int:
         if not records:
             return 0
+        now = time.time()
+        written = 0
+        remaining = 0.0
         async with self._redis.pipeline(transaction=False) as pipe:
             for record in records:
+                if self._ttl is not None:
+                    # Expire the hash by the record's own age, not by when it
+                    # happened to be written. The index is scored by
+                    # `recorded_at`, so keying the ttl to anything else lets the
+                    # two disagree: a record delayed in the queue past its ttl,
+                    # or backfilled with an older `recorded_at`, would be evicted
+                    # from the index while its hash stayed live, and `count()`
+                    # would then undercount what is really there.
+                    remaining = self._ttl - (now - record.recorded_at)
+                    if remaining <= 0:
+                        continue  # already older than the ttl; storing it would be a lie
                 key = self._key(record.record_id)
                 pipe.hset(key, mapping=self._mapping(record))
                 if self._ttl is not None:
-                    pipe.expire(key, self._ttl)
+                    pipe.expire(key, max(1, int(remaining)))
                 pipe.zadd(self._index_key, {record.record_id: record.recorded_at})
+                written += 1
             await pipe.execute()
-        return len(records)
+        if self._ttl is not None:
+            # A hash expires on its own, but its index member does not, so the
+            # index would otherwise grow without bound and `count()` would keep
+            # rising forever. Both sides now key off `recorded_at`, so evicting
+            # by score matches what Redis has already reclaimed.
+            await self._redis.zremrangebyscore(self._index_key, "-inf", now - self._ttl)
+        return written
 
     async def _get(self, record_id: str) -> Record | None:
         raw = await self._redis.hgetall(self._key(record_id))
@@ -811,6 +876,10 @@ class RedisRecordStore(RecordStore):
         return out
 
     async def count(self) -> int:
+        # Evict expired members first, or the count would include records whose
+        # hashes Redis has already reclaimed.
+        if self._ttl is not None:
+            await self._redis.zremrangebyscore(self._index_key, "-inf", time.time() - self._ttl)
         return int(await self._redis.zcard(self._index_key))
 
     async def purge(self, *, older_than: float) -> int:

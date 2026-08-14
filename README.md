@@ -124,6 +124,45 @@ stream resumability means. It does not restore server-side state from a tool cal
 that was mid-flight when the process died. Off by default; see
 **[docs/sessions.md](docs/sessions.md)**.
 
+## Every protocol version: `record=True`
+
+Events and durable sessions apply to clients on a handshake-era protocol
+revision. From `2026-07-28` the SDK routes each request to a stateless
+single-exchange handler: no `initialize` handshake, no `Mcp-Session-Id`, one
+request in and one response out. That path never reaches your event store, so
+there is nothing to replay and no session to persist.
+
+A **record** is the half that still works. It is a small durable note of one
+handled message, written on every protocol revision, so a single store keeps
+telling you what happened while a deployment migrates across revisions.
+
+```python
+app = with_persistence(mcp, backend="sqlite", url="events.db", record=True)
+```
+
+| | handshake era (`2024-11-05` … `2025-11-25`) | `2026-07-28` and later |
+|---|---|---|
+| Durable event store | yes | no, never consulted |
+| SSE replay / resumability | yes | not possible: no event id on the wire |
+| Durable sessions | yes | not applicable: no session id exists |
+| **Durable records** | **yes** | **yes** |
+
+Records carry the method, the protocol version that handled it, the outcome
+(including `cancelled` when a client disconnects), the duration, and the tool
+name. Params are **not** captured unless you name them in an allowlist, and a
+record has no free-text error field at all, so a validation message or exception
+string can never leak into the store.
+
+Writing happens off the request path: a bounded queue with a background writer,
+so a slow record backend costs a request nothing. The trade is that a full queue
+drops records, which is always counted and never silent, through
+`app.state.record_flusher.stats()` or a `record_metrics=` collector.
+
+Off by default. With an event store configured, the first request on a stateless
+protocol version logs one warning so the boundary is discoverable, and
+`mcp-persist doctor` reports it as a `protocol support` check. Full detail in
+**[docs/records.md](docs/records.md)**.
+
 ## Seeing what is actually in there: `mcp-persist dashboard`
 
 ```bash
@@ -324,6 +363,7 @@ Full API and examples in **[docs/api.md](docs/api.md)**.
       ...
   ```
 - **`BatchingEventStore`**: buffer writes for high-throughput Redis/Postgres deployments, flushing on a size or latency ceiling while still returning event IDs synchronously. See [docs/api.md](docs/api.md).
+- **Records**: a durable note of every handled message, written on **every** protocol version including the stateless `2026-07-28` transport where the event store is bypassed. Allowlist-only param capture, no free-text error field, and writing happens off the request path. See [docs/records.md](docs/records.md).
 - **Tiered storage**: archive expired events into cold storage instead of deleting them (`ArchiveScheduler`), and resume across both tiers (`ChainedEventStore`). See [docs/tiered-storage.md](docs/tiered-storage.md).
 - **Event stream forking**: branch an existing stream at any point and replay from that branch with different inputs or models (preserving the original branch intact), turning the linear log into a tree for systematic A/B evaluation. See [docs/api.md](docs/api.md#event-stream-forking).
 - **Metrics**: pass a `metrics=` collector (a `Protocol`, the built-in `LoggingMetricsCollector`, or `OTelMetricsCollector` for OpenTelemetry) to emit to Prometheus/Datadog/etc.; zero overhead when unused. The proxy adds an optional `on_proxy_replay` hook for reconnect/replay rates and blocked cross-session attempts.
@@ -383,6 +423,7 @@ Full methodology, environment spec, percentiles, and analysis in
 | [docs/cli.md](docs/cli.md) | `doctor`, `stats`, `purge` (incl. `--older-than`), `dump`/`load` & `migrate` full reference: sample output, `--json`, exit codes |
 | [docs/api.md](docs/api.md) | `subscribe`, `migrate`, `export_stream`/`import_stream`, metrics + OpenTelemetry + `DEBUG_PERSIST`, compression, batching, tiered storage, `PurgeScheduler`, env config, `ping`/`health` |
 | [docs/sessions.md](docs/sessions.md) | Durable sessions: surviving a restart or a non-sticky worker, the registry, credential enforcement, `mcp-persist sessions` |
+| [docs/records.md](docs/records.md) | Records: persistence on every protocol version, the support matrix, `PayloadPolicy`, outcomes, drop accounting |
 | [docs/encryption.md](docs/encryption.md) | AES-256-GCM encryption at rest: `KeyRing`, env config, key rotation, composition with compression, threat model |
 | [docs/multi-tenancy.md](docs/multi-tenancy.md) | Per-tenant isolation: binding `tenant_id`, scoped reads/purge/metrics, how each backend isolates |
 | [docs/tiered-storage.md](docs/tiered-storage.md) | Archiving expired events to cold storage: `ArchiveScheduler`, `ChainedEventStore`, resume across tiers |

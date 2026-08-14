@@ -389,6 +389,39 @@ def _check_encryption(env: Mapping[str, str] | None = None) -> Check:
     return Check("encryption", "pass", f"encryption enabled (active key id {active_id!r})")
 
 
+def _check_protocol_support(env: Mapping[str, str] | None = None) -> Check:
+    """Report which protocol revisions this deployment's persistence applies to.
+
+    The single most confusing thing about running this library today: the SDK
+    routes any non-handshake protocol version to a stateless single-exchange
+    transport that never reaches the event store, so SSE replay and durable
+    sessions quietly do not apply to those clients. Nothing is broken, but an
+    operator who does not know it will go looking for events that were never
+    going to be written. Records cover every revision and close that gap, so the
+    check reports whether they are on.
+    """
+    from mcp_persist.config import env_flag
+    from mcp_persist.middleware import protocol_support
+
+    handshake_versions, modern_versions = protocol_support()
+    handshake = ", ".join(handshake_versions)
+    modern = ", ".join(modern_versions)
+    if env_flag("MCP_PERSIST_RECORD", env):
+        return Check(
+            "protocol support",
+            "pass",
+            f"events and durable sessions apply to {handshake}; {modern} is stateless and bypasses "
+            "the event store, but recording is enabled so those requests are still captured",
+        )
+    return Check(
+        "protocol support",
+        "warn",
+        f"events and durable sessions apply to {handshake} only; {modern} is a stateless "
+        "single-exchange transport that never reaches the event store, so nothing is persisted for "
+        "clients on it. Enable records (record=True or MCP_PERSIST_RECORD=1) to capture every revision",
+    )
+
+
 async def diagnose(
     cfg: StoreConfig,
     *,
@@ -413,6 +446,7 @@ async def diagnose(
     checks.extend(_check_retention(cfg))
     checks.append(_check_compression(cfg))
     checks.append(_check_encryption())
+    checks.append(_check_protocol_support())
     return checks
 
 
