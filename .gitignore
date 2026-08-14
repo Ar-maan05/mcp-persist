@@ -23,3 +23,6 @@ venv/
 
 # uv lockfile
 uv.lock
+
+# Internal planning docs (not published)
+ROADMAP-2x-internal.md
