@@ -66,7 +66,11 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+# Pinned below 1.32: hatchling 1.32 declares Metadata-Version 2.5 by default,
+# and twine (6.2.0) monkeypatches packaging's accepted list to stop at 2.4, so
+# `twine check` and `twine upload` reject the build. This project uses none of
+# the 2.5 only fields, so the emitted metadata is otherwise byte identical.
+requires = ["hatchling<1.32"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
