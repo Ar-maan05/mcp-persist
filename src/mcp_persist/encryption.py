@@ -32,7 +32,19 @@ reasons:
 
 AES-GCM is authenticated, so a payload tampered with by something with direct
 write access to the store fails decryption (``InvalidTag``) instead of decrypting
-to silently wrong bytes. Because GCM ciphertext is not length-expanding and the
+to silently wrong bytes. Authenticating the bytes is not enough on its own,
+though: a valid ciphertext copied from one row into another would still decrypt
+cleanly, handing one stream (or one tenant sharing the key) another's messages.
+So a payload is also bound to where it is stored. Events carry their stream id
+and records their record id as GCM associated data, written with the
+``ea:<key_id>:`` marker, and a copy moved anywhere else fails authentication
+like any other tamper. Payloads written before this (``en:``) carry no binding
+and stay readable; they age out through ttl/retention as usual.
+
+A reader older than 2.1.1 does not know the ``ea:`` marker. For a rolling
+upgrade across that boundary, set ``bind_context=False`` (or
+``MCP_PERSIST_ENCRYPTION_BIND_CONTEXT=0``) until every reader is upgraded, then
+turn it back on. Because GCM ciphertext is not length-expanding and the
 inner :func:`~mcp_persist.compression.decompress_payload` still enforces its
 decompression-bomb cap, layering encryption over compression adds no new
 unbounded-allocation surface.
@@ -54,6 +66,10 @@ if TYPE_CHECKING:
 # Marker prefixing an encrypted payload. See the module docstring for why this
 # can never collide with a real (plaintext) payload.
 _ENC_PREFIX = "en:"
+
+# Marker for a payload encrypted with its storage location as GCM associated
+# data. Same shape as _ENC_PREFIX; decrypting it requires that same context.
+_BOUND_PREFIX = "ea:"
 
 # AES-GCM standard nonce length. A fresh random nonce is generated per write; at
 # 96 bits the chance of a collision under a single key is negligible for the event
@@ -77,9 +93,9 @@ class KeyRing:
     environment. :func:`generate_key` produces a fresh base64 key for either.
     """
 
-    __slots__ = ("_keys", "_active_key_id")
+    __slots__ = ("_keys", "_active_key_id", "bind_context")
 
-    def __init__(self, keys: dict[str, bytes], active_key_id: str) -> None:
+    def __init__(self, keys: dict[str, bytes], active_key_id: str, *, bind_context: bool = True) -> None:
         if not keys:
             raise ValueError("KeyRing requires at least one key")
         for key_id, raw in keys.items():
@@ -93,6 +109,9 @@ class KeyRing:
             raise ValueError(f"active_key_id {active_key_id!r} is not one of the supplied keys {sorted(keys)}")
         self._keys = dict(keys)
         self._active_key_id = active_key_id
+        # Whether new writes are bound to where they are stored (see the module
+        # docstring). Reads accept both forms either way.
+        self.bind_context = bind_context
 
     @property
     def active_key_id(self) -> str:
@@ -141,13 +160,25 @@ def _decode_key(value: str, *, key_id: str) -> bytes:
     return raw
 
 
-def encrypt_payload(payload: str, *, keyring: KeyRing | None) -> str:
+def event_context(stream_id: str) -> str:
+    """The associated data binding an event payload to its stream."""
+    return f"event\x00{stream_id}"
+
+
+def record_context(record_id: str) -> str:
+    """The associated data binding a record payload to its record."""
+    return f"record\x00{record_id}"
+
+
+def encrypt_payload(payload: str, *, keyring: KeyRing | None, context: str | None = None) -> str:
     """Encrypt an (already-compressed) payload, or pass it through unchanged.
 
     Returns ``payload`` untouched when ``keyring`` is ``None`` or ``payload`` is the
     empty string (priming events carry no body and stay trivially recognizable).
-    Otherwise returns ``en:<key_id>:<base64(nonce + ciphertext)>`` under the
-    keyring's active key. Unlike compression there is no size threshold:
+    Otherwise returns ``ea:<key_id>:<base64(nonce + ciphertext)>`` with
+    ``context`` (see :func:`event_context`) authenticated as associated data, or
+    the unbound ``en:`` form when no context is given or the keyring has
+    ``bind_context`` off. Unlike compression there is no size threshold:
     confidentiality is all-or-nothing.
     """
     if keyring is None or not payload:
@@ -155,23 +186,30 @@ def encrypt_payload(payload: str, *, keyring: KeyRing | None) -> str:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     key_id, key = keyring.active()
+    bound = context is not None and keyring.bind_context
     nonce = os.urandom(_NONCE_BYTES)
-    ciphertext = AESGCM(key).encrypt(nonce, payload.encode("utf-8"), None)
+    aad = context.encode("utf-8") if bound and context is not None else None
+    ciphertext = AESGCM(key).encrypt(nonce, payload.encode("utf-8"), aad)
     encoded = base64.b64encode(nonce + ciphertext).decode("ascii")
-    return f"{_ENC_PREFIX}{key_id}:{encoded}"
+    return f"{_BOUND_PREFIX if bound else _ENC_PREFIX}{key_id}:{encoded}"
 
 
-def decrypt_payload(stored: str, *, keyring: KeyRing | None) -> str:
+def decrypt_payload(stored: str, *, keyring: KeyRing | None, context: str | None = None) -> str:
     """Inverse of :func:`encrypt_payload`; non-encrypted payloads pass through.
 
-    Decoding is driven entirely by the :data:`_ENC_PREFIX` marker, so this is safe
-    to call on any stored payload. An encrypted payload encountered without a
-    keyring (or without the key that wrote it) raises ``ValueError`` rather than
-    returning ciphertext: the store fails closed instead of feeding garbage to JSON
-    validation. A tampered payload fails GCM authentication and also raises.
+    Decoding is driven entirely by the marker, so this is safe to call on any
+    stored payload. An encrypted payload encountered without a keyring (or without
+    the key that wrote it) raises ``ValueError`` rather than returning ciphertext:
+    the store fails closed instead of feeding garbage to JSON validation. A
+    tampered payload fails GCM authentication and also raises, and so does a bound
+    (``ea:``) payload read with any ``context`` other than the one it was written
+    with, which is what a payload copied to another row looks like.
     """
-    if not stored.startswith(_ENC_PREFIX):
+    bound = stored.startswith(_BOUND_PREFIX)
+    if not bound and not stored.startswith(_ENC_PREFIX):
         return stored
+    if bound and context is None:
+        raise ValueError("encrypted payload is bound to its storage location, but no context was supplied to check it")
     if keyring is None:
         raise ValueError(
             "encountered an encrypted payload (en: marker) but no encryption keyring is configured; "
@@ -179,14 +217,15 @@ def decrypt_payload(stored: str, *, keyring: KeyRing | None) -> str:
         )
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-    body = stored[len(_ENC_PREFIX) :]
+    body = stored[len(_ENC_PREFIX) :]  # both markers are the same length
     key_id, sep, b64 = body.partition(":")
     if not sep:
         raise ValueError("malformed encrypted payload: missing key id")
     key = keyring.get(key_id)
     blob = base64.b64decode(b64)
     nonce, ciphertext = blob[:_NONCE_BYTES], blob[_NONCE_BYTES:]
-    plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
+    aad = context.encode("utf-8") if bound and context is not None else None
+    plaintext = AESGCM(key).decrypt(nonce, ciphertext, aad)
     return plaintext.decode("utf-8")
 
 
@@ -201,6 +240,9 @@ def keyring_from_env(env: Mapping[str, str] | None = None) -> KeyRing | None:
       rotate keys.
     * ``MCP_PERSIST_ENCRYPTION_KEY`` ``"<b64>"``, a single key bound to the id
       ``"default"``. A convenience for the common single-key deployment.
+
+    ``MCP_PERSIST_ENCRYPTION_BIND_CONTEXT`` (default on) sets the keyring's
+    ``bind_context``; turn it off only for a rolling upgrade from before 2.1.1.
 
     Returns ``None`` when none of these is set, so encryption stays opt-in. Raises
     ``ValueError`` for a malformed key, a missing/ambiguous active id, or both
@@ -220,9 +262,10 @@ def keyring_from_env(env: Mapping[str, str] | None = None) -> KeyRing | None:
             "(rotation list), not both"
         )
 
+    bind_context = _bind_context_from_env(source)
     if key_raw is not None:
         key_id = active_id or "default"
-        return KeyRing({key_id: _decode_key(key_raw, key_id=key_id)}, active_key_id=key_id)
+        return KeyRing({key_id: _decode_key(key_raw, key_id=key_id)}, active_key_id=key_id, bind_context=bind_context)
 
     keys: dict[str, bytes] = {}
     assert keys_raw is not None
@@ -245,4 +288,13 @@ def keyring_from_env(env: Mapping[str, str] | None = None) -> KeyRing | None:
                 "to pick the one new writes use"
             )
         active_id = next(iter(keys))
-    return KeyRing(keys, active_key_id=active_id)
+    return KeyRing(keys, active_key_id=active_id, bind_context=bind_context)
+
+
+def _bind_context_from_env(source: Mapping[str, str]) -> bool:
+    raw = (source.get("MCP_PERSIST_ENCRYPTION_BIND_CONTEXT") or "").strip().lower()
+    if raw in ("", "1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"MCP_PERSIST_ENCRYPTION_BIND_CONTEXT must be a boolean, got {raw!r}")

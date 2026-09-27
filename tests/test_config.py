@@ -117,7 +117,7 @@ async def test_from_env_sqlite_compression_is_applied():
 @pytest.mark.anyio
 async def test_from_env_sqlite_encryption_roundtrips():
     from mcp_persist import generate_key
-    from mcp_persist.encryption import _ENC_PREFIX
+    from mcp_persist.encryption import _BOUND_PREFIX
 
     env = {
         "MCP_PERSIST_BACKEND": "sqlite",
@@ -133,7 +133,7 @@ async def test_from_env_sqlite_encryption_roundtrips():
             (int(eid),),
         ) as cur:
             raw = (await cur.fetchone())[0]
-        assert raw.startswith(_ENC_PREFIX)
+        assert raw.startswith(_BOUND_PREFIX)
 
 
 def test_from_env_redis_applies_tenant_and_compression(monkeypatch):

@@ -269,6 +269,18 @@ message. Prefer an SSH tunnel over `--unsafe-bind`:
 ssh -L 8765:127.0.0.1:8765 you@server   # then run the dashboard on the server
 ```
 
+Binding to loopback does not stop a web page you have open from reaching it: a
+page can re-point its own hostname at `127.0.0.1` (DNS rebinding) and read the
+API as if it were same-origin. So the dashboard also refuses any request whose
+`Host` header is not `localhost`, `127.0.0.1` or `[::1]`, plus the address it is
+bound to. Reaching it by another name (a tunnel alias, an internal DNS name)
+needs `--allowed-host NAME`, which can be repeated. With `--unsafe-bind` on a
+wildcard address (`0.0.0.0`, `::`) and no `--allowed-host`, any `Host` is
+accepted, since the names the machine answers to cannot be known in advance.
+
+The overview shows the store URL with any password masked, as every command
+does.
+
 `--redact-payloads` drops message bodies server-side (not merely hides them in
 the page), keeping counts, event ids and method names. Use it when sharing a
 screen, or when the events carry data you would rather not render.

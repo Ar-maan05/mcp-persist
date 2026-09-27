@@ -188,3 +188,47 @@ def test_dashboard_refuses_a_public_bind(monkeypatch: pytest.MonkeyPatch, tmp_pa
     with pytest.raises(SystemExit) as excinfo:
         main()
     assert excinfo.value.code == 2
+
+
+async def test_requests_naming_a_foreign_host_are_refused(tmp_path: Path) -> None:
+    # Bound to loopback, but a page on attacker.example that re-points its own
+    # name at 127.0.0.1 (DNS rebinding) reaches the API as same-origin; the
+    # Host header is what still names the attacker's domain.
+    async with _dashboard(tmp_path) as base, httpx.AsyncClient(timeout=15.0) as client:
+        port = base.rsplit(":", 1)[1]
+        refused = await client.get(base + "/api/streams/stream-a/events", headers={"host": "attacker.example"})
+        assert refused.status_code == 400
+        for host in (f"localhost:{port}", f"127.0.0.1:{port}", f"[::1]:{port}"):
+            response = await client.get(base + "/api/overview", headers={"host": host})
+            assert response.status_code == 200, host
+
+
+async def test_allowed_hosts_extend_the_host_check(tmp_path: Path) -> None:
+    db = str(tmp_path / "events.db")
+    await _seed(db)
+    app = create_dashboard(StoreConfig(backend="sqlite", url=db), allowed_hosts=["dash.internal"])
+    async with _serve(app) as base, httpx.AsyncClient(timeout=15.0) as client:
+        assert (await client.get(base + "/api/overview", headers={"host": "dash.internal:80"})).status_code == 200
+        assert (await client.get(base + "/api/overview", headers={"host": "localhost"})).status_code == 400
+
+
+async def test_overview_never_shows_the_dsn_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mcp_persist._admin as admin
+    from mcp_persist.dashboard import _snapshot
+
+    async def fake_stats(*_args: object, **_kwargs: object) -> admin.StatsReport:
+        return admin.StatsReport("postgres", [], 0, 0, None, 0.0)
+
+    monkeypatch.setattr(admin, "gather_stats", fake_stats)
+    cfg = StoreConfig(backend="postgres", url="postgresql://app:s3cret@db.internal/mcp")
+    snapshot = await _snapshot(cfg, object())
+    assert snapshot["url"] == "postgresql://app:***@db.internal/mcp"
+
+
+async def test_events_truncated_only_when_more_than_the_limit(tmp_path: Path) -> None:
+    async with _dashboard(tmp_path) as base, httpx.AsyncClient(timeout=15.0) as client:
+        exact = (await client.get(base + "/api/streams/stream-a/events?limit=2")).json()
+        clipped = (await client.get(base + "/api/streams/stream-a/events?limit=1")).json()
+    assert exact["truncated"] is False and len(exact["events"]) == 2
+    assert clipped["truncated"] is True
+    assert [e["payload"]["label"] for e in clipped["events"]] == ["result"]  # the newest one

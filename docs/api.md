@@ -197,7 +197,9 @@ reconnecting client never misses a buffered event.
 
 Flushes are serialized. If a backend fails partway through a flush, successfully
 written events are left alone and the failed event plus the untouched tail stay
-queued in event-ID order. Background flushes log the failure and retry after the
+queued in event-ID order. That backlog is bounded by `max_pending` (default
+`10000`, or `flush_max_events` if larger): once it is full, `store_event` raises
+instead of accepting writes the backend cannot take. Background flushes log the failure and retry after the
 latency window. An explicit `flush()`, size-triggered flush, replay-triggered
 flush, or `aclose()` still propagates the backend error so callers can react.
 After `aclose()` begins, new writes are rejected. Each flush uses one Redis
@@ -308,6 +310,7 @@ plus optional:
 | `MCP_PERSIST_ENCRYPTION_KEY` | all | single base64 AES-256 encryption key |
 | `MCP_PERSIST_ENCRYPTION_KEYS` | all | rotation list in `id:base64,id:base64` form |
 | `MCP_PERSIST_ENCRYPTION_KEY_ID` | all | active key ID for a rotation list |
+| `MCP_PERSIST_ENCRYPTION_BIND_CONTEXT` | all | bind payloads to their stream/record (default on; see [encryption.md](encryption.md)) |
 | `MCP_PERSIST_BATCH_MAX_EVENTS` | redis, postgres | wrap in `BatchingEventStore` with this flush size |
 | `MCP_PERSIST_BATCH_MAX_LATENCY_MS` | redis, postgres | batching flush latency ceiling |
 

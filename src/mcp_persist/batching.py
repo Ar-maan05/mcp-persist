@@ -53,6 +53,12 @@ class BatchingEventStore(EventStore):
         inner:                 The wrapped event store.
         flush_max_events:      Flush when this many events are buffered (default 64).
         flush_max_latency_ms:  Flush after this many milliseconds (default 50).
+        max_pending:           Refuse new writes once this many are waiting to be
+                               flushed (default: 10000, or flush_max_events if that
+                               is larger). Only reachable while flushes
+                               keep failing: the backlog is retained for retry, and
+                               without a bound it would grow for as long as the
+                               backend is down while every write appeared to succeed.
         metrics:               Optional metrics collector.
     """
 
@@ -62,12 +68,17 @@ class BatchingEventStore(EventStore):
         *,
         flush_max_events: int = 64,
         flush_max_latency_ms: float = 50.0,
+        max_pending: int | None = None,
         metrics: MetricsCollector | None = None,
     ) -> None:
         if flush_max_events < 1:
             raise ValueError(f"flush_max_events must be a positive integer, got {flush_max_events!r}")
         if flush_max_latency_ms <= 0:
             raise ValueError(f"flush_max_latency_ms must be positive, got {flush_max_latency_ms!r}")
+        if max_pending is None:
+            max_pending = max(10_000, flush_max_events)
+        if max_pending < flush_max_events:
+            raise ValueError(f"max_pending must be at least flush_max_events ({flush_max_events}), got {max_pending!r}")
         if not callable(getattr(inner, "_allocate_event_ids", None)):
             raise TypeError(
                 f"{type(inner).__name__} does not support batched ID pre-allocation. BatchingEventStore "
@@ -79,6 +90,7 @@ class BatchingEventStore(EventStore):
         self._inner = inner
         self._flush_max_events = flush_max_events
         self._flush_max_latency_ms = flush_max_latency_ms
+        self._max_pending = max_pending
         self._metrics: MetricsCollector = metrics if metrics is not None else NoOpMetricsCollector()
         self._pending: list[_PendingWrite] = []
         self._id_block: deque[EventId] = deque()
@@ -108,6 +120,11 @@ class BatchingEventStore(EventStore):
         async with self._lock:
             if self._closed:
                 raise RuntimeError("BatchingEventStore is closed")
+            if len(self._pending) >= self._max_pending:
+                raise RuntimeError(
+                    f"BatchingEventStore has {len(self._pending)} unflushed events and is refusing more: "
+                    "flushes to the backend are failing (see the logged flush errors)"
+                )
             if not self._id_block:
                 self._id_block.extend(
                     await self._inner._allocate_event_ids(self._flush_max_events)  # type: ignore[attr-defined]

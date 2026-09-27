@@ -10,6 +10,7 @@ rejection test for the unsupported SQLite backend.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import aiosqlite
 import fakeredis.aioredis as fakeredis
@@ -196,3 +197,35 @@ async def test_sqlite_is_rejected():
             BatchingEventStore(store)
     finally:
         await conn.close()
+
+
+@pytest.mark.anyio
+async def test_backlog_is_bounded_while_flushes_fail(redis_store, monkeypatch):
+    # A failed flush keeps its batch for retry. With the backend down, every
+    # later write used to be accepted into that backlog without limit.
+    batching = BatchingEventStore(redis_store, flush_max_events=2, flush_max_latency_ms=10_000, max_pending=4)
+
+    async def down(events):
+        raise ConnectionError("backend down")
+
+    monkeypatch.setattr(redis_store, "_store_events_with_ids", down)
+    for _ in range(4):
+        with contextlib.suppress(ConnectionError):
+            await batching.store_event("s", SAMPLE_MSG)
+    assert len(batching._pending) == 4
+    with pytest.raises(RuntimeError, match="unflushed"):
+        await batching.store_event("s", SAMPLE_MSG)
+    assert len(batching._pending) == 4
+
+    monkeypatch.undo()
+    await batching.flush()
+    assert batching._pending == []
+    await batching.store_event("s", SAMPLE_MSG)
+    await batching.aclose()
+
+
+@pytest.mark.anyio
+async def test_max_pending_must_hold_a_full_batch(redis_store):
+    with pytest.raises(ValueError, match="max_pending"):
+        BatchingEventStore(redis_store, flush_max_events=10, max_pending=5)
+    assert BatchingEventStore(redis_store, flush_max_events=20_000)._max_pending == 20_000

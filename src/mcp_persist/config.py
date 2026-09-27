@@ -25,6 +25,7 @@ Variables:
 ``MCP_PERSIST_ENCRYPTION_KEY``      single base64 AES-256 key for encryption at rest (optional)
 ``MCP_PERSIST_ENCRYPTION_KEYS``     ``id:b64,id:b64`` key list for rotation (optional)
 ``MCP_PERSIST_ENCRYPTION_KEY_ID``   active key id when more than one key is listed (optional)
+``MCP_PERSIST_ENCRYPTION_BIND_CONTEXT`` bind payloads to their stream/record (optional bool, default on)
 ``MCP_PERSIST_BATCH_MAX_EVENTS``    batching wrapper flush size (optional integer)
 ``MCP_PERSIST_BATCH_MAX_LATENCY_MS`` batching wrapper flush latency (optional integer)
 ``MCP_PERSIST_DURABLE_SESSIONS``    record session ids so they survive a restart (optional bool)

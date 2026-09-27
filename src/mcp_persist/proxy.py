@@ -37,6 +37,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from contextlib import asynccontextmanager
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 # mcp 2.0 moved from httpx to httpx2, which is API-compatible for everything
 # used here. Aliased so the call sites below read as ordinary httpx usage.
@@ -257,12 +258,9 @@ class PersistenceProxy:
         )
         response = await self._client.send(request, stream=True)
 
-        if "text/event-stream" not in response.headers.get("content-type", "").lower():
+        if not _is_event_stream(response):
             # Plain JSON (or error) response: forward verbatim, store nothing.
-            try:
-                await _forward_response(response, send, cors=self._cors)
-            finally:
-                await response.aclose()
+            await self._forward_and_close(response, send)
             return
 
         # SSE response: intercept. Prefer the session id the upstream assigned
@@ -272,6 +270,7 @@ class PersistenceProxy:
         stream_id = f"{session_id}:{stream_key}"
 
         buf = StreamBuffer(stream_id, self._store, maxlen=self._buffer_maxlen, metrics=self._metrics)
+        buf.credentials = _credentials(scope)
         self._register_buffer(stream_id, buf)
         buf.start(response)  # the buffer now owns the response; do not aclose it here
 
@@ -281,58 +280,92 @@ class PersistenceProxy:
     # ── GET ──────────────────────────────────────────────────────────────────
 
     async def _handle_get(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Nothing stored is served until the upstream has accepted this request.
+        # The proxy holds no credentials of its own: it is the upstream that
+        # decides whether a session id and a credential belong together, so the
+        # store is only read on the far side of that decision.
         session_id = _header(scope, b"mcp-session-id") or uuid.uuid4().hex
         last_event_id = _header(scope, b"last-event-id")
         get_stream_id = f"{session_id}:{GET_STREAM_KEY}"
+        credentials = _credentials(scope)
         live = self._buffers.get(get_stream_id)
+        if live is not None and live.done:
+            live = None
 
-        if last_event_id is not None:
-            if live is not None and not live.done:
-                # Live GET stream: replay the gap from the store, then continue live.
-                gen = live.consume_from(after=last_event_id)
+        if live is not None and live.credentials != credentials:
+            # A credential other than the one the upstream accepted when this
+            # stream opened. Ask the upstream before sharing the stream with it:
+            # it can refuse outright, or answer 409 because the session's one
+            # standalone GET stream is already open, which it only reaches once
+            # the session and the credential have both been accepted.
+            response = await self._send_upstream_get(scope)
+            if response.status_code == 409:
+                await response.aclose()
+            elif _is_event_stream(response):
+                live = self._start_get_buffer(get_stream_id, credentials, response)
             else:
-                # No live GET buffer: replay from the store (the event id resolves
-                # its owning stream — a completed POST stream or an expired GET
-                # buffer), then resume notifications from a fresh upstream GET.
-                gen = self._replay_then_resume_get(session_id, last_event_id, scope)
+                await self._forward_and_close(response, send)
+                return
+
+        if live is not None:
+            # Reuse the live buffer instead of opening a second upstream GET (the
+            # SDK allows only one standalone GET stream per session). With a
+            # Last-Event-ID it replays the gap from the store, then continues live.
+            gen = live.consume_from(after=last_event_id)
         else:
-            if live is not None and not live.done:
-                # Reuse the live buffer instead of opening a second upstream GET
-                # (the SDK allows only one standalone GET stream per session).
-                gen = live.consume_from(after=None)
+            response = await self._send_upstream_get(scope)
+            if not _is_event_stream(response):
+                await self._forward_and_close(response, send)
+                return
+            buf = self._start_get_buffer(get_stream_id, credentials, response)
+            if last_event_id is None:
+                gen = buf.consume_from(after=None)
             else:
-                gen = self._fresh_get(session_id, scope)
+                # The event id resolves its owning stream (a completed POST stream
+                # or an expired GET buffer): replay that, then continue live.
+                gen = self._replay_then_live(buf, session_id, last_event_id)
 
         await _send_sse_start(send, session_id, cors=self._cors)
         await _stream_to_client(gen, receive, send)
 
-    async def _fresh_get(self, session_id: str, scope: Scope) -> AsyncGenerator[tuple[EventId, str], None]:
-        buf = await self._open_get_buffer(session_id, scope)
-        async for item in buf.consume_from(after=None):
-            yield item
-
-    async def _replay_then_resume_get(
-        self, session_id: str, last_event_id: EventId, scope: Scope
+    async def _replay_then_live(
+        self, buf: StreamBuffer, session_id: str, last_event_id: EventId
     ) -> AsyncGenerator[tuple[EventId, str], None]:
         # Replay is gated on session ownership (see _store_replay): a Last-Event-ID
-        # pointing at another session's stream replays nothing, but we still open a
-        # fresh GET so the client resumes live notifications for its own session.
+        # pointing at another session's stream replays nothing, but the client
+        # still resumes live notifications for its own session.
+        replayed_up_to: int | None = None
         async for item in _store_replay(self._store, last_event_id, session_id=session_id, metrics=self._metrics):
+            replayed_up_to = int(item[0])
             yield item
-        buf = await self._open_get_buffer(session_id, scope)
+        # The fresh upstream GET was opened before the replay, and it stores its
+        # events under the same stream id an expired GET buffer used, so events
+        # it received meanwhile may already have gone out in the replay.
         async for item in buf.consume_from(after=None):
+            if replayed_up_to is not None and int(item[0]) <= replayed_up_to:
+                continue
             yield item
 
-    async def _open_get_buffer(self, session_id: str, scope: Scope) -> StreamBuffer:
-        get_stream_id = f"{session_id}:{GET_STREAM_KEY}"
+    async def _send_upstream_get(self, scope: Scope) -> httpx.Response:
         request = self._client.build_request(
             "GET", self._upstream_url, headers=_forward_headers(scope["headers"], strip={"last-event-id"})
         )
-        response = await self._client.send(request, stream=True)  # the buffer owns this response
+        return await self._client.send(request, stream=True)
+
+    def _start_get_buffer(
+        self, get_stream_id: str, credentials: tuple[str | None, ...], response: httpx.Response
+    ) -> StreamBuffer:
         buf = StreamBuffer(get_stream_id, self._store, maxlen=self._buffer_maxlen, metrics=self._metrics)
+        buf.credentials = credentials
         self._register_buffer(get_stream_id, buf)
-        buf.start(response)
+        buf.start(response)  # the buffer now owns the response
         return buf
+
+    async def _forward_and_close(self, response: httpx.Response, send: Send) -> None:
+        try:
+            await _forward_response(response, send, cors=self._cors)
+        finally:
+            await response.aclose()
 
     # ── passthrough (non-MCP paths, DELETE, etc.) ─────────────────────────────
 
@@ -342,7 +375,7 @@ class PersistenceProxy:
         except _RequestBodyTooLarge as exc:
             await _send_413(send, exc.limit, cors=self._cors)
             return
-        url = self._upstream_base + scope["path"]
+        url = self._upstream_base + _upstream_path(scope)
         if scope.get("query_string"):
             url += "?" + scope["query_string"].decode("latin-1")
         request = self._client.build_request(
@@ -470,6 +503,35 @@ def _header(scope: Scope, name: bytes) -> str | None:
         if key == name:
             return value.decode("latin-1")
     return None
+
+
+def _credentials(scope: Scope) -> tuple[str | None, ...]:
+    """The request headers that carry a credential, for comparing two requests.
+
+    A live stream is shared with a later request only when these match the ones
+    the upstream accepted when the stream opened; anything else goes back to the
+    upstream to be judged.
+    """
+    return (_header(scope, b"authorization"), _header(scope, b"cookie"))
+
+
+def _is_event_stream(response: httpx.Response) -> bool:
+    """Whether the upstream accepted the request and answered with an SSE stream."""
+    return response.is_success and "text/event-stream" in response.headers.get("content-type", "").lower()
+
+
+def _upstream_path(scope: Scope) -> str:
+    """The request path as the client sent it, percent-encoding intact.
+
+    ``scope["path"]`` is already decoded, so re-sending it would turn an encoded
+    ``%3F`` into the start of a query string and ``%2F`` into a separator. The
+    ASGI ``raw_path`` is the original bytes; fall back to re-encoding the decoded
+    path for a server that does not provide it.
+    """
+    raw = scope.get("raw_path")
+    if raw:
+        return raw.decode("latin-1")
+    return quote(scope["path"], safe="/:@!$&'()*+,;=-._~")
 
 
 def _forward_headers(

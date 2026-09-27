@@ -48,7 +48,7 @@ from pydantic import TypeAdapter
 
 from mcp_persist._debug import debug_log, default_metrics_collector
 from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
-from mcp_persist.encryption import decrypt_payload, encrypt_payload
+from mcp_persist.encryption import decrypt_payload, encrypt_payload, event_context
 from mcp_persist.health import HealthReport, probe_health
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 from mcp_persist.stored import StoredEvent
@@ -398,7 +398,7 @@ class SQLiteEventStore(EventStore):
 
     # EventStore interface
 
-    def _encode_payload(self, payload: str) -> str:
+    def _encode_payload(self, payload: str, context: str | None = None) -> str:
         """Compress then encrypt a payload for storage (the order matters).
 
         Compression runs first so the codec sees plaintext (ciphertext does not
@@ -406,11 +406,16 @@ class SQLiteEventStore(EventStore):
         (priming events) through untouched.
         """
         payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
-        return encrypt_payload(payload, keyring=self._keyring)
+        return encrypt_payload(payload, keyring=self._keyring, context=context)
 
-    def _decode_payload(self, stored: str) -> str:
-        """Inverse of :meth:`_encode_payload`: decrypt then decompress."""
-        return decompress_payload(decrypt_payload(stored, keyring=self._keyring))
+    def _decode_payload(self, stored: str, context: str | None = None) -> str:
+        """Inverse of :meth:`_encode_payload`: decrypt then decompress.
+
+        ``context`` names where the payload is stored (see
+        :func:`~mcp_persist.encryption.event_context`); a bound payload only
+        decrypts under the context it was written with.
+        """
+        return decompress_payload(decrypt_payload(stored, keyring=self._keyring, context=context))
 
     async def store_event(
         self,
@@ -441,7 +446,7 @@ class SQLiteEventStore(EventStore):
             payload = ""
         else:
             payload = message.model_dump_json(by_alias=True, exclude_none=True)
-            payload = self._encode_payload(payload)
+            payload = self._encode_payload(payload, event_context(stream_id))
 
         cols = "(stream_id, payload, created_at"
         vals = "(?, ?, ?"
@@ -657,7 +662,9 @@ class SQLiteEventStore(EventStore):
                     if not payload:
                         continue
                     try:
-                        message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload))
+                        message = jsonrpc_message_adapter.validate_json(
+                            self._decode_payload(payload, event_context(stream))
+                        )
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "Skipping event %s on stream %s during replay: failed JSONRPC validation/decompression: %s",
@@ -677,6 +684,8 @@ class SQLiteEventStore(EventStore):
         new_stream_id: StreamId,
     ) -> None:
         """Branch a session at a specific event ID."""
+        if new_stream_id == parent_stream_id:
+            raise ValueError(f"cannot fork stream {parent_stream_id!r} into itself")
         if not self._initialized:
             await self.initialize()
         await self._conn.execute(
@@ -692,8 +701,18 @@ class SQLiteEventStore(EventStore):
         segments = []
         current_stream = stream_id
         max_id = None
+        visited: set[StreamId] = set()
 
         while True:
+            if current_stream in visited:
+                # A fork chain that loops back on itself (a stream forked from its
+                # own descendant) has no root; stop rather than walk it forever.
+                logger.warning(
+                    "Fork chain of stream %s loops back to %s; ignoring the cycle", stream_id, current_stream
+                )
+                segments.append((current_stream, None, max_id))
+                break
+            visited.add(current_stream)
             async with self._conn.execute(
                 f"SELECT parent_stream_id, fork_event_id FROM {self._forks_table} WHERE child_stream_id = ?",
                 (current_stream,),
@@ -1060,7 +1079,9 @@ class SQLiteEventStore(EventStore):
                         continue
 
                     try:
-                        message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload))
+                        message = jsonrpc_message_adapter.validate_json(
+                            self._decode_payload(payload, event_context(stream))
+                        )
                     except Exception as exc:  # noqa: BLE001
                         self.unreadable_events += 1
                         logger.warning(
@@ -1103,19 +1124,24 @@ class SQLiteEventStore(EventStore):
         if not self._initialized:
             await self.initialize()
 
+        # A tenant-bound store sees only its own rows, here as everywhere else:
+        # two tenants may well use the same stream id.
+        tenant_sql, tenant_params = self._tenant_filter_sql()
+
         # Seed from the current newest event so the subscription is forward-only,
         # even on an empty stream (where MAX returns NULL -> start from 0).
         async with self._conn.execute(
-            f"SELECT MAX(event_id) FROM {self._table} WHERE stream_id = ?",
-            (stream_id,),
+            f"SELECT MAX(event_id) FROM {self._table} WHERE stream_id = ?{tenant_sql}",
+            (stream_id, *tenant_params),
         ) as cursor:
             row = await cursor.fetchone()
         last_seen = row[0] if row is not None and row[0] is not None else 0
 
         while True:
             async with self._conn.execute(
-                f"SELECT event_id, payload FROM {self._table} WHERE stream_id = ? AND event_id > ? ORDER BY event_id",
-                (stream_id, last_seen),
+                f"SELECT event_id, payload FROM {self._table} "
+                f"WHERE stream_id = ?{tenant_sql} AND event_id > ? ORDER BY event_id",
+                (stream_id, *tenant_params, last_seen),
             ) as cursor:
                 rows = await cursor.fetchall()
 
@@ -1126,7 +1152,9 @@ class SQLiteEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload))
+                    message = jsonrpc_message_adapter.validate_json(
+                        self._decode_payload(payload, event_context(stream_id))
+                    )
                 except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
                     logger.warning(
                         "Skipping event %s on stream %s during subscribe: failed JSONRPC validation/decompression: %s",

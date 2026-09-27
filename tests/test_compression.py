@@ -96,7 +96,7 @@ def test_decompression_bomb_rejected():
     reason="zstd extra not installed",
 )
 def test_zstd_decompression_bomb_rejected():
-    # The zstd read path enforces the same cap via decompress(max_output_size=...);
+    # The zstd read path enforces the same cap through a bounded stream reader;
     # a frame that inflates past it must be refused, not materialized.
     import zstandard
 
@@ -104,6 +104,44 @@ def test_zstd_decompression_bomb_rejected():
     stored = "zs:" + base64.b64encode(zstandard.ZstdCompressor().compress(bomb)).decode("ascii")
     with pytest.raises(ValueError, match="decompression bomb"):
         decompress_payload(stored)
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("zstandard") is None,
+    reason="zstd extra not installed",
+)
+def test_zstd_bomb_is_refused_before_allocating_its_declared_size(tmp_path):
+    # A frame whose header declares its content size made one-shot decompress()
+    # allocate that size up front, ignoring max_output_size: 1 GiB for a ~32 KB
+    # payload, with the cap only checked afterwards. Measured in a fresh process
+    # so the peak RSS belongs to the decompression alone.
+    import subprocess
+    import sys
+
+    import zstandard
+
+    declared = 1 << 30
+    compressor = zstandard.ZstdCompressor().compressobj(size=declared)
+    frame = b"".join(compressor.compress(b"\x00" * (1 << 24)) for _ in range(declared >> 24)) + compressor.flush()
+    bomb = tmp_path / "bomb.txt"
+    bomb.write_text("zs:" + base64.b64encode(frame).decode("ascii"))
+
+    probe = (
+        "import resource, sys\n"
+        "from mcp_persist.compression import decompress_payload\n"
+        "stored = open(sys.argv[1]).read()\n"
+        "before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
+        "try:\n"
+        "    decompress_payload(stored)\n"
+        "except ValueError as exc:\n"
+        "    assert 'decompression bomb' in str(exc)\n"
+        "else:\n"
+        "    raise SystemExit('bomb was not refused')\n"
+        "print((resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before) // 1024)\n"
+    )
+    result = subprocess.run([sys.executable, "-c", probe, str(bomb)], capture_output=True, text=True, check=True)
+    growth_mib = int(result.stdout.strip())
+    assert growth_mib < 512, f"decompression grew RSS by {growth_mib} MiB"
 
 
 def test_payload_at_cap_still_decompresses():

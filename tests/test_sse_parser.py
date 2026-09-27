@@ -204,7 +204,26 @@ def test_lone_trailing_cr_not_emitted_early() -> None:
     # we know whether an "\n" follows.
     parser = SSEParser()
     assert parser.feed("data: x\r") == []
-    assert parser._buf == "data: x\r"  # held back intact
+    # Held back intact: the "\r" and a following "\n" form one terminator,
+    # so a single blank line (not two) dispatches the frame.
+    assert parser.feed("\n\r\n") == [SSEFrame(data="x", event=None, original_id=None)]
+
+
+def test_large_line_split_into_small_chunks_parses_in_linear_time() -> None:
+    # One multi-megabyte data line arriving in small network reads used to be
+    # re-scanned from the start on every chunk, quadratic in the line length:
+    # a 4 MiB tool result took ~40s of synchronous CPU on the proxy's loop.
+    import time
+
+    body = "x" * (4 * 1024 * 1024)
+    wire = f"id: 1\r\nevent: message\r\ndata: {body}\r\n\r\n"
+    parser = SSEParser()
+    frames: list[SSEFrame] = []
+    started = time.perf_counter()
+    for pos in range(0, len(wire), 8192):
+        frames += parser.feed(wire[pos : pos + 8192])
+    assert time.perf_counter() - started < 2.0
+    assert frames == [SSEFrame(data=body, event="message", original_id="1")]
 
 
 # --- flush() / end-of-stream ----------------------------------------------

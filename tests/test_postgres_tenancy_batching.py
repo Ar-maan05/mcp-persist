@@ -94,3 +94,68 @@ async def test_batching_preallocates_and_persists(pg_pool):
     _, captured = await _replay(inner, first)
     assert len(captured) == 3
     await batching.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("table_name", ["review_schema.test_tenancy_events", "TestTenancyEvents"])
+async def test_batching_allocates_from_the_tables_own_sequence(pg_pool, table_name):
+    # A schema-qualified or mixed-case table used to resolve its sequence by the
+    # bare, unquoted name: the schema-qualified one drew ids from public's table
+    # of the same name, so batched writes collided with (and ON CONFLICT
+    # overwrote) rows written through the table's own identity column.
+    await pg_pool.execute("DROP SCHEMA IF EXISTS review_schema CASCADE")
+    await pg_pool.execute('DROP TABLE IF EXISTS "TestTenancyEvents", "TestTenancyEvents_forks"')
+    await pg_pool.execute("CREATE SCHEMA review_schema")
+    try:
+        # Advance public's same-named table so a wrong lookup is observable.
+        public = PostgresEventStore(pg_pool, table_name=TABLE, ttl=3600)
+        await public.initialize()
+        for _ in range(5):
+            await public.store_event("public", SAMPLE_MSG)
+
+        store = PostgresEventStore(pg_pool, table_name=table_name, ttl=3600)
+        await store.initialize()
+        batching = BatchingEventStore(store, flush_max_events=2, flush_max_latency_ms=10_000)
+        batched = [await batching.store_event("batched", SAMPLE_MSG) for _ in range(2)]
+        await batching.flush()
+        direct = [await store.store_event("direct", SAMPLE_MSG) for _ in range(3)]
+
+        ids = [int(i) for i in batched + direct]
+        assert len(set(ids)) == len(ids)
+        assert ids == sorted(ids)
+        _, captured = await _replay(store, direct[0])
+        assert [e.event_id for e in captured] == direct[1:]
+        await batching.aclose()
+    finally:
+        await pg_pool.execute("DROP SCHEMA IF EXISTS review_schema CASCADE")
+        await pg_pool.execute('DROP TABLE IF EXISTS "TestTenancyEvents", "TestTenancyEvents_forks"')
+        await pg_pool.execute(f"DROP TABLE IF EXISTS {TABLE}_forks")
+
+
+@pytest.mark.anyio
+async def test_subscribe_is_scoped_to_the_stores_tenant(pg_pool):
+    # The NOTIFY channel is derived from the stream id alone and the payload was
+    # then fetched by event id alone, so a tenant received another tenant's
+    # events on a shared stream id.
+    import asyncio
+
+    acme = PostgresEventStore(pg_pool, table_name=TABLE, tenant_id="acme", ttl=None, enable_streaming=True)
+    globex = PostgresEventStore(pg_pool, table_name=TABLE, tenant_id="globex", ttl=None, enable_streaming=True)
+    await acme.initialize()
+    await globex.initialize()
+
+    received: list[str] = []
+
+    async def consume() -> None:
+        async for event_id, _message in globex.subscribe("shared"):
+            received.append(event_id)
+            return
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0.3)
+    await acme.store_event("shared", SAMPLE_MSG)
+    await asyncio.sleep(0.3)
+    assert received == []
+    mine = await globex.store_event("shared", SAMPLE_MSG)
+    await asyncio.wait_for(task, 5)
+    assert received == [mine]

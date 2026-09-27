@@ -29,6 +29,7 @@ import asyncio
 import importlib.util
 import json
 import logging
+import os
 import sys
 import time
 from collections.abc import Callable, Iterator
@@ -111,8 +112,6 @@ def _resolve_config(args: argparse.Namespace) -> StoreConfig:
     the application. Raises ``ValueError`` with an actionable message for invalid
     configuration.
     """
-    import os
-
     env = os.environ
     backend = (args.backend or env.get(f"{_PREFIX}BACKEND") or "").strip().lower()
     if not backend:
@@ -165,8 +164,6 @@ def _resolve_migrate_side(args: argparse.Namespace, side: str) -> StoreConfig:
     alongside the destination's new one, with ``MCP_PERSIST_ENCRYPTION_KEY_ID``
     selecting which is written.
     """
-    import os
-
     env = os.environ
 
     def flag(name: str) -> Any:
@@ -298,7 +295,7 @@ async def _check_connectivity(
                 await store.ping()  # type: ignore[attr-defined]
                 version = await _server_version(store, cfg.backend)
     except Exception as exc:
-        return Check("connectivity", "fail", f"cannot reach {cfg.backend} at {cfg.url}: {exc}")
+        return Check("connectivity", "fail", f"cannot reach {cfg.backend} at {redact_url(cfg.url)}: {exc}")
     suffix = f" ({version})" if version else ""
     return Check("connectivity", "pass", f"connected to {cfg.backend}{suffix}")
 
@@ -458,7 +455,7 @@ _GLYPH = {"pass": "[ ok ]", "warn": "[warn]", "fail": "[fail]"}
 
 def _render(cfg: StoreConfig, checks: list[Check]) -> str:
     width = max(len(c.name) for c in checks)
-    lines = [f"mcp-persist doctor: {cfg.backend} ({cfg.url})", ""]
+    lines = [f"mcp-persist doctor: {cfg.backend} ({redact_url(cfg.url)})", ""]
     lines += [f"{_GLYPH[c.status]} {c.name.ljust(width)}  {c.detail}" for c in checks]
 
     fails = sum(c.status == "fail" for c in checks)
@@ -477,7 +474,7 @@ def _render_json(cfg: StoreConfig, checks: list[Check]) -> str:
     return json.dumps(
         {
             "backend": cfg.backend,
-            "url": cfg.url,
+            "url": redact_url(cfg.url),
             "ok": not any(c.status == "fail" for c in checks),
             "checks": [{"name": c.name, "status": c.status, "detail": c.detail} for c in checks],
         }
@@ -619,7 +616,7 @@ def _fmt_id(value: int | None) -> str:
 
 
 def _render_stats(cfg: StoreConfig, report: StatsReport) -> str:
-    lines = [f"mcp-persist stats: {cfg.backend} ({cfg.url})", ""]
+    lines = [f"mcp-persist stats: {cfg.backend} ({redact_url(cfg.url)})", ""]
     if report.streams:
         headers = ("stream", "events", "min", "max")
         rows = [(s.stream_id, str(s.events), _fmt_id(s.min_event_id), _fmt_id(s.max_event_id)) for s in report.streams]
@@ -647,7 +644,7 @@ def _render_stats_json(cfg: StoreConfig, report: StatsReport) -> str:
     return json.dumps(
         {
             "backend": cfg.backend,
-            "url": cfg.url,
+            "url": redact_url(cfg.url),
             "total_streams": report.total_streams,
             "total_events": report.total_events,
             "last_event_id": report.last_event_id,
@@ -677,13 +674,22 @@ def redact_url(url: str) -> str:
     DSN with no password) is returned unchanged.
     """
     scheme, sep, rest = url.partition("://")
-    if not sep or "@" not in rest:
+    if not sep:
         return url
-    userinfo, _, hostpart = rest.rpartition("@")
-    user, colon, _password = userinfo.partition(":")
-    if not colon:
-        return url
-    return f"{scheme}://{user}:***@{hostpart}"
+    rest, qmark, query = rest.partition("?")
+    if query:
+        # libpq-style URIs also accept the password as a query parameter.
+        query = "&".join(
+            f"{name}=***" if name.lower() == "password" else part
+            for part in query.split("&")
+            for name in [part.partition("=")[0]]
+        )
+    if "@" in rest:
+        userinfo, _, hostpart = rest.rpartition("@")
+        user, colon, _password = userinfo.partition(":")
+        if colon:
+            rest = f"{user}:***@{hostpart}"
+    return f"{scheme}://{rest}{qmark}{query}"
 
 
 def _config_fields(cfg: StoreConfig) -> list[tuple[str, str]]:
@@ -861,6 +867,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="allow binding a non-loopback address, exposing store contents to the network",
     )
     dash.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="a host name the dashboard may be reached by, besides localhost (repeatable); "
+        "requests naming any other Host are refused, which is what stops DNS rebinding",
+    )
+    dash.add_argument(
         "--redact-payloads",
         action="store_true",
         help="hide message bodies, showing only counts, ids and method names",
@@ -919,7 +933,9 @@ def _run_stats(args: argparse.Namespace) -> int:
     except Exception as exc:
         # A CLI prints a clean line rather than a traceback when the store can't
         # be read (connection refused, missing table, bad DSN).
-        print(f"mcp-persist: error: cannot read stats from {cfg.backend} at {cfg.url}: {exc}", file=sys.stderr)
+        print(
+            f"mcp-persist: error: cannot read stats from {cfg.backend} at {redact_url(cfg.url)}: {exc}", file=sys.stderr
+        )
         return 1
     print(_render_stats_json(cfg, report) if args.json else _render_stats(cfg, report))
     return 0
@@ -953,7 +969,7 @@ def _run_purge(args: argparse.Namespace) -> int:
             _purge_store(cfg, batch_size=args.batch_size, dry_run=args.dry_run, older_than=older_than)
         )
     except Exception as exc:
-        print(f"mcp-persist: error: purge failed for {cfg.backend} at {cfg.url}: {exc}", file=sys.stderr)
+        print(f"mcp-persist: error: purge failed for {cfg.backend} at {redact_url(cfg.url)}: {exc}", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps({"purged": removed, "dry_run": args.dry_run}))
@@ -978,12 +994,15 @@ def _run_dump(args: argparse.Namespace) -> int:
     try:
         document = asyncio.run(_dump_stream(cfg, args.stream_id))
     except Exception as exc:
-        print(f"mcp-persist: error: dump failed for {cfg.backend} at {cfg.url}: {exc}", file=sys.stderr)
+        print(f"mcp-persist: error: dump failed for {cfg.backend} at {redact_url(cfg.url)}: {exc}", file=sys.stderr)
         return 1
     text = json.dumps(document, indent=None if args.json else 2)
     if args.output:
         try:
-            with open(args.output, "w", encoding="utf-8") as handle:
+            # A dump is decrypted plaintext, so a new file is created readable by
+            # its owner only rather than with the process umask.
+            fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with open(fd, "w", encoding="utf-8") as handle:
                 handle.write(text + "\n")
         except OSError as exc:
             print(f"mcp-persist: error: cannot write {args.output}: {exc}", file=sys.stderr)
@@ -1016,7 +1035,7 @@ def _run_load(args: argparse.Namespace) -> int:
     except ValueError as exc:
         _die(str(exc))
     except Exception as exc:
-        print(f"mcp-persist: error: load failed for {cfg.backend} at {cfg.url}: {exc}", file=sys.stderr)
+        print(f"mcp-persist: error: load failed for {cfg.backend} at {redact_url(cfg.url)}: {exc}", file=sys.stderr)
         return 1
     target = args.stream_id or document.get("stream_id")
     if args.json:
@@ -1140,7 +1159,7 @@ def _run_sessions(args: argparse.Namespace) -> int:
         _die(str(exc))
     except Exception as exc:
         print(
-            f"mcp-persist: error: cannot read sessions from {cfg.backend} at {cfg.url}: {exc}",
+            f"mcp-persist: error: cannot read sessions from {cfg.backend} at {redact_url(cfg.url)}: {exc}",
             file=sys.stderr,
         )
         return 1
@@ -1203,11 +1222,20 @@ def _run_dashboard(args: argparse.Namespace) -> int:
     except ImportError:  # pragma: no cover - uvicorn ships with mcp today
         _die("the dashboard needs uvicorn: pip install uvicorn")
 
-    from mcp_persist.dashboard import create_dashboard
+    from mcp_persist.dashboard import LOOPBACK_HOSTS, create_dashboard
 
-    app = create_dashboard(cfg, redact_payloads=args.redact_payloads)
+    allowed_hosts = [*LOOPBACK_HOSTS, *args.allowed_host]
+    if args.host in ("0.0.0.0", "::"):
+        if not args.allowed_host:
+            # Reachable at whatever names the machine has, none of which are
+            # known here; the operator already accepted exposure with --unsafe-bind.
+            allowed_hosts = ["*"]
+            print("accepting any Host header; pass --allowed-host to restrict it", file=sys.stderr)
+    elif args.host not in allowed_hosts:
+        allowed_hosts.append(args.host)
+    app = create_dashboard(cfg, redact_payloads=args.redact_payloads, allowed_hosts=allowed_hosts)
     shown = "localhost" if args.host in ("127.0.0.1", "::1", "") else args.host
-    print(f"mcp-persist dashboard: http://{shown}:{args.port}  ({cfg.backend} at {cfg.url})")
+    print(f"mcp-persist dashboard: http://{shown}:{args.port}  ({cfg.backend} at {redact_url(cfg.url)})")
     if args.redact_payloads:
         print("message payloads are redacted")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

@@ -190,6 +190,11 @@ reconnects with `Last-Event-ID`; the proxy replays the missed events from the
 store and continues live. The upstream needs **no** event store of its own: the
 proxy is the store.
 
+The proxy holds no credentials of its own, so it lets the upstream decide who may
+resume a session: stored history is only replayed once the upstream has accepted
+the reconnecting request, and an upstream refusal (a `401`, an unknown session)
+reaches the client unchanged.
+
 > **Running a TypeScript (or any non-Python) MCP server?** The proxy speaks plain
 > HTTP, so it adds resumability in front of it without touching the server. See
 > [docs/typescript.md](docs/typescript.md) for a step-by-step guide.

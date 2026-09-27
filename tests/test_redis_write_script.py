@@ -235,3 +235,42 @@ async def test_cluster_client_never_registers_script(monkeypatch):
     assert eid == "1"
     assert store._write_script is None
     assert store._script_ok is None  # never probed
+
+
+async def test_raw_insert_never_lowers_the_counter_under_a_concurrent_write(client, monkeypatch):
+    # _store_event_raw raised the counter with a GET then a SET. Live writes
+    # whose INCRs landed between the two were overwritten by the lower value,
+    # and the ids they had been handed were issued again.
+    store = RedisEventStore(client, ttl=None)
+    issued = {int(await store.store_event("live", SAMPLE_MSG)) for _ in range(5)}  # counter = 5
+    real_get = client.get
+
+    async def get_then_concurrent_writes(key):
+        value = await real_get(key)
+        if key == store._counter_key():
+            # Two live writers take ids between the read and the write-back.
+            issued.add(await client.incr(key))
+            issued.add(await client.incr(key))
+        return value
+
+    monkeypatch.setattr(client, "get", get_then_concurrent_writes)
+    await store._store_event_raw("archived", "6", "", 0.0)
+    monkeypatch.undo()
+
+    following = int(await store.store_event("live", SAMPLE_MSG))
+    assert following not in issued
+    assert following > 6
+
+
+async def test_raw_insert_raises_the_counter_without_scripting(client, monkeypatch):
+    from redis.exceptions import ResponseError
+
+    class _RaisingScript:
+        async def __call__(self, *a, **k):
+            raise ResponseError("unknown command 'evalsha'")
+
+    monkeypatch.setattr(client, "register_script", lambda src: _RaisingScript())
+    store = RedisEventStore(client, ttl=None)
+    await store._store_event_raw("archived", "41", "", 0.0)
+    await store._store_event_raw("archived", "7", "", 0.0)  # never lowers it
+    assert int(await client.get(store._counter_key())) == 41

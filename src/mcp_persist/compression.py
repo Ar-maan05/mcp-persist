@@ -111,16 +111,24 @@ def decompress_payload(stored: str) -> str:
 def _zstd_decompress_bounded(raw: bytes, max_bytes: int) -> str:
     import zstandard  # type: ignore[import-not-found]
 
-    # max_output_size caps the allocation so a bomb is rejected rather than fully
-    # materialized. It is a parameter of decompress(), not the constructor. A
-    # frame without an embedded content size needs this bound to stay one-shot;
-    # requesting max_bytes + 1 lets a payload exactly on the cap through while
-    # still detecting anything larger.
-    decompressor = zstandard.ZstdDecompressor()
-    out = decompressor.decompress(raw, max_output_size=max_bytes + 1)
-    if len(out) > max_bytes:
+    # One-shot decompress() cannot be bounded: when the frame header declares a
+    # content size, zstandard allocates that size up front and ignores
+    # max_output_size, so a 32 KB frame claiming 1 GiB allocates 1 GiB before
+    # any check runs. A stream reader only ever produces what is asked of it, so
+    # reading max_bytes + 1 bounds the allocation whatever the header says, and
+    # lets a payload exactly on the cap through while detecting anything larger.
+    chunks: list[bytes] = []
+    total = 0
+    with zstandard.ZstdDecompressor().stream_reader(raw) as reader:
+        while total <= max_bytes:
+            chunk = reader.read(min(1 << 20, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    if total > max_bytes:
         raise ValueError(f"refusing to decompress payload over {max_bytes}-byte cap (possible decompression bomb)")
-    return out.decode("utf-8")
+    return b"".join(chunks).decode("utf-8")
 
 
 def _gunzip_bounded(raw: bytes, max_bytes: int) -> str:

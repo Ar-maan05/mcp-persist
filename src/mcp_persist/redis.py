@@ -39,7 +39,7 @@ from pydantic import TypeAdapter
 
 from mcp_persist._debug import default_metrics_collector
 from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
-from mcp_persist.encryption import decrypt_payload, encrypt_payload
+from mcp_persist.encryption import decrypt_payload, encrypt_payload, event_context
 from mcp_persist.health import HealthReport, probe_health
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 
@@ -82,6 +82,18 @@ if ttl >= 0 then
   redis.call('EXPIRE', KEYS[3], ttl)
 end
 return id
+"""
+
+# Raise the counter to at least ARGV[1], never lower it. A GET then SET from the
+# client is a race: an INCR landing between the two is overwritten, and the id it
+# handed out is issued again. One key, so this is also valid on Redis Cluster.
+_RAISE_COUNTER_LUA = """
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local wanted = tonumber(ARGV[1])
+if current < wanted then
+  redis.call('SET', KEYS[1], wanted)
+end
+return 1
 """
 
 _script_error_types: tuple[type[BaseException], ...] | None = None
@@ -219,6 +231,7 @@ class RedisEventStore(EventStore):
         # (scripting unsupported or Redis Cluster, so the pipeline path is used).
         # See _write_event.
         self._write_script: Any = None
+        self._raise_counter_script: Any = None
         self._script_ok: bool | None = None
         self.unreadable_events = 0
 
@@ -374,7 +387,7 @@ class RedisEventStore(EventStore):
         safe_call(self._metrics.on_store_event, stream_id, event_id, (time.monotonic() - start) * 1000.0)
         return event_id
 
-    def _encode_payload(self, payload: str) -> str:
+    def _encode_payload(self, payload: str, context: str | None = None) -> str:
         """Compress then encrypt a payload for storage (the order matters).
 
         Compression runs first so the codec sees plaintext (ciphertext does not
@@ -382,11 +395,16 @@ class RedisEventStore(EventStore):
         (priming events) through untouched.
         """
         payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
-        return encrypt_payload(payload, keyring=self._keyring)
+        return encrypt_payload(payload, keyring=self._keyring, context=context)
 
-    def _decode_payload(self, stored: str) -> str:
-        """Inverse of :meth:`_encode_payload`: decrypt then decompress."""
-        return decompress_payload(decrypt_payload(stored, keyring=self._keyring))
+    def _decode_payload(self, stored: str, context: str | None = None) -> str:
+        """Inverse of :meth:`_encode_payload`: decrypt then decompress.
+
+        ``context`` names where the payload is stored (see
+        :func:`~mcp_persist.encryption.event_context`); a bound payload only
+        decrypts under the context it was written with.
+        """
+        return decompress_payload(decrypt_payload(stored, keyring=self._keyring, context=context))
 
     async def _store_event_impl(
         self,
@@ -400,7 +418,7 @@ class RedisEventStore(EventStore):
                 by_alias=True,
                 exclude_none=True,
             )
-            payload = self._encode_payload(payload)
+            payload = self._encode_payload(payload, event_context(stream_id))
 
         event_id = await self._write_event(stream_id, payload)
 
@@ -521,7 +539,7 @@ class RedisEventStore(EventStore):
             payload = ""
         else:
             payload = message.model_dump_json(by_alias=True, exclude_none=True)
-            payload = self._encode_payload(payload)
+            payload = self._encode_payload(payload, event_context(stream_id))
 
         async with self._redis.pipeline(transaction=False) as pipe:
             pipe.hset(
@@ -552,7 +570,9 @@ class RedisEventStore(EventStore):
             payload = (
                 ""
                 if message is None
-                else self._encode_payload(message.model_dump_json(by_alias=True, exclude_none=True))
+                else self._encode_payload(
+                    message.model_dump_json(by_alias=True, exclude_none=True), event_context(stream_id)
+                )
             )
             encoded.append((stream_id, message, event_id, int(event_id), payload))
 
@@ -586,9 +606,7 @@ class RedisEventStore(EventStore):
         store, set ``ttl=None`` so archived events are not re-expired by Redis.
         """
         event_id_int = int(event_id)
-        current = await self._redis.get(self._counter_key())
-        if current is None or int(current) < event_id_int:
-            await self._redis.set(self._counter_key(), event_id_int)
+        await self._raise_counter_to(event_id_int)
 
         async with self._redis.pipeline(transaction=False) as pipe:
             pipe.hset(
@@ -606,6 +624,19 @@ class RedisEventStore(EventStore):
                 pipe.expire(self._event_key(event_id), self._ttl)
                 pipe.expire(self._stream_key(stream_id), self._ttl)
             await pipe.execute()
+
+    async def _raise_counter_to(self, value: int) -> None:
+        """Make sure later ids are issued above ``value``, atomically when possible."""
+        try:
+            if self._raise_counter_script is None:
+                self._raise_counter_script = self._redis.register_script(_RAISE_COUNTER_LUA)
+            await self._raise_counter_script(keys=[self._counter_key()], args=[value])
+            return
+        except _scripting_error_types() as exc:
+            logger.debug("Redis scripting unavailable (%s); raising the counter non-atomically", exc)
+        current = await self._redis.get(self._counter_key())
+        if current is None or int(current) < value:
+            await self._redis.set(self._counter_key(), value)
 
     async def _event_exists(self, event_id: EventId) -> bool:
         return await self._redis.exists(self._event_key(event_id)) > 0
@@ -717,7 +748,9 @@ class RedisEventStore(EventStore):
                 continue
 
             try:
-                message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload_str))
+                message = jsonrpc_message_adapter.validate_json(
+                    self._decode_payload(payload_str, event_context(stream))
+                )
             except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
                 # A single corrupt/unparseable payload must not abort the whole
                 # replay: a reconnecting client would otherwise lose every event
@@ -758,6 +791,8 @@ class RedisEventStore(EventStore):
         new_stream_id: StreamId,
     ) -> None:
         """Branch a session at a specific event ID."""
+        if new_stream_id == parent_stream_id:
+            raise ValueError(f"cannot fork stream {parent_stream_id!r} into itself")
         key = self._fork_key(new_stream_id)
         async with self._redis.pipeline(transaction=False) as pipe:
             pipe.hset(
@@ -775,8 +810,18 @@ class RedisEventStore(EventStore):
         segments = []
         current_stream = stream_id
         max_id = None
+        visited: set[StreamId] = set()
 
         while True:
+            if current_stream in visited:
+                # A fork chain that loops back on itself (a stream forked from its
+                # own descendant) has no root; stop rather than walk it forever.
+                logger.warning(
+                    "Fork chain of stream %s loops back to %s; ignoring the cycle", stream_id, current_stream
+                )
+                segments.append((current_stream, None, max_id))
+                break
+            visited.add(current_stream)
             key = self._fork_key(current_stream)
             row = await self._redis.hgetall(key)
             if not row:
@@ -851,7 +896,9 @@ class RedisEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload_str))
+                    message = jsonrpc_message_adapter.validate_json(
+                        self._decode_payload(payload_str, event_context(stream))
+                    )
                 except Exception as exc:  # noqa: BLE001
                     self.unreadable_events += 1
                     logger.warning(
@@ -920,9 +967,13 @@ class RedisEventStore(EventStore):
                 if event_id is None:
                     continue
 
-                payload_raw = await self._redis.hget(self._event_key(event_id), "payload")
+                owner_raw, payload_raw = await self._redis.hmget(self._event_key(event_id), ["stream_id", "payload"])
                 if payload_raw is None:
                     # Event expired between notification and fetch; nothing to deliver.
+                    continue
+                if self._decode(owner_raw) != stream_id:
+                    # Anyone who can PUBLISH on the channel can name any event id;
+                    # only deliver an event that belongs to this stream.
                     continue
 
                 payload_str = self._decode(payload_raw)
@@ -931,7 +982,9 @@ class RedisEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload_str))
+                    message = jsonrpc_message_adapter.validate_json(
+                        self._decode_payload(payload_str, event_context(stream_id))
+                    )
                 except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
                     logger.warning(
                         "Skipping event %s on stream %s during subscribe: failed JSONRPC validation/decompression: %s",

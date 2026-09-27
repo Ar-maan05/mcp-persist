@@ -33,8 +33,6 @@ from typing import TYPE_CHECKING, Any
 from mcp_persist.metrics import safe_call
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from mcp_persist.metrics import MetricsCollector
     from mcp_persist.records import Record, RecordStore
 
@@ -279,8 +277,3 @@ class RecordFlusher:
 
     async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
-
-
-async def drain_records(flusher: RecordFlusher, records: Sequence[Record]) -> int:
-    """Submit ``records`` and report how many were accepted. For tests."""
-    return sum(1 for record in records if flusher.submit(record))

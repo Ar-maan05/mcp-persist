@@ -177,13 +177,24 @@ class SQLiteSessionRegistry(_SQLSessionRegistry):
         self._conn = store._conn
         self._table = f'"{table_name}"'
 
+    @property
+    def _tenant_key(self) -> str:
+        """ "" for "no tenant".
+
+        SQLite treats NULLs as distinct in a PRIMARY KEY, so a NULL tenant made
+        every ON CONFLICT miss: re-registering an id inserted a second row, and a
+        terminated session could come back as a live one. Matches the Postgres
+        registry and the record stores.
+        """
+        return self._tenant_id or ""
+
     async def initialize(self) -> None:
         if self._ready:
             return
         await self._conn.execute(
             f"CREATE TABLE IF NOT EXISTS {self._table} ("
             "  session_id TEXT NOT NULL,"
-            "  tenant_id TEXT,"
+            "  tenant_id TEXT NOT NULL DEFAULT '',"
             "  created_at REAL NOT NULL,"
             "  last_seen_at REAL NOT NULL,"
             "  terminated INTEGER NOT NULL DEFAULT 0,"
@@ -191,8 +202,34 @@ class SQLiteSessionRegistry(_SQLSessionRegistry):
             "  PRIMARY KEY (session_id, tenant_id)"
             ")"
         )
+        await self._migrate_null_tenants()
         await self._conn.commit()
         self._ready = True
+
+    async def _migrate_null_tenants(self) -> None:
+        """Fold rows written with a NULL tenant (before 2.1.1) into the '' key.
+
+        Those rows could hold several copies of one session id. They are merged
+        so that a session ended in any copy stays ended: a merge must never be
+        what revives a terminated session.
+        """
+        async with self._conn.execute(
+            f"SELECT session_id, MIN(created_at), MAX(last_seen_at), MAX(terminated), MAX(owner) "
+            f"FROM {self._table} WHERE tenant_id IS NULL GROUP BY session_id"
+        ) as cursor:
+            merged = await cursor.fetchall()
+        if not merged:
+            return
+        await self._conn.execute(f"DELETE FROM {self._table} WHERE tenant_id IS NULL")
+        await self._conn.executemany(
+            f"INSERT INTO {self._table} (session_id, tenant_id, created_at, last_seen_at, terminated, owner) "
+            "VALUES (?, '', ?, ?, ?, ?) "
+            "ON CONFLICT(session_id, tenant_id) DO UPDATE SET "
+            "created_at = MIN(created_at, excluded.created_at), "
+            "last_seen_at = MAX(last_seen_at, excluded.last_seen_at), "
+            "terminated = MAX(terminated, excluded.terminated)",
+            merged,
+        )
 
     async def register(self, session_id: str, *, owner: dict[str, Any] | None = None) -> None:
         await self.initialize()
@@ -203,7 +240,7 @@ class SQLiteSessionRegistry(_SQLSessionRegistry):
             f"INSERT INTO {self._table} (session_id, tenant_id, created_at, last_seen_at, terminated, owner) "
             "VALUES (?, ?, ?, ?, 0, ?) "
             "ON CONFLICT(session_id, tenant_id) DO UPDATE SET last_seen_at = excluded.last_seen_at",
-            (session_id, self._tenant_id, now, now, self._encode_owner(owner)),
+            (session_id, self._tenant_key, now, now, self._encode_owner(owner)),
         )
         await self._conn.commit()
 
@@ -211,8 +248,8 @@ class SQLiteSessionRegistry(_SQLSessionRegistry):
         await self.initialize()
         async with self._conn.execute(
             f"SELECT session_id, created_at, last_seen_at, terminated, owner FROM {self._table} "
-            "WHERE session_id = ? AND tenant_id IS ?",
-            (session_id, self._tenant_id),
+            "WHERE session_id = ? AND tenant_id = ?",
+            (session_id, self._tenant_key),
         ) as cursor:
             row = await cursor.fetchone()
         if row is None:
@@ -228,25 +265,23 @@ class SQLiteSessionRegistry(_SQLSessionRegistry):
     async def touch(self, session_id: str) -> None:
         await self.initialize()
         await self._conn.execute(
-            f"UPDATE {self._table} SET last_seen_at = ? WHERE session_id = ? AND tenant_id IS ?",
-            (time.time(), session_id, self._tenant_id),
+            f"UPDATE {self._table} SET last_seen_at = ? WHERE session_id = ? AND tenant_id = ?",
+            (time.time(), session_id, self._tenant_key),
         )
         await self._conn.commit()
 
     async def terminate(self, session_id: str) -> None:
         await self.initialize()
         await self._conn.execute(
-            f"UPDATE {self._table} SET terminated = 1, last_seen_at = ? WHERE session_id = ? AND tenant_id IS ?",
-            (time.time(), session_id, self._tenant_id),
+            f"UPDATE {self._table} SET terminated = 1, last_seen_at = ? WHERE session_id = ? AND tenant_id = ?",
+            (time.time(), session_id, self._tenant_key),
         )
         await self._conn.commit()
 
     async def list_sessions(self, *, include_terminated: bool = False, limit: int = 100) -> list[SessionRecord]:
         await self.initialize()
-        query = (
-            f"SELECT session_id, created_at, last_seen_at, terminated, owner FROM {self._table} WHERE tenant_id IS ?"
-        )
-        params: list[Any] = [self._tenant_id]
+        query = f"SELECT session_id, created_at, last_seen_at, terminated, owner FROM {self._table} WHERE tenant_id = ?"
+        params: list[Any] = [self._tenant_key]
         if not include_terminated:
             query += " AND terminated = 0"
         query += " ORDER BY last_seen_at DESC LIMIT ?"
@@ -268,8 +303,8 @@ class SQLiteSessionRegistry(_SQLSessionRegistry):
         await self.initialize()
         cutoff = time.time() - older_than
         cursor = await self._conn.execute(
-            f"DELETE FROM {self._table} WHERE last_seen_at < ? AND tenant_id IS ?",
-            (cutoff, self._tenant_id),
+            f"DELETE FROM {self._table} WHERE last_seen_at < ? AND tenant_id = ?",
+            (cutoff, self._tenant_key),
         )
         await self._conn.commit()
         return int(cursor.rowcount or 0)

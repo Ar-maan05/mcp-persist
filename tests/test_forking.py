@@ -221,3 +221,52 @@ async def test_wide_forking_sqlite(sqlite_store):
 @pytest.mark.anyio
 async def test_wide_forking_redis(redis_store):
     await run_wide_forking_stress(redis_store)
+
+
+# ── Fork cycles ──────────────────────────────────────────────────────────────
+
+
+async def run_fork_cycle_terminates(store):
+    # A chain that loops (b forked from a, then a re-forked from b) used to be
+    # walked forever by every replay of either stream.
+    first = await store.store_event("a", SAMPLE_MSG(1))
+    await store.fork_stream("a", first, "b")
+    second = await store.store_event("b", SAMPLE_MSG(2))
+    await store.fork_stream("b", second, "a")
+
+    events: list[EventMessage] = []
+
+    async def cb(event: EventMessage) -> None:
+        events.append(event)
+
+    await asyncio.wait_for(store.replay_events_after("0", cb, "a"), 5)
+    await asyncio.wait_for(store.replay_events_after("0", cb, "b"), 5)
+
+    with pytest.raises(ValueError, match="into itself"):
+        await store.fork_stream("a", first, "a")
+
+
+@pytest.mark.anyio
+async def test_fork_cycle_terminates_sqlite(sqlite_store):
+    await run_fork_cycle_terminates(sqlite_store)
+
+
+@pytest.mark.anyio
+async def test_fork_cycle_terminates_redis(redis_store):
+    await run_fork_cycle_terminates(redis_store)
+
+
+@pytest.mark.skipif(POSTGRES_URL is None, reason="No Postgres URL configured")
+@pytest.mark.anyio
+async def test_fork_cycle_terminates_postgres():
+    import asyncpg
+
+    pool = await asyncpg.create_pool(POSTGRES_URL)
+    try:
+        await pool.execute("DROP TABLE IF EXISTS test_cycle_events, test_cycle_events_forks")
+        s = PostgresEventStore(pool, table_name="test_cycle_events", ttl=None)
+        await s.initialize()
+        await run_fork_cycle_terminates(s)
+    finally:
+        await pool.execute("DROP TABLE IF EXISTS test_cycle_events, test_cycle_events_forks")
+        await pool.close()

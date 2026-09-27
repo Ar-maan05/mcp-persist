@@ -41,6 +41,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+from mcp_persist.encryption import record_context
+
 if TYPE_CHECKING:
     from mcp.server.streamable_http import EventStore
 
@@ -369,17 +371,17 @@ class _SQLRecordStore(RecordStore):
         self._tenant_id = tenant_id
         self._ready = False
 
-    def _encode_payload(self, payload: dict[str, Any] | None) -> str | None:
+    def _encode_payload(self, payload: dict[str, Any] | None, record_id: str) -> str | None:
         """Serialize then hand to the store's own codec (compress, then encrypt)."""
         if payload is None:
             return None
-        return self._store._encode_payload(json.dumps(payload, sort_keys=True))
+        return self._store._encode_payload(json.dumps(payload, sort_keys=True), record_context(record_id))
 
-    def _decode_payload(self, stored: Any) -> dict[str, Any] | None:
+    def _decode_payload(self, stored: Any, record_id: str) -> dict[str, Any] | None:
         if stored is None:
             return None
         try:
-            decoded = json.loads(self._store._decode_payload(stored))
+            decoded = json.loads(self._store._decode_payload(stored, record_context(record_id)))
         except Exception:
             # An unreadable payload (wrong key after a rotation, corruption)
             # must not lose the rest of the record, which is the part that says
@@ -454,7 +456,7 @@ class SQLiteRecordStore(_SQLRecordStore):
             record.request_id,
             record.tool_name,
             record.error_code,
-            self._encode_payload(record.payload),
+            self._encode_payload(record.payload, record.record_id),
             1 if record.payload_truncated else 0,
         )
 
@@ -537,7 +539,7 @@ class SQLiteRecordStore(_SQLRecordStore):
             request_id=row[8],
             tool_name=row[9],
             error_code=row[10],
-            payload=self._decode_payload(row[11]),
+            payload=self._decode_payload(row[11], row[0]),
             payload_truncated=bool(row[12]),
         )
 
@@ -609,7 +611,7 @@ class PostgresRecordStore(_SQLRecordStore):
             record.request_id,
             record.tool_name,
             record.error_code,
-            self._encode_payload(record.payload),
+            self._encode_payload(record.payload, record.record_id),
             record.payload_truncated,
         )
 
@@ -701,7 +703,7 @@ class PostgresRecordStore(_SQLRecordStore):
                 request_id=r["request_id"],
                 tool_name=r["tool_name"],
                 error_code=r["error_code"],
-                payload=self._decode_payload(r["payload"]),
+                payload=self._decode_payload(r["payload"], r["record_id"]),
                 payload_truncated=bool(r["payload_truncated"]),
             )
             for r in rows
@@ -756,7 +758,11 @@ class RedisRecordStore(RecordStore):
 
     def _mapping(self, record: Record) -> dict[str, str]:
         payload = record.payload
-        encoded = "" if payload is None else self._store._encode_payload(json.dumps(payload, sort_keys=True))
+        encoded = (
+            ""
+            if payload is None
+            else self._store._encode_payload(json.dumps(payload, sort_keys=True), record_context(record.record_id))
+        )
         return {
             "record_id": record.record_id,
             "recorded_at": repr(record.recorded_at),
@@ -818,7 +824,7 @@ class RedisRecordStore(RecordStore):
         payload: dict[str, Any] | None = None
         if data.get("payload"):
             try:
-                decoded = json.loads(self._store._decode_payload(data["payload"]))
+                decoded = json.loads(self._store._decode_payload(data["payload"], record_context(record_id)))
                 payload = decoded if isinstance(decoded, dict) else None
             except Exception:
                 logger.warning("Ignoring unreadable payload on record %s", record_id[:64])

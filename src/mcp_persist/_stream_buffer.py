@@ -63,6 +63,10 @@ class StreamBuffer:
         # (if any) fires when this buffer serves a cold replay. None disables it.
         self._metrics = metrics
         self.done = False
+        # The credential headers of the request that opened this stream, set by
+        # the proxy. A later request presenting different ones is not handed
+        # this stream until the upstream has accepted them.
+        self.credentials: tuple[str | None, ...] | None = None
         self._deque: deque[tuple[EventId, str]] = deque(maxlen=maxlen)
         self._waiters: list[asyncio.Future[None]] = []
         self._task: asyncio.Task[None] | None = None

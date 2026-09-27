@@ -58,6 +58,7 @@ export MCP_PERSIST_ENCRYPTION_KEY_ID="k2"
 | `MCP_PERSIST_ENCRYPTION_KEY` | A single base64 AES-256 key, bound to the id `default`. The common case. |
 | `MCP_PERSIST_ENCRYPTION_KEYS` | `id:base64,id:base64` list of keys, for rotation. |
 | `MCP_PERSIST_ENCRYPTION_KEY_ID` | Which listed key new writes encrypt with. Required when more than one key is listed; defaults to the sole key otherwise. |
+| `MCP_PERSIST_ENCRYPTION_BIND_CONTEXT` | Bind each payload to where it is stored (default on). Turn off only during a rolling upgrade from a release before 2.1.1; see below. |
 
 Set either `MCP_PERSIST_ENCRYPTION_KEY` or `MCP_PERSIST_ENCRYPTION_KEYS`, not both.
 When neither is set, encryption stays off and stores are constructed exactly as
@@ -71,10 +72,14 @@ store yourself.
 A stored, encrypted payload looks like:
 
 ```
-en:<key_id>:<base64( 12-byte nonce + AES-GCM ciphertext and tag )>
+ea:<key_id>:<base64( 12-byte nonce + AES-GCM ciphertext and tag )>
 ```
 
-The `en:` marker and the embedded `key_id` make three properties hold:
+Payloads written before 2.1.1 (or with binding turned off) use the `en:` marker
+instead; the two differ only in the binding described in the next section, and
+both are read transparently.
+
+The marker and the embedded `key_id` make three properties hold:
 
 - **A reader recognizes ciphertext.** A real serialized `JSONRPCMessage` always
   starts with `{` and a priming event is the empty string, so neither collides
@@ -87,6 +92,25 @@ The `en:` marker and the embedded `key_id` make three properties hold:
   so a reader looks up the right key per row. This is what makes rotation
   seamless.
 
+## Binding a payload to its location
+
+AES-GCM authenticates the bytes of a payload, so a payload edited in place fails
+to decrypt. On its own it does not authenticate *where* the payload lives: a
+valid ciphertext copied from one row into another would decrypt cleanly, handing
+one stream's messages to another stream, or one tenant's to another tenant
+sharing the key. So every `ea:` payload is encrypted with its location as GCM
+associated data: an event's stream id, or a record's record id. Reading it
+anywhere else fails authentication exactly like any other tamper, and the event
+is skipped.
+
+`en:` payloads written before 2.1.1 carry no binding. They stay readable, and age
+out through `ttl`/retention like everything else.
+
+A reader older than 2.1.1 does not recognise `ea:`. For a rolling upgrade across
+that boundary, set `MCP_PERSIST_ENCRYPTION_BIND_CONTEXT=0` (or
+`KeyRing(..., bind_context=False)`) until every process runs 2.1.1 or later, then
+remove it. Reads accept both forms whatever the setting.
+
 ## Composition with compression
 
 Encryption composes with `compression=` and is the **outer** layer. On write a
@@ -94,8 +118,8 @@ payload is compressed first (ciphertext does not compress), then encrypted; on
 read it is decrypted first, then decompressed:
 
 ```
-write:  JSON  ->  gz:/zs: (if compression on)  ->  en:...   (stored)
-read:   en:...  ->  gz:/zs: or plain  ->  JSON
+write:  JSON  ->  gz:/zs: (if compression on)  ->  ea:...   (stored)
+read:   ea:...  ->  gz:/zs: or plain  ->  JSON
 ```
 
 The two codecs nest without either knowing about the other, so you can run both:

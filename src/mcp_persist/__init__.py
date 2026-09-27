@@ -43,6 +43,7 @@ from mcp_persist.migration import MigrationResult, migrate
 from mcp_persist.portability import export_stream, import_stream
 from mcp_persist.postgres import PostgresEventStore
 from mcp_persist.proxy import PersistenceProxy
+from mcp_persist.recorder import RecordFlusher
 from mcp_persist.records import (
     Carrier,
     Outcome,
@@ -112,6 +113,7 @@ __all__ = [
     "PostgresSessionRegistry",
     "PurgeScheduler",
     "Record",
+    "RecordFlusher",
     "RecordStore",
     "RedisEventStore",
     "RedisRecordStore",

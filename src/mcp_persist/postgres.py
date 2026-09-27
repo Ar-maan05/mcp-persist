@@ -50,7 +50,7 @@ from pydantic import TypeAdapter
 
 from mcp_persist._debug import debug_log, default_metrics_collector
 from mcp_persist.compression import compress_payload, decompress_payload, validate_compression
-from mcp_persist.encryption import decrypt_payload, encrypt_payload
+from mcp_persist.encryption import decrypt_payload, encrypt_payload, event_context
 from mcp_persist.health import HealthReport, probe_health
 from mcp_persist.metrics import NoOpMetricsCollector, safe_call
 from mcp_persist.stored import StoredEvent
@@ -365,7 +365,7 @@ class PostgresEventStore(EventStore):
 
     # EventStore interface
 
-    def _encode_payload(self, payload: str) -> str:
+    def _encode_payload(self, payload: str, context: str | None = None) -> str:
         """Compress then encrypt a payload for storage (the order matters).
 
         Compression runs first so the codec sees plaintext (ciphertext does not
@@ -373,11 +373,16 @@ class PostgresEventStore(EventStore):
         (priming events) through untouched.
         """
         payload = compress_payload(payload, codec=self._compression, min_bytes=self._compress_min_bytes)
-        return encrypt_payload(payload, keyring=self._keyring)
+        return encrypt_payload(payload, keyring=self._keyring, context=context)
 
-    def _decode_payload(self, stored: str) -> str:
-        """Inverse of :meth:`_encode_payload`: decrypt then decompress."""
-        return decompress_payload(decrypt_payload(stored, keyring=self._keyring))
+    def _decode_payload(self, stored: str, context: str | None = None) -> str:
+        """Inverse of :meth:`_encode_payload`: decrypt then decompress.
+
+        ``context`` names where the payload is stored (see
+        :func:`~mcp_persist.encryption.event_context`); a bound payload only
+        decrypts under the context it was written with.
+        """
+        return decompress_payload(decrypt_payload(stored, keyring=self._keyring, context=context))
 
     async def store_event(
         self,
@@ -408,7 +413,7 @@ class PostgresEventStore(EventStore):
             payload = ""
         else:
             payload = message.model_dump_json(by_alias=True, exclude_none=True)
-            payload = self._encode_payload(payload)
+            payload = self._encode_payload(payload, event_context(stream_id))
 
         event_id = await self._pool.fetchval(
             f"INSERT INTO {self._table} (stream_id, payload, created_at, tenant_id) "
@@ -435,10 +440,14 @@ class PostgresEventStore(EventStore):
             raise ValueError(f"n must be a positive integer, got {n!r}")
         if not self._initialized:
             await self.initialize()
-        bare = self._table.split(".")[-1].strip('"')
+        # pg_get_serial_sequence parses its argument as a (possibly qualified,
+        # possibly quoted) identifier, so pass the table exactly as it is quoted
+        # everywhere else. A bare name would drop the schema and resolve through
+        # search_path, drawing ids from another table's sequence, and would fold
+        # a mixed-case name to lower case.
         rows = await self._pool.fetch(
             "SELECT nextval(pg_get_serial_sequence($1, 'event_id'))::bigint AS id FROM generate_series(1, $2)",
-            bare,
+            self._table,
             n,
             timeout=self._timeout,
         )
@@ -456,7 +465,7 @@ class PostgresEventStore(EventStore):
             payload = ""
         else:
             payload = message.model_dump_json(by_alias=True, exclude_none=True)
-            payload = self._encode_payload(payload)
+            payload = self._encode_payload(payload, event_context(stream_id))
         await self._pool.execute(
             f"INSERT INTO {self._table} (event_id, stream_id, payload, created_at, tenant_id) "
             "OVERRIDING SYSTEM VALUE VALUES ($1, $2, $3, $4, $5) "
@@ -489,7 +498,9 @@ class PostgresEventStore(EventStore):
             payload = (
                 ""
                 if message is None
-                else self._encode_payload(message.model_dump_json(by_alias=True, exclude_none=True))
+                else self._encode_payload(
+                    message.model_dump_json(by_alias=True, exclude_none=True), event_context(stream_id)
+                )
             )
             rows.append((int(event_id), stream_id, payload, now, self._tenant_id))
 
@@ -638,7 +649,9 @@ class PostgresEventStore(EventStore):
                     if not payload:
                         continue
                     try:
-                        message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload))
+                        message = jsonrpc_message_adapter.validate_json(
+                            self._decode_payload(payload, event_context(stream))
+                        )
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "Skipping event %s on stream %s during replay: failed JSONRPC validation/decompression: %s",
@@ -663,6 +676,8 @@ class PostgresEventStore(EventStore):
         new_stream_id: StreamId,
     ) -> None:
         """Branch a session at a specific event ID."""
+        if new_stream_id == parent_stream_id:
+            raise ValueError(f"cannot fork stream {parent_stream_id!r} into itself")
         if not self._initialized:
             await self.initialize()
         await self._pool.execute(
@@ -683,8 +698,18 @@ class PostgresEventStore(EventStore):
         segments = []
         current_stream = stream_id
         max_id = None
+        visited: set[StreamId] = set()
 
         while True:
+            if current_stream in visited:
+                # A fork chain that loops back on itself (a stream forked from its
+                # own descendant) has no root; stop rather than walk it forever.
+                logger.warning(
+                    "Fork chain of stream %s loops back to %s; ignoring the cycle", stream_id, current_stream
+                )
+                segments.append((current_stream, None, max_id))
+                break
+            visited.add(current_stream)
             row = await self._pool.fetchrow(
                 f"SELECT parent_stream_id, fork_event_id FROM {self._forks_table} WHERE child_stream_id = $1",
                 current_stream,
@@ -1085,7 +1110,9 @@ class PostgresEventStore(EventStore):
                         continue
 
                     try:
-                        message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload))
+                        message = jsonrpc_message_adapter.validate_json(
+                            self._decode_payload(payload, event_context(stream))
+                        )
                     except Exception as exc:  # noqa: BLE001
                         self.unreadable_events += 1
                         logger.warning(
@@ -1185,10 +1212,18 @@ class PostgresEventStore(EventStore):
             await conn.add_listener(channel, listener)
             while True:
                 event_id = await queue.get()
+                if not event_id.isdigit():
+                    continue
 
+                # The channel is derived from the stream id alone, so it is shared
+                # by every tenant using that id (and anyone with database access can
+                # NOTIFY on it). Only deliver the row if it really is this stream's,
+                # in this store's tenant.
+                params: list[Any] = [int(event_id), stream_id]
+                tenant_sql = self._tenant_clause(params)
                 row = await conn.fetchrow(
-                    f"SELECT payload FROM {self._table} WHERE event_id = $1",
-                    int(event_id),
+                    f"SELECT payload FROM {self._table} WHERE event_id = $1 AND stream_id = $2{tenant_sql}",
+                    *params,
                     timeout=self._timeout,
                 )
                 if row is None:
@@ -1200,7 +1235,9 @@ class PostgresEventStore(EventStore):
                     continue
 
                 try:
-                    message = jsonrpc_message_adapter.validate_json(self._decode_payload(payload))
+                    message = jsonrpc_message_adapter.validate_json(
+                        self._decode_payload(payload, event_context(stream_id))
+                    )
                 except Exception as exc:  # noqa: BLE001 - corrupt payload (bad JSON or undecompressible); skip it, don't abort the stream
                     logger.warning(
                         "Skipping event %s on stream %s during subscribe: failed JSONRPC validation/decompression: %s",

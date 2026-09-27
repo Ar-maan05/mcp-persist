@@ -127,6 +127,9 @@ async def test_terminate_is_visible_and_sticky(registry) -> None:
     await registry.register("sess-a")
     again = await registry.get("sess-a")
     assert again is not None and again.terminated is True
+    # ...and must not leave a second, live copy behind in the listing.
+    assert [r.session_id for r in await registry.list_sessions()] == []
+    assert [r.session_id for r in await registry.list_sessions(include_terminated=True)] == ["sess-a"]
 
 
 async def test_list_orders_by_recency_and_filters_terminated(registry) -> None:
@@ -167,3 +170,33 @@ async def test_registry_rejects_a_backend_without_one() -> None:
 
     with pytest.raises(TypeError, match="no session registry"):
         session_registry_for(NotAStore())  # type: ignore[arg-type]
+
+
+async def test_sqlite_rows_from_before_the_tenant_key_fix_are_merged() -> None:
+    # Before 2.1.1 an unbound SQLite registry stored tenant_id as NULL, which
+    # SQLite treats as distinct in a PRIMARY KEY, so one id could hold several
+    # rows. Opening the table folds them into one, and an ended copy stays ended.
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        await conn.execute(
+            "CREATE TABLE mcp_sessions (session_id TEXT NOT NULL, tenant_id TEXT, created_at REAL NOT NULL, "
+            "last_seen_at REAL NOT NULL, terminated INTEGER NOT NULL DEFAULT 0, owner TEXT, "
+            "PRIMARY KEY (session_id, tenant_id))"
+        )
+        await conn.executemany(
+            "INSERT INTO mcp_sessions VALUES (?, NULL, ?, ?, ?, NULL)",
+            [("dup", 10.0, 20.0, 1), ("dup", 30.0, 40.0, 0), ("solo", 5.0, 6.0, 0)],
+        )
+        store = SQLiteEventStore(conn, table_name="events", ttl=None)
+        await store.initialize()
+        registry = session_registry_for(store)
+        await registry.initialize()
+
+        dup = await registry.get("dup")
+        assert dup is not None
+        assert (dup.created_at, dup.last_seen_at, dup.terminated) == (10.0, 40.0, True)
+        assert [r.session_id for r in await registry.list_sessions()] == ["solo"]
+        async with conn.execute("SELECT COUNT(*) FROM mcp_sessions WHERE tenant_id IS NULL") as cursor:
+            assert (await cursor.fetchone())[0] == 0
+    finally:
+        await conn.close()

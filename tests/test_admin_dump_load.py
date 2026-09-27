@@ -12,7 +12,7 @@ import pytest
 from mcp_types import JSONRPCMessage, JSONRPCRequest
 
 from mcp_persist import SQLiteEventStore, _admin, event_store_from_env, generate_key
-from mcp_persist.encryption import _ENC_PREFIX, keyring_from_env
+from mcp_persist.encryption import _BOUND_PREFIX, keyring_from_env
 
 
 def _msg(i: int) -> JSONRPCMessage:
@@ -141,7 +141,7 @@ def test_dump_and_load_honor_encryption_and_tenant_config(tmp_path, capsys, monk
         async with event_store_from_env(destination_env) as store:
             async with store._conn.execute("SELECT payload FROM mcp_events") as cursor:  # type: ignore[attr-defined]
                 (payload,) = await cursor.fetchone()
-            assert payload.startswith(_ENC_PREFIX)
+            assert payload.startswith(_BOUND_PREFIX)
             doc = await _admin._dump_stream(
                 _admin.StoreConfig(
                     backend="sqlite",
@@ -205,3 +205,41 @@ def test_purge_older_than_rejected_for_redis(capsys):
         _admin._run_purge(args)
     assert exc.value.code == 2
     assert "not supported for redis" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("url", "shown"),
+    [
+        ("postgresql://app:s3cret@db/mcp", "postgresql://app:***@db/mcp"),
+        ("redis://:s3cret@cache:6379/0", "redis://:***@cache:6379/0"),
+        (
+            "postgresql://db/mcp?user=app&password=s3cret&sslmode=require",
+            "postgresql://db/mcp?user=app&password=***&sslmode=require",
+        ),
+        ("postgresql://app@db/mcp", "postgresql://app@db/mcp"),
+        ("events.db", "events.db"),
+    ],
+)
+def test_redact_url_masks_every_password_form(url, shown):
+    assert _admin.redact_url(url) == shown
+
+
+def test_command_output_never_prints_the_dsn_password(capsys):
+    # redact_url existed but only `config` used it; doctor, stats and the error
+    # lines of every other command printed the DSN with its password.
+    url = "postgresql://app:s3cret@127.0.0.1:1/nope"
+    for argv in (["doctor", "--backend", "postgres", "--url", url], ["stats", "--backend", "postgres", "--url", url]):
+        args = _admin._parse_args(argv)
+        (_admin._run_doctor if argv[0] == "doctor" else _admin._run_stats)(args)
+        out = capsys.readouterr()
+        assert "s3cret" not in out.out + out.err
+        assert "app:***@" in out.out + out.err
+
+
+def test_dump_file_is_created_owner_only(tmp_path):
+    src = tmp_path / "src.db"
+    dump_path = tmp_path / "dump.json"
+    asyncio.run(_seed(str(src), "chat", 1))
+    args = _admin._parse_args(["dump", "chat", "--backend", "sqlite", "--url", str(src), "-o", str(dump_path)])
+    assert _admin._run_dump(args) == 0
+    assert dump_path.stat().st_mode & 0o777 == 0o600

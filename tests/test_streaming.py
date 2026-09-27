@@ -308,3 +308,39 @@ async def test_postgres_subscribe_releases_connection_even_if_remove_listener_ra
         await task
 
     pool.release.assert_awaited_once_with(conn)
+
+
+@pytest.mark.anyio
+async def test_sqlite_subscribe_is_scoped_to_the_stores_tenant(sqlite_streaming_store):
+    # subscribe() queried by stream id alone, so a tenant-bound store received
+    # another tenant's events whenever the two used the same stream id.
+    conn = sqlite_streaming_store._conn
+    acme = SQLiteEventStore(conn, table_name="tenanted", tenant_id="acme", ttl=None, enable_streaming=True)
+    globex = SQLiteEventStore(conn, table_name="tenanted", tenant_id="globex", ttl=None, enable_streaming=True)
+    await acme.initialize()
+    await globex.initialize()
+
+    received: list = []
+    task = _consume(globex, "shared", 1, received, poll_interval=0.05)
+    await asyncio.sleep(REGISTER_DELAY)
+    await acme.store_event("shared", _msg(1))
+    await asyncio.sleep(REGISTER_DELAY)
+    assert received == []
+
+    await globex.store_event("shared", _msg(2))
+    await asyncio.wait_for(task, timeout=2.0)
+    assert [_id(m) for _, m in received] == ["2"]
+
+
+@pytest.mark.anyio
+async def test_redis_subscribe_ignores_a_forged_notification(redis_streaming_store):
+    # Anyone who can PUBLISH on the channel could name an event id from another
+    # stream and have its payload delivered here.
+    other = await redis_streaming_store.store_event("other", _msg(1))
+    received: list = []
+    task = _consume(redis_streaming_store, "mine", 1, received)
+    await asyncio.sleep(REGISTER_DELAY)
+    await redis_streaming_store._redis.publish(redis_streaming_store._notify_channel("mine"), other)
+    await redis_streaming_store.store_event("mine", _msg(2))
+    await asyncio.wait_for(task, timeout=2.0)
+    assert [_id(m) for _, m in received] == ["2"]

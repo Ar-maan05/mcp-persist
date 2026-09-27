@@ -15,6 +15,11 @@ than raw rows. It is a debugging tool for a store you already have access to,
 not a monitoring service; there is no authentication, which is exactly why it
 refuses to bind a non-loopback address unless you say ``--unsafe-bind``.
 
+Binding to loopback is not enough on its own: a web page the operator happens to
+have open can re-point its own hostname at 127.0.0.1 (DNS rebinding) and read
+the API as same-origin. So every request must name the dashboard by a host it
+actually answers to, and anything else is refused before it reaches a route.
+
 The page has no external assets. The CSS and JS are inline, so it works on a
 locked-down network, in an air-gapped environment, and behind a corporate proxy,
 and there is no CDN to trust.
@@ -23,20 +28,54 @@ and there is no CDN to trust.
 from __future__ import annotations
 
 import json
+from collections import deque
 from typing import TYPE_CHECKING, Any
 
 from starlette.applications import Starlette
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.middleware import Middleware
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Iterable
 
     from starlette.requests import Request
+    from starlette.types import ASGIApp, Receive, Scope, Send
 
     from mcp_persist._admin import StoreConfig
 
 MAX_PAYLOAD_PREVIEW = 4000
+
+LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _host_name(header: str) -> str:
+    """The host part of a ``Host`` header, lower-cased, without port or brackets."""
+    header = header.strip().lower()
+    if header.startswith("["):  # IPv6 literal, e.g. "[::1]:8765"
+        return header[1 : header.find("]")] if "]" in header else header
+    return header.rsplit(":", 1)[0] if header.count(":") == 1 else header
+
+
+class _HostGuard:
+    """Refuse any request whose ``Host`` is not one the dashboard answers to.
+
+    Starlette ships a ``TrustedHostMiddleware``, but it splits the header on the
+    first colon, which cannot match an IPv6 literal such as ``[::1]:8765``.
+    """
+
+    def __init__(self, app: ASGIApp, *, hosts: Iterable[str]) -> None:
+        self._app = app
+        self._hosts = frozenset(h.strip("[]").lower() for h in hosts)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] in ("http", "websocket") and "*" not in self._hosts:
+            host = next((v.decode("latin-1") for k, v in scope["headers"] if k == b"host"), "")
+            if _host_name(host) not in self._hosts:
+                response = PlainTextResponse("Invalid host header", status_code=400)
+                await response(scope, receive, send)
+                return
+        await self._app(scope, receive, send)
 
 
 def _describe_payload(raw: Any) -> dict[str, Any]:
@@ -70,7 +109,7 @@ def _describe_payload(raw: Any) -> dict[str, Any]:
 
 async def _snapshot(cfg: StoreConfig, store: Any) -> dict[str, Any]:
     """Everything the overview needs, in one round trip per section."""
-    from mcp_persist._admin import gather_stats
+    from mcp_persist._admin import gather_stats, redact_url
 
     report = await gather_stats(cfg, store)
 
@@ -84,7 +123,7 @@ async def _snapshot(cfg: StoreConfig, store: Any) -> dict[str, Any]:
 
     return {
         "backend": report.backend,
-        "url": cfg.url,
+        "url": redact_url(cfg.url),
         "tenant_id": cfg.tenant_id,
         "ttl": cfg.ttl,
         "total_events": report.total_events,
@@ -122,7 +161,9 @@ async def _sessions(store: Any) -> dict[str, Any]:
     }
 
 
-def create_dashboard(cfg: StoreConfig, *, redact_payloads: bool = False) -> Starlette:
+def create_dashboard(
+    cfg: StoreConfig, *, redact_payloads: bool = False, allowed_hosts: Iterable[str] | None = None
+) -> Starlette:
     """Build the dashboard ASGI app for the store described by ``cfg``.
 
     The store is opened once for the app's lifetime rather than per request, so
@@ -133,6 +174,9 @@ def create_dashboard(cfg: StoreConfig, *, redact_payloads: bool = False) -> Star
         redact_payloads: Omit message bodies, leaving counts, ids, timestamps and
             the method names. Use it when the screen is shared, or when the
             events carry data you would rather not render.
+        allowed_hosts: Host names a request may address the dashboard by.
+            Defaults to the loopback names; ``"*"`` accepts any, which is only
+            appropriate when the operator has deliberately exposed it.
     """
     import contextlib
 
@@ -165,36 +209,41 @@ def create_dashboard(cfg: StoreConfig, *, redact_payloads: bool = False) -> Star
             return JSONResponse({"error": str(exc)}, status_code=503)
 
     async def api_events(request: Request) -> JSONResponse:
-        from mcp_persist.portability import export_stream
-
         stream_id = request.path_params["stream_id"]
         try:
             limit = max(1, min(int(request.query_params.get("limit", 200)), 1000))
         except ValueError:
             limit = 200
 
+        # Only the newest `limit` events are kept, so a long stream costs a read
+        # rather than a full in-memory export on every poll.
+        newest: deque[tuple[str, Any]] = deque(maxlen=limit)
+        total = 0
         try:
-            document = await export_stream(state["store"], stream_id, backend=cfg.backend)
+            async for event_id, message in state["store"]._iter_stream_events(stream_id):
+                newest.append((str(event_id), message))
+                total += 1
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=503)
 
-        events = document.get("events", [])
         # Newest first: when a stream is long, the recent end is the interesting
         # one, and it saves the page scrolling to the bottom on every refresh.
-        events = list(reversed(events))[:limit]
         rows = [
             {
-                "event_id": event.get("event_id"),
+                "event_id": event_id,
                 "payload": {"kind": "redacted", "label": "(redacted)", "json": None}
                 if redact_payloads
-                else _describe_payload(event.get("message")),
+                else _describe_payload(
+                    None if message is None else message.model_dump(mode="json", by_alias=True, exclude_none=True)
+                ),
             }
-            for event in events
+            for event_id, message in reversed(newest)
         ]
-        return JSONResponse({"stream_id": stream_id, "events": rows, "truncated": len(events) >= limit})
+        return JSONResponse({"stream_id": stream_id, "events": rows, "truncated": total > limit})
 
     return Starlette(
         lifespan=lifespan,
+        middleware=[Middleware(_HostGuard, hosts=LOOPBACK_HOSTS if allowed_hosts is None else allowed_hosts)],
         routes=[
             Route("/", index),
             Route("/api/overview", api_overview),
@@ -310,7 +359,7 @@ _PAGE = """
 
 <script>
 const $ = (id) => document.getElementById(id);
-let selected = null, paused = false, openRow = null;
+let selected = null, paused = false, openRow = null, loadedMark = null;
 
 const esc = (s) => String(s).replace(/[&<>"']/g, c => (
   {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -359,9 +408,14 @@ async function refresh() {
       : '<tr><td colspan="4" class="empty">No events stored yet.</td></tr>';
 
     for (const row of $('streams').querySelectorAll('tr[data-id]')) {
-      row.onclick = () => { selected = row.dataset.id; openRow = null; refresh(); };
+      row.onclick = () => { selected = row.dataset.id; openRow = null; loadedMark = null; refresh(); };
     }
-    if (selected) await loadEvents(selected);
+    if (selected) {
+      // Re-read the events only when the stream has moved on since the last read.
+      const current = o.streams.find(s => s.stream_id === selected);
+      const mark = `${selected}@${current ? current.max_event_id : ''}`;
+      if (mark !== loadedMark) { loadedMark = mark; await loadEvents(selected); }
+    }
   } catch (e) {
     $('health').innerHTML = `<span class="dot bad"></span> <span class="err">${esc(e.message)}</span>`;
   }

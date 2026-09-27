@@ -118,7 +118,7 @@ class DatabaseAuditSink:
             parts[-1] = new_table_part
             self._audit_table = ".".join(parts)
         else:
-            self._audit_table = audit_table
+            self._audit_table = _quoted_table(audit_table)
 
         self._initialized = False
 
@@ -203,3 +203,17 @@ class DatabaseAuditSink:
             # Use PostgreSQL query executor
             timeout = self._store._timeout
             await self._store._pool.execute(query, *params, timeout=timeout)
+
+
+def _quoted_table(name: str) -> str:
+    """Validate a caller-supplied table name and quote each part.
+
+    It is interpolated into DDL and INSERT statements, so it gets the same
+    identifier rule as the events table rather than being trusted verbatim.
+    """
+    from mcp_persist.sqlite import IDENTIFIER_RE
+
+    parts = [part[1:-1] if len(part) > 1 and part[0] == part[-1] == '"' else part for part in name.split(".")]
+    if len(parts) > 2 or not all(part and IDENTIFIER_RE.match(part) for part in parts):
+        raise ValueError(f"audit_table must be a valid SQL identifier or 'schema.table', got {name!r}")
+    return ".".join(f'"{part}"' for part in parts)

@@ -14,6 +14,7 @@ matters in practice because the SDK's upstream (``sse-starlette``) emits
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 __all__ = ["SSEFrame", "SSEParser"]
@@ -48,9 +49,13 @@ class SSEParser:
     """
 
     def __init__(self) -> None:
-        # Unconsumed tail: a partial line, or a lone trailing "\r" whose
-        # following byte (possibly "\n") has not arrived yet.
-        self._buf: str = ""
+        # The unterminated line in progress, kept as the chunks it arrived in so
+        # a long line costs one join when it completes, rather than a re-copy
+        # and a re-scan of everything so far on every chunk.
+        self._partial: list[str] = []
+        # A chunk ended in "\r" whose following byte (possibly "\n") has not
+        # arrived yet; the "\r" is held back and re-read with the next chunk.
+        self._held_cr = False
         # Field accumulators for the event currently being built. Per the SSE
         # spec, a "data" line appends its value plus a "\n" to the data buffer;
         # an empty data buffer at dispatch time means no "data:" field was seen.
@@ -60,8 +65,7 @@ class SSEParser:
 
     def feed(self, chunk: str) -> list[SSEFrame]:
         """Consume a chunk and return any frames it completed."""
-        self._buf += chunk
-        return self._drain()
+        return self._process(self._split(chunk))
 
     def flush(self) -> list[SSEFrame]:
         """Resolve end-of-stream and return any final frame.
@@ -73,12 +77,42 @@ class SSEParser:
         final line (no terminator at all) is discarded, per the SSE spec, which
         does not dispatch an event that lacks its terminating blank line.
         """
-        if self._buf.endswith("\r"):
-            self._buf = self._buf[:-1] + "\n"
-        return self._drain()
+        if not self._held_cr:
+            return []
+        self._held_cr = False
+        line = "".join(self._partial)
+        self._partial.clear()
+        return self._process([line])
 
-    def _drain(self) -> list[SSEFrame]:
-        lines, self._buf = _split_lines(self._buf)
+    def _split(self, chunk: str) -> list[str]:
+        """Return the lines ``chunk`` completes, keeping any unfinished tail.
+
+        Only ``chunk`` itself is scanned, so the total cost stays linear in the
+        input however the stream is split, including one very large ``data:``
+        line delivered across many small network reads.
+        """
+        if self._held_cr:
+            self._held_cr = False
+            chunk = "\r" + chunk
+        if chunk.endswith("\r"):
+            # Possible split "\r\n": don't consume until the next char is in.
+            self._held_cr = True
+            chunk = chunk[:-1]
+        lines: list[str] = []
+        start = 0
+        for match in _LINE_END.finditer(chunk):
+            piece = chunk[start : match.start()]
+            if self._partial:
+                self._partial.append(piece)
+                piece = "".join(self._partial)
+                self._partial.clear()
+            lines.append(piece)
+            start = match.end()
+        if start < len(chunk):
+            self._partial.append(chunk[start:])
+        return lines
+
+    def _process(self, lines: list[str]) -> list[SSEFrame]:
         frames: list[SSEFrame] = []
         for line in lines:
             if line == "":
@@ -128,30 +162,6 @@ class SSEParser:
         return SSEFrame(data=data, event=event, original_id=original_id)
 
 
-def _split_lines(buf: str) -> tuple[list[str], str]:
-    """Split ``buf`` into complete lines plus the unconsumed remainder.
-
-    Recognises ``\\n``, ``\\r``, and ``\\r\\n`` terminators. A lone ``\\r`` at
-    the very end of ``buf`` is left in the remainder: the next chunk might begin
-    with ``\\n``, in which case the two form a single ``\\r\\n`` terminator.
-    """
-    lines: list[str] = []
-    start = 0
-    i = 0
-    n = len(buf)
-    while i < n:
-        c = buf[i]
-        if c == "\n":
-            lines.append(buf[start:i])
-            i += 1
-            start = i
-        elif c == "\r":
-            if i + 1 >= n:
-                # Possible split "\r\n": don't consume until the next char is in.
-                break
-            lines.append(buf[start:i])
-            i += 2 if buf[i + 1] == "\n" else 1
-            start = i
-        else:
-            i += 1
-    return lines, buf[start:]
+# Line terminators per the SSE spec. "\r\n" is listed first so it matches as a
+# single terminator rather than as "\r" followed by an empty "\n" line.
+_LINE_END = re.compile(r"\r\n|\r|\n")

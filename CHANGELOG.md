@@ -5,6 +5,40 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.1] - 2026-09-26
+
+**A security and correctness release.** Every change here is a fix found in a full review of the package. Upgrading is recommended for everyone, and strongly for anyone running the proxy, the dashboard, batching on Postgres, multi-tenant stores or encryption at rest. One behavior needs attention during a rolling upgrade: see the encryption entry.
+
+### Security
+- **The proxy no longer replays stored history before the upstream has accepted the request.** On a `GET` with `Last-Event-ID`, the proxy read the session's events out of its store and streamed them before the upstream saw the request, so knowing a session id was enough to read that session's history, whatever credential came with it. The upstream is now asked first, and the store is read only once it has accepted. A live stream opened under one credential is no longer handed to a request carrying a different one without checking that credential with the upstream too.
+- **The proxy forwards an upstream refusal instead of hiding it.** A `GET` the upstream rejected (a `401`, a `404` for an unknown session) was answered with an empty `200` event stream, so a client could not tell a bad credential from a quiet session. The upstream's status and body now reach the client unchanged.
+- **The dashboard refuses requests addressed to a foreign host.** Binding to `127.0.0.1` did not stop a web page the operator had open from reaching it: the page could re-point its own hostname at the loopback address (DNS rebinding) and read every stored message, decrypted, as same-origin. Requests must now name the dashboard by `localhost`, `127.0.0.1`, `[::1]` or the address it is bound to; `--allowed-host` adds others.
+- **Database passwords are no longer printed.** `redact_url` existed but only `config` used it: `doctor`, `stats`, `purge`, `dump`, `load`, `sessions` and the dashboard startup line printed the store URL with its password, and the dashboard served it from `/api/overview`. All of them now mask it, including a `password=` query parameter.
+- **The zstd decompression-bomb cap now holds.** One-shot `zstandard` decompression allocates the content size a frame's header declares, ignoring the output limit, so a 32 KB `zs:` payload claiming 1 GiB allocated 1 GiB before the cap was checked. Decompression now goes through a stream reader that never produces more than the cap. The gzip path was already bounded.
+- **`subscribe()` respects the tenant binding.** On SQLite and Postgres a tenant-bound store's subscription received another tenant's events whenever the two used the same stream id. Both now filter by tenant and stream, and Redis and Postgres also ignore a notification naming an event from another stream.
+- **Encrypted payloads are bound to where they are stored.** AES-GCM authenticated the bytes of a payload but not its location, so a ciphertext copied into another stream's row (or another tenant's, under a shared key) decrypted cleanly and was replayed there. Payloads are now written with the `ea:` marker and their stream id, or record id, as associated data; a copy read anywhere else fails authentication and is skipped. `en:` payloads written before this release stay readable. **Rolling upgrades:** a 2.1.0 reader cannot read `ea:` payloads, so set `MCP_PERSIST_ENCRYPTION_BIND_CONTEXT=0` (or `KeyRing(..., bind_context=False)`) until every process runs 2.1.1, then remove it.
+- **`mcp-persist dump -o` creates the file readable by its owner only.** A dump is decrypted plaintext and was written with the process umask.
+- **`DatabaseAuditSink` validates an explicit `audit_table`.** The name was interpolated into SQL as given.
+
+### Fixed
+- **Batched Postgres writes to a schema-qualified or mixed-case table used the wrong ID sequence.** Ids were drawn from the sequence of the same-named table on the search path, so once the two counters overlapped, ordinary writes failed with a duplicate key and batched writes silently overwrote other streams' events through `ON CONFLICT`. A mixed-case name failed outright. The table's own sequence is now resolved from its fully quoted name.
+- **The proxy's SSE parser is linear.** It re-scanned everything buffered so far on every network chunk, so one large event cost time quadratic in its size, all of it synchronous on the event loop: a 4 MiB tool result stalled the whole proxy, every client included, for about 40 seconds. It now scans each chunk once (about 20 ms for the same event).
+- **A fork cycle no longer hangs replay.** A stream forked from its own descendant made every replay of it walk the fork chain forever, on all three backends. The walk now stops at a repeated stream, and forking a stream into itself is rejected.
+- **The SQLite session registry no longer duplicates sessions.** An unbound registry stored its tenant as `NULL`, which SQLite treats as distinct in a primary key, so its upserts never matched: re-registering an id added a second row, and a terminated session was listed again as live. It now uses `''` like the Postgres registry and the record stores, and rows from earlier versions are merged on open, with a terminated copy staying terminated.
+- **`BatchingEventStore` bounds its backlog.** While flushes kept failing, every write was still accepted into the retry queue without limit. Past `max_pending` (default 10000, or `flush_max_events` if larger), `store_event` now raises.
+- **A Redis archive write can no longer reissue an event id.** `_store_event_raw` raised the id counter with a separate read and write, so live writes landing between the two could have their ids handed out again. It is now one atomic server-side step.
+- **The proxy forwards paths with their percent-encoding intact.** Non-MCP paths were rebuilt from the decoded path, so an encoded `%3F` became the start of a query string.
+- **The dashboard's event view is cheaper and reports truncation correctly.** It exported the whole selected stream into memory on every two-second poll, and flagged a stream holding exactly `limit` events as truncated. It now keeps only the newest `limit`, and the page re-reads a stream only when it has changed.
+- **`RecordFlusher` is now importable from the package root.** 2.1.0 listed it as new public API, but it was never added to `mcp_persist/__init__.py`, so `from mcp_persist import RecordFlusher` raised `ImportError`. It is the background writer the middleware builds on, so it is the name an integrator wiring records by hand reaches for. A test now checks that every name in `__all__` resolves and that the whole records API is exported.
+
+### Added
+- `mcp-persist dashboard --allowed-host NAME` (repeatable), and `create_dashboard(..., allowed_hosts=)`.
+- `BatchingEventStore(..., max_pending=)`.
+- `KeyRing(..., bind_context=)` and `MCP_PERSIST_ENCRYPTION_BIND_CONTEXT`.
+
+### Removed
+- `mcp_persist.recorder.drain_records`, an undocumented helper that nothing used.
+
 ## [2.1.0] - 2026-08-14
 
 **Persistence that works on every protocol version.** Everything this library did up to here applied only to clients negotiating a handshake-era protocol revision. From `2026-07-28` the SDK routes each request to a stateless single-exchange handler with no `initialize` handshake, no `Mcp-Session-Id`, and one request in and one response out, and that path never reaches the event store at all. A deployment configured for persistence therefore persisted nothing for a modern client, with no error and no warning. 2.1 says so out loud, and adds a surface that keeps working across the boundary.
@@ -446,6 +480,7 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore`, a Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
+[2.1.1]: https://github.com/Ar-maan05/mcp-persist/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/Ar-maan05/mcp-persist/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.12.3...v2.0.0
 [1.12.3]: https://github.com/Ar-maan05/mcp-persist/compare/v1.12.2...v1.12.3

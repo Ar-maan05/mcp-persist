@@ -18,7 +18,7 @@ from mcp_types import JSONRPCRequest
 
 from mcp_persist import KeyRing, RedisEventStore, SQLiteEventStore, generate_key, keyring_from_env
 from mcp_persist.compression import compress_payload, decompress_payload
-from mcp_persist.encryption import _ENC_PREFIX, decrypt_payload, encrypt_payload
+from mcp_persist.encryption import _BOUND_PREFIX, _ENC_PREFIX, decrypt_payload, encrypt_payload, event_context
 
 SAMPLE_MSG = JSONRPCRequest(jsonrpc="2.0", id="1", method="tools/list")
 
@@ -260,7 +260,7 @@ async def test_sqlite_encrypts_at_rest_and_replays():
         # The raw column holds ciphertext, not the JSON payload.
         async with store._conn.execute(f"SELECT payload FROM {store._table} WHERE event_id = ?", (int(e1),)) as cur:
             raw = (await cur.fetchone())[0]
-        assert raw.startswith(_ENC_PREFIX)
+        assert raw.startswith(_BOUND_PREFIX)
         assert "tools/list" not in raw
 
         # Replay decrypts transparently.
@@ -316,7 +316,7 @@ async def test_redis_encrypts_at_rest_and_replays():
     await store.store_event("s1", SAMPLE_MSG)
 
     raw = await client.hget("mcp:event:1", "payload")
-    assert raw.decode().startswith(_ENC_PREFIX)
+    assert raw.decode().startswith(_BOUND_PREFIX)
     assert b"tools/list" not in raw
 
     resolved, events = await _replay(store, e1, "s1")
@@ -337,3 +337,100 @@ async def test_redis_encryption_works_on_both_write_paths():
         resolved, events = await _replay(store, e1, "s1")
         assert resolved == "s1"
         assert [e.message.method for e in events] == ["tools/list"]
+
+
+# ── Binding a payload to where it is stored ─────────────────────────────────
+
+
+def test_bound_payload_only_decrypts_in_its_own_context():
+    ring = _ring()
+    enc = encrypt_payload('{"a":1}', keyring=ring, context=event_context("stream-a"))
+    assert enc.startswith(f"{_BOUND_PREFIX}k1:")
+    assert decrypt_payload(enc, keyring=ring, context=event_context("stream-a")) == '{"a":1}'
+    with pytest.raises(Exception):  # noqa: B017 - cryptography's InvalidTag
+        decrypt_payload(enc, keyring=ring, context=event_context("stream-b"))
+    with pytest.raises(ValueError, match="no context"):
+        decrypt_payload(enc, keyring=ring)
+
+
+def test_unbound_payloads_stay_readable_under_any_context():
+    # Rows written before 2.1.1 carry no binding and must keep decrypting.
+    ring = _ring()
+    legacy = encrypt_payload('{"a":1}', keyring=ring)
+    assert legacy.startswith(f"{_ENC_PREFIX}k1:")
+    assert decrypt_payload(legacy, keyring=ring, context=event_context("anything")) == '{"a":1}'
+
+
+def test_binding_can_be_turned_off_for_a_rolling_upgrade():
+    key = generate_key()
+    ring = keyring_from_env({"MCP_PERSIST_ENCRYPTION_KEY": key, "MCP_PERSIST_ENCRYPTION_BIND_CONTEXT": "0"})
+    assert ring is not None and ring.bind_context is False
+    assert encrypt_payload("{}", keyring=ring, context=event_context("s")).startswith(_ENC_PREFIX)
+    assert keyring_from_env({"MCP_PERSIST_ENCRYPTION_KEY": key}).bind_context is True  # type: ignore[union-attr]
+    with pytest.raises(ValueError, match="BIND_CONTEXT"):
+        keyring_from_env({"MCP_PERSIST_ENCRYPTION_KEY": key, "MCP_PERSIST_ENCRYPTION_BIND_CONTEXT": "maybe"})
+
+
+@pytest.mark.anyio
+async def test_ciphertext_copied_into_another_stream_is_not_delivered():
+    # GCM authenticated the bytes but not their location, so a valid payload
+    # copied into another stream's row decrypted cleanly and was replayed there.
+    ring = _ring()
+    async with SQLiteEventStore.create(":memory:", ttl=None, keyring=ring) as store:
+        secret = await store.store_event("victim", JSONRPCRequest(jsonrpc="2.0", id="9", method="secret"))
+        anchor = await store.store_event("attacker", SAMPLE_MSG)
+        target = await store.store_event("attacker", SAMPLE_MSG)
+        async with store._conn.execute(f"SELECT payload FROM {store._table} WHERE event_id = ?", (int(secret),)) as cur:
+            (stolen,) = await cur.fetchone()
+        await store._conn.execute(f"UPDATE {store._table} SET payload = ? WHERE event_id = ?", (stolen, int(target)))
+        await store._conn.commit()
+
+        delivered = []
+
+        async def cb(event):
+            delivered.append(event.message.method)
+
+        await store.replay_events_after(anchor, cb)
+        assert delivered == []
+
+
+@pytest.mark.anyio
+async def test_legacy_unbound_rows_are_still_replayed():
+    ring = _ring()
+    async with SQLiteEventStore.create(":memory:", ttl=None, keyring=ring) as store:
+        anchor = await store.store_event("s", SAMPLE_MSG)
+        legacy = encrypt_payload(SAMPLE_MSG.model_dump_json(by_alias=True, exclude_none=True), keyring=ring)
+        await store._conn.execute(
+            f"INSERT INTO {store._table} (stream_id, payload, created_at) VALUES (?, ?, 0)", ("s", legacy)
+        )
+        await store._conn.commit()
+        delivered = []
+
+        async def cb(event):
+            delivered.append(event.message.method)
+
+        await store.replay_events_after(anchor, cb)
+        assert delivered == ["tools/list"]
+
+
+@pytest.mark.anyio
+async def test_record_payload_copied_to_another_record_is_not_read():
+    from mcp_persist.records import Record, record_store_for
+
+    ring = _ring()
+    async with SQLiteEventStore.create(":memory:", ttl=None, keyring=ring) as store:
+        records = record_store_for(store)
+        await records.initialize()
+        await records.store_records(
+            [
+                Record(protocol_version="v", method="tools/call", record_id="a", payload={"q": "secret"}),
+                Record(protocol_version="v", method="tools/call", record_id="b", payload={"q": "mine"}),
+            ]
+        )
+        await store._conn.execute(
+            "UPDATE mcp_records SET payload = (SELECT payload FROM mcp_records WHERE record_id = 'a') "
+            "WHERE record_id = 'b'"
+        )
+        await store._conn.commit()
+        by_id = {r.record_id: r.payload for r in await records.list_records()}
+        assert by_id == {"a": {"q": "secret"}, "b": None}

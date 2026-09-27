@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 import aiosqlite
 import httpx2 as httpx
@@ -137,11 +137,16 @@ class ControlledUpstream(httpx.AsyncBaseTransport):
         self.post_count = 0
         self.get_count = 0
         self.requests: list[tuple[str, dict[str, str]]] = []
+        self.raw_paths: list[bytes] = []
+        # If set, called with a GET's headers; a Response it returns is sent
+        # instead of the SSE stream (an auth failure, a 409, ...).
+        self.get_override: Callable[[dict[str, str]], httpx.Response | None] | None = None
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in request.headers.raw}
         await request.aread()
         self.requests.append((request.method, headers))
+        self.raw_paths.append(request.url.raw_path)
         if request.url.path not in ("/mcp", "/mcp/"):  # non-MCP paths: plain passthrough target
             return httpx.Response(200, headers=[(b"content-type", b"application/json")], content=b'{"ok":true}')
         if self.redirect_post and request.method == "POST" and request.url.path == "/mcp":
@@ -158,6 +163,10 @@ class ControlledUpstream(httpx.AsyncBaseTransport):
             return httpx.Response(200, headers=sse_headers, stream=_QueueStream(self.post_queue))
         if request.method == "GET":
             self.get_count += 1
+            if self.get_override is not None:
+                override = self.get_override(headers)
+                if override is not None:
+                    return override
             return httpx.Response(200, headers=sse_headers, stream=_QueueStream(self.get_queue))
         return httpx.Response(200, headers=[(b"content-type", b"application/json")], content=b'{"ok":true}')
 
@@ -201,11 +210,13 @@ class Client:
         headers: dict[str, str] | None = None,
         body: bytes = b"",
         query: bytes = b"",
+        raw_path: bytes | None = None,
     ) -> None:
         self.scope = {
             "type": "http",
             "method": method,
             "path": path,
+            "raw_path": raw_path if raw_path is not None else path.encode(),
             "query_string": query,
             "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in (headers or {}).items()],
         }
@@ -505,6 +516,133 @@ async def test_non_mcp_path_passthrough(make):
     assert json.loads(await c.read_json()) == {"ok": True}
     await c.finish()
     assert up.requests[0][0] == "GET"
+
+
+def _unauthorized(headers: dict[str, str]) -> httpx.Response | None:
+    if headers.get("authorization") == "Bearer good":
+        return None
+    return httpx.Response(401, headers=[(b"content-type", b"application/json")], content=b'{"error":"unauthorized"}')
+
+
+async def _store_post_stream(
+    proxy: PersistenceProxy, up: ControlledUpstream, headers: dict[str, str]
+) -> tuple[str, str]:
+    """Store a,b,c on a POST stream; return (session id, first event id)."""
+    up.feed(up.post_queue, "a", "b", "c")
+    p = Client(proxy, "POST", headers=headers, body=b'{"jsonrpc":"2.0","id":9,"method":"x"}')
+    _, post_headers = await p.start()
+    events = await p.read_all()
+    await p.finish()
+    first_id = events[0].original_id
+    assert first_id is not None
+    return post_headers["mcp-session-id"], first_id
+
+
+@pytest.mark.anyio
+async def test_get_forwards_upstream_rejection(make):
+    # An upstream that refuses the GET (bad credential, unknown session) used to
+    # be answered with an empty 200 SSE stream, hiding the error from the client.
+    up = ControlledUpstream()
+    up.get_override = _unauthorized
+    proxy = make(up)
+
+    c = Client(proxy, "GET", headers={"mcp-session-id": "S1", "authorization": "Bearer bad"})
+    status, _ = await c.start()
+    assert status == 401
+    assert json.loads(await c.read_json()) == {"error": "unauthorized"}
+    await c.finish()
+    assert proxy._buffers == {}
+
+
+@pytest.mark.anyio
+async def test_get_replay_requires_upstream_acceptance(make):
+    # Stored history used to be replayed before the upstream saw the request, so
+    # a session id alone was enough to read it, whatever the credential.
+    up = ControlledUpstream()
+    up.get_override = _unauthorized
+    proxy = make(up)
+    session, first_id = await _store_post_stream(proxy, up, {"mcp-session-id": "S1", "authorization": "Bearer good"})
+    proxy._buffers.clear()
+
+    thief = Client(proxy, "GET", headers={"mcp-session-id": session, "last-event-id": first_id})
+    status, _ = await thief.start()
+    assert status == 401
+    await thief.read_json()
+    await thief.finish()
+
+    up.get_queue.put_nowait(None)
+    owner = Client(
+        proxy, "GET", headers={"mcp-session-id": session, "last-event-id": first_id, "authorization": "Bearer good"}
+    )
+    status, _ = await owner.start()
+    assert status == 200
+    assert [e.data for e in await owner.read_all()] == [payload("b"), payload("c")]
+    await owner.finish()
+
+
+@pytest.mark.anyio
+async def test_live_get_stream_not_shared_with_a_different_credential(make):
+    up = ControlledUpstream()
+    up.get_override = _unauthorized
+    proxy = make(up)
+
+    a = Client(proxy, "GET", headers={"mcp-session-id": "S1", "authorization": "Bearer good"})
+    await a.start()
+    up.get_queue.put_nowait(sse("n1"))
+    (event,) = await a.read_events(1)
+    assert event.original_id is not None
+    a.disconnect()
+    await a.finish()
+    assert not proxy._buffers["S1:_GET_stream"].done
+
+    # A different credential is checked with the upstream, which refuses it.
+    thief = Client(proxy, "GET", headers={"mcp-session-id": "S1", "last-event-id": "0"})
+    status, _ = await thief.start()
+    assert status == 401
+    await thief.read_json()
+    await thief.finish()
+    assert up.get_count == 2
+
+
+@pytest.mark.anyio
+async def test_live_get_stream_shared_after_upstream_conflict(make):
+    # A refreshed credential the upstream accepts gets a 409 (the session's one
+    # GET stream is already open): that is acceptance, so the client attaches to
+    # the live buffer rather than being refused.
+    up = ControlledUpstream()
+    proxy = make(up)
+
+    a = Client(proxy, "GET", headers={"mcp-session-id": "S1", "authorization": "Bearer old"})
+    await a.start()
+    up.get_queue.put_nowait(sse("n1"))
+    (event,) = await a.read_events(1)
+    last_id = event.original_id
+    assert last_id is not None
+    a.disconnect()
+    await a.finish()
+
+    up.get_override = lambda headers: httpx.Response(409)
+    b = Client(proxy, "GET", headers={"mcp-session-id": "S1", "last-event-id": last_id, "authorization": "Bearer new"})
+    status, _ = await b.start()
+    assert status == 200
+    up.get_queue.put_nowait(sse("n2"))
+    up.get_queue.put_nowait(None)
+    assert [e.data for e in await b.read_all()] == [payload("n2")]
+    await b.finish()
+
+
+@pytest.mark.anyio
+async def test_passthrough_keeps_percent_encoding(make):
+    # scope["path"] is decoded: forwarding it turned "%3F" into a query string.
+    up = ControlledUpstream()
+    proxy = make(up)
+
+    c = Client(proxy, "GET", path="/files/a?b", raw_path=b"/files/a%3Fb", query=b"x=1")
+    status, _ = await c.start()
+    assert status == 200
+    await c.read_json()
+    await c.finish()
+    assert up.raw_paths == [b"/files/a%3Fb?x=1"]
 
 
 # ── proxy replay metrics: _store_replay (cold reconnect, no live buffer) ───────

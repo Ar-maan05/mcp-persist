@@ -536,3 +536,29 @@ def test_retention_policy_from_env_validation_errors():
                 "MCP_PERSIST_RETENTION_WINDOWS": '{"team-a": "abc"}',
             }
         )
+
+
+@pytest.mark.anyio
+async def test_database_audit_sink_validates_an_explicit_table_name(sqlite_conn):
+    # An explicit audit_table was interpolated into DDL and INSERTs verbatim.
+    store = SQLiteEventStore(sqlite_conn, table_name="test_ev", ttl=None)
+    await store.initialize()
+    for bad in ("audit; DROP TABLE test_ev", "a.b.c", "", 'x"y'):
+        with pytest.raises(ValueError, match="audit_table"):
+            DatabaseAuditSink(store, audit_table=bad)
+
+    sink = DatabaseAuditSink(store, audit_table='"my_audit"')
+    await sink.record(
+        DeletionAuditEntry(
+            timestamp=1.0,
+            tenant_id=None,
+            window_seconds=60,
+            cutoff=0.0,
+            deleted_count=0,
+            backend="sqlite",
+            source_table='"test_ev"',
+            default_applied=True,
+        )
+    )
+    async with sqlite_conn.execute("SELECT COUNT(*) FROM my_audit") as cur:
+        assert (await cur.fetchone())[0] == 1
