@@ -200,3 +200,43 @@ async def test_sqlite_rows_from_before_the_tenant_key_fix_are_merged() -> None:
             assert (await cursor.fetchone())[0] == 0
     finally:
         await conn.close()
+
+
+async def test_handshake_round_trips_and_the_first_one_is_kept(registry) -> None:
+    handshake = {"protocolVersion": "2025-06-18", "capabilities": {"sampling": {}}, "clientInfo": {"name": "c"}}
+    await registry.register("sess-h", handshake=handshake)
+    record = await registry.get("sess-h")
+    assert record is not None and record.handshake == handshake
+
+    # A re-register never replaces what the session was actually opened with.
+    await registry.register("sess-h", handshake={"protocolVersion": "other"})
+    again = await registry.get("sess-h")
+    assert again is not None and again.handshake == handshake
+
+    await registry.register("sess-none")
+    none = await registry.get("sess-none")
+    assert none is not None and none.handshake is None
+    assert [r.handshake for r in await registry.list_sessions() if r.session_id == "sess-h"] == [handshake]
+
+
+async def test_sqlite_table_from_before_the_handshake_column_is_upgraded() -> None:
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        await conn.execute(
+            "CREATE TABLE mcp_sessions (session_id TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT '', "
+            "created_at REAL NOT NULL, last_seen_at REAL NOT NULL, terminated INTEGER NOT NULL DEFAULT 0, "
+            "owner TEXT, PRIMARY KEY (session_id, tenant_id))"
+        )
+        await conn.execute("INSERT INTO mcp_sessions VALUES ('old', '', 1.0, 2.0, 0, NULL)")
+        store = SQLiteEventStore(conn, table_name="events", ttl=None)
+        await store.initialize()
+        registry = session_registry_for(store)
+        await registry.initialize()
+
+        old = await registry.get("old")
+        assert old is not None and old.handshake is None
+        await registry.register("new", handshake={"protocolVersion": "2025-06-18"})
+        new = await registry.get("new")
+        assert new is not None and new.handshake == {"protocolVersion": "2025-06-18"}
+    finally:
+        await conn.close()

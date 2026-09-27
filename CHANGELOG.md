@@ -5,6 +5,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **An adopted durable session serves ordinary requests.** A process that adopted a session started a fresh connection that had never seen the client's `initialize`, and the SDK refuses every method but `ping` until it has, so after a restart or on another worker `tools/list`, `tools/call` and the rest failed with `-32602`. The `initialize` params are now recorded with the session, and the adopting process restores the handshake from them. Sessions recorded before this release have no handshake and are adopted as before.
+
+### Added
+- `SessionRecord.handshake`, and a `handshake=` keyword on `SessionRegistry.register`. The SQL registries add a `handshake` column to an existing table on startup. A custom registry whose `register` does not take `handshake` keeps working; its sessions are adopted uninitialized.
+
 ## [2.1.1] - 2026-09-26
 
 **A security and correctness release.** Every change here is a fix found in a full review of the package. Upgrading is recommended for everyone, and strongly for anyone running the proxy, the dashboard, batching on Postgres, multi-tenant stores or encryption at rest. One behavior needs attention during a rolling upgrade: see the encryption entry.

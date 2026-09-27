@@ -14,8 +14,10 @@ reconnect, not client-library behaviour.
 from __future__ import annotations
 
 import contextlib
+import json
 import socket
-from collections.abc import AsyncIterator
+import uuid
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,28 @@ from mcp_persist import SQLiteEventStore, with_persistence
 from mcp_persist.sessions import SessionRecord, _owner_matches, session_registry_for
 
 pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture(autouse=True)
+def _one_process_many_servers() -> Iterator[None]:
+    """Let several uvicorn servers run one after another in this process.
+
+    sse-starlette watches for a uvicorn shutdown and, once it sees one, ends
+    every SSE response in the process for good. A real restart is a new
+    process, but these tests "restart" by starting a second server in this one,
+    which would then have every stream cut off. Stop it from watching.
+    """
+    from sse_starlette.sse import AppStatus
+
+    saved = AppStatus.enable_automatic_graceful_drain
+    AppStatus.enable_automatic_graceful_drain = False
+    AppStatus.should_exit = False
+    try:
+        yield
+    finally:
+        AppStatus.enable_automatic_graceful_drain = saved
+        AppStatus.should_exit = False
+
 
 _INIT_BODY: dict[str, Any] = {
     "jsonrpc": "2.0",
@@ -275,6 +299,7 @@ def test_session_record_as_dict_is_json_shaped() -> None:
         "terminated": False,
         "owner": None,
         "metadata": {},
+        "handshake": None,
     }
 
 
@@ -288,9 +313,9 @@ async def test_a_new_session_is_recorded_before_the_client_learns_its_id(
 
     real_register = SQLiteSessionRegistry.register
 
-    async def slow_register(self, session_id, *, owner=None):  # type: ignore[no-untyped-def]
+    async def slow_register(self, session_id, **kwargs):  # type: ignore[no-untyped-def]
         await anyio.sleep(0.5)
-        await real_register(self, session_id, owner=owner)
+        await real_register(self, session_id, **kwargs)
 
     monkeypatch.setattr(SQLiteSessionRegistry, "register", slow_register)
 
@@ -301,3 +326,80 @@ async def test_a_new_session_is_recorded_before_the_client_learns_its_id(
     async with _serve(app_a, worker_a) as url_a, _serve(app_b, worker_b) as url_b:
         session_id = await _initialize(url_a)
         assert await _reconnect_status(url_b, session_id) == 200
+
+
+async def _call(url: str, session_id: str, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    """One JSON-RPC request on ``session_id``; returns the response message."""
+    body: dict[str, Any] = {"jsonrpc": "2.0", "id": uuid.uuid4().hex, "method": method}
+    if params is not None:
+        body["params"] = params
+    headers = {**_HEADERS, "Mcp-Session-Id": session_id, "Mcp-Protocol-Version": "2025-06-18"}
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        response = await client.post(url, json=body, headers=headers)
+    assert response.status_code == 200, response.text
+    if response.headers["content-type"].startswith("application/json"):
+        return response.json()
+    data = [line[len("data:") :].strip() for line in response.text.splitlines() if line.startswith("data:")]
+    return json.loads(next(d for d in data if d))
+
+
+async def test_an_adopted_session_serves_ordinary_requests_after_a_restart(tmp_path: Path) -> None:
+    # The client finished `initialize` with the old process and will not send it
+    # again, and a fresh connection that never saw it answered every method but
+    # `ping` with -32602. The handshake is now recorded with the session and
+    # restored by the process that adopts it.
+    db = str(tmp_path / "events.db")
+    port = _free_port()
+
+    app1 = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=True)
+    async with _serve(app1, port) as url:
+        session_id = await _initialize(url)
+
+    app2 = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=True)
+    async with _serve(app2, port) as url:
+        listed = await _call(url, session_id, "tools/list")
+        assert [tool["name"] for tool in listed["result"]["tools"]] == ["echo"]
+        await anyio.sleep(0.6)  # later requests too, not just a burst right after adoption
+        called = await _call(url, session_id, "tools/call", {"name": "echo", "arguments": {"message": "hi"}})
+        assert called["result"]["structuredContent"] == {"echo": "hi"}
+
+
+async def test_the_handshake_is_recorded_with_the_session(tmp_path: Path) -> None:
+    db = str(tmp_path / "events.db")
+    port = _free_port()
+    app = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=True)
+    async with _serve(app, port) as url:
+        session_id = await _initialize(url)
+
+    async with SQLiteEventStore.create(db) as store:
+        registry = session_registry_for(store)
+        await registry.initialize()
+        record = await registry.get(session_id)
+    assert record is not None
+    assert record.handshake == _INIT_BODY["params"]
+
+
+async def test_a_registry_without_the_handshake_keyword_still_works(tmp_path: Path) -> None:
+    # SessionRegistry is public, and one written against 2.1 has no `handshake`
+    # parameter. Sessions are still recorded and adopted; they just are not
+    # restored as initialized.
+    from mcp_persist.sessions import SQLiteSessionRegistry
+
+    real_register = SQLiteSessionRegistry.register
+
+    async def register_2_1(self, session_id, *, owner=None):  # type: ignore[no-untyped-def]
+        await real_register(self, session_id, owner=owner)
+
+    original = SQLiteSessionRegistry.register
+    SQLiteSessionRegistry.register = register_2_1  # type: ignore[method-assign]
+    try:
+        db = str(tmp_path / "events.db")
+        port = _free_port()
+        app1 = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=True)
+        async with _serve(app1, port) as url:
+            session_id = await _initialize(url)
+        app2 = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=True)
+        async with _serve(app2, port) as url:
+            assert (await _call(url, session_id, "ping"))["result"] == {}
+    finally:
+        SQLiteSessionRegistry.register = original  # type: ignore[method-assign]

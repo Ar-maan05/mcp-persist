@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import json
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
@@ -37,9 +38,11 @@ from mcp.server.auth.middleware.bearer_auth import (
     AuthorizationContext,
     authorization_context,
 )
-from mcp.server.runner import serve_loop
+from mcp.server.connection import Connection
+from mcp.server.runner import ServerRunner, serve_connection
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER, StreamableHTTPServerTransport
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
 from starlette.requests import Request
 
 from mcp_persist.sessions import _owner_matches
@@ -58,6 +61,11 @@ logger = logging.getLogger(__name__)
 # builds its own `idle_scope` in connect(), and pushes the deadline back while
 # requests are in flight. Earlier SDKs left all of that to the manager.
 _TRANSPORT_OWNS_IDLE_TIMEOUT = "idle_timeout" in inspect.signature(StreamableHTTPServerTransport.__init__).parameters
+
+# The largest opening request body inspected for its `initialize` params. A real
+# initialize is a few hundred bytes; anything past this is not worth buffering
+# a copy of, and the session is still recorded, just without its handshake.
+_MAX_HANDSHAKE_BODY_BYTES = 64 * 1024
 
 
 class ResumableSessionManager(StreamableHTTPSessionManager):
@@ -90,6 +98,12 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
             )
         self._registry = registry
         self._adopt_sessions = adopt_sessions
+        # A registry written against 2.1 has no `handshake` keyword; it keeps
+        # working, and its adopted sessions are served uninitialized as before.
+        register_params = inspect.signature(registry.register).parameters
+        self._registry_takes_handshake = "handshake" in register_params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in register_params.values()
+        )
         # Set once the manager starts shutting down. From mcp 2.2 the SDK
         # terminates every session's transport as its task is cancelled, and a
         # restart must not be recorded as the client ending its sessions: that
@@ -120,6 +134,17 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
 
         known_before = set(self._server_instances)
         registered: set[str] = set()
+        opening_body = bytearray()
+
+        async def receive_and_keep_opening_body() -> Message:
+            # Only a request without a session id can open one, and it has to be
+            # `initialize`. Keep a copy of its body so the handshake can be
+            # recorded with the session and restored by whichever process adopts
+            # it later.
+            message = await receive()
+            if message["type"] == "http.request" and len(opening_body) <= _MAX_HANDSHAKE_BODY_BYTES:
+                opening_body.extend(message.get("body", b""))
+            return message
 
         async def send_once_registered(message: Message) -> None:
             # A new session is recorded before the response that hands the client
@@ -130,15 +155,23 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
                 new_id = _response_session_id(message)
                 if new_id is not None and new_id not in known_before and new_id not in registered:
                     registered.add(new_id)
-                    await self._register(new_id, requestor)
+                    await self._register(new_id, requestor, _initialize_params(opening_body))
             await send(message)
 
-        await super()._handle_stateful_request(scope, receive, send_once_registered)
-        await self._reconcile(known_before, session_id, requestor, registered)
+        opening = session_id is None
+        await super()._handle_stateful_request(
+            scope, receive_and_keep_opening_body if opening else receive, send_once_registered
+        )
+        await self._reconcile(known_before, session_id, requestor, registered, _initialize_params(opening_body))
 
-    async def _register(self, session_id: str, requestor: dict[str, Any] | None) -> None:
+    async def _register(
+        self, session_id: str, requestor: dict[str, Any] | None, handshake: dict[str, Any] | None
+    ) -> None:
         try:
-            await self._registry.register(session_id, owner=requestor)
+            if self._registry_takes_handshake:
+                await self._registry.register(session_id, owner=requestor, handshake=handshake)
+            else:
+                await self._registry.register(session_id, owner=requestor)
         except Exception:
             # A registry outage costs this session its durability, not its
             # response: the client still gets a working session on this worker.
@@ -150,6 +183,7 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
         session_id: str | None,
         requestor: dict[str, Any] | None,
         registered: set[str],
+        handshake: dict[str, Any] | None,
     ) -> None:
         """Record what the upstream handler just did.
 
@@ -161,7 +195,7 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
         """
         for new_id in set(self._server_instances) - known_before:
             if new_id not in registered:
-                await self._register(new_id, requestor)
+                await self._register(new_id, requestor, handshake)
             self._hook_termination(self._server_instances[new_id], new_id)
 
         if session_id is None:
@@ -278,13 +312,7 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
                                 idle_scope.deadline = anyio.current_time() + self.session_idle_timeout
                                 transport.idle_scope = idle_scope
                         with idle_scope:
-                            await serve_loop(
-                                self.app,
-                                read_stream,
-                                write_stream,
-                                lifespan_state=self._lifespan_state,
-                                session_id=session_id,
-                            )
+                            await self._serve_adopted(read_stream, write_stream, session_id, record.handshake)
                         if idle_scope.cancelled_caught:
                             self._server_instances.pop(session_id, None)
                             self._session_owners.pop(session_id, None)
@@ -301,6 +329,49 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
             await self._registry.touch(session_id)
             await transport.handle_request(scope, receive, send)
             return True
+
+    async def _serve_adopted(
+        self, read_stream: Any, write_stream: Any, session_id: str, handshake: dict[str, Any] | None
+    ) -> None:
+        """Serve an adopted session, with its handshake already in place.
+
+        The same dispatcher and connection ``serve_loop`` builds, except that the
+        connection starts initialized from the recorded ``initialize`` params.
+        The client finished its handshake with the process that created the
+        session and will not repeat it, and a connection that never saw it
+        refuses every method but ``ping``.
+        """
+        dispatcher: JSONRPCDispatcher[Any] = JSONRPCDispatcher(
+            read_stream, write_stream, inline_methods=frozenset({"initialize"})
+        )
+        connection = Connection.for_loop(dispatcher, session_id=session_id)
+        if handshake is not None:
+            try:
+                client_params, protocol_version = ServerRunner._negotiate_initialize(handshake)
+            except Exception:
+                logger.warning(
+                    "Recorded handshake for session %s is unreadable; serving it uninitialized", session_id[:64]
+                )
+            else:
+                connection.client_params = client_params
+                connection.protocol_version = protocol_version
+                connection.initialized.set()
+        await serve_connection(self.app, dispatcher, connection=connection, lifespan_state=self._lifespan_state)
+
+
+def _initialize_params(body: bytes | bytearray) -> dict[str, Any] | None:
+    """The params of the ``initialize`` request in an opening request body, if any."""
+    if not body or len(body) > _MAX_HANDSHAKE_BODY_BYTES:
+        return None
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return None
+    for message in payload if isinstance(payload, list) else [payload]:
+        if isinstance(message, dict) and message.get("method") == "initialize":
+            params = message.get("params")
+            return params if isinstance(params, dict) else None
+    return None
 
 
 def _response_session_id(message: Message) -> str | None:

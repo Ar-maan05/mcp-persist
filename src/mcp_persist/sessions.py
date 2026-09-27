@@ -59,6 +59,11 @@ class SessionRecord:
         owner: The ``AuthorizationContext`` of the principal that created the
             session, or None when the server runs unauthenticated. Adoption
             compares this against the requesting principal.
+        handshake: The params of the client's ``initialize`` request, or None
+            if they were not captured. A process that adopts the session
+            restores the handshake from them, since the client will not send
+            ``initialize`` again, and an uninitialized connection refuses every
+            method but ``ping``.
     """
 
     session_id: str
@@ -67,6 +72,7 @@ class SessionRecord:
     terminated: bool = False
     owner: dict[str, Any] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    handshake: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable view, for the CLI and for logs."""
@@ -77,6 +83,7 @@ class SessionRecord:
             "terminated": self.terminated,
             "owner": self.owner,
             "metadata": self.metadata,
+            "handshake": self.handshake,
         }
 
 
@@ -88,8 +95,10 @@ class SessionRegistry(ABC):
         """Create whatever storage the registry needs. Idempotent."""
 
     @abstractmethod
-    async def register(self, session_id: str, *, owner: dict[str, Any] | None = None) -> None:
-        """Record a newly created session."""
+    async def register(
+        self, session_id: str, *, owner: dict[str, Any] | None = None, handshake: dict[str, Any] | None = None
+    ) -> None:
+        """Record a newly created session, with the client's ``initialize`` params when known."""
 
     @abstractmethod
     async def get(self, session_id: str) -> SessionRecord | None:
@@ -147,7 +156,7 @@ class _SQLSessionRegistry(SessionRegistry):
         self._ready = False
 
     @staticmethod
-    def _decode_owner(raw: Any) -> dict[str, Any] | None:
+    def _decode_json(raw: Any) -> dict[str, Any] | None:
         if raw is None:
             return None
         if isinstance(raw, dict):
@@ -155,13 +164,13 @@ class _SQLSessionRegistry(SessionRegistry):
         try:
             decoded = json.loads(raw)
         except (TypeError, ValueError):
-            logger.warning("Ignoring unreadable owner payload on session record")
+            logger.warning("Ignoring an unreadable JSON field on a session record")
             return None
         return decoded if isinstance(decoded, dict) else None
 
     @staticmethod
-    def _encode_owner(owner: dict[str, Any] | None) -> str | None:
-        return None if owner is None else json.dumps(owner, sort_keys=True)
+    def _encode_json(value: dict[str, Any] | None) -> str | None:
+        return None if value is None else json.dumps(value, sort_keys=True)
 
 
 class SQLiteSessionRegistry(_SQLSessionRegistry):
@@ -199,12 +208,21 @@ class SQLiteSessionRegistry(_SQLSessionRegistry):
             "  last_seen_at REAL NOT NULL,"
             "  terminated INTEGER NOT NULL DEFAULT 0,"
             "  owner TEXT,"
+            "  handshake TEXT,"
             "  PRIMARY KEY (session_id, tenant_id)"
             ")"
         )
+        await self._add_handshake_column()
         await self._migrate_null_tenants()
         await self._conn.commit()
         self._ready = True
+
+    async def _add_handshake_column(self) -> None:
+        """Add the ``handshake`` column to a table created before 2.2."""
+        bare = self._table.strip('"')
+        async with self._conn.execute(f"SELECT 1 FROM pragma_table_info('{bare}') WHERE name = 'handshake'") as cursor:
+            if await cursor.fetchone() is None:
+                await self._conn.execute(f"ALTER TABLE {self._table} ADD COLUMN handshake TEXT")
 
     async def _migrate_null_tenants(self) -> None:
         """Fold rows written with a NULL tenant (before 2.1.1) into the '' key.
@@ -231,23 +249,27 @@ class SQLiteSessionRegistry(_SQLSessionRegistry):
             merged,
         )
 
-    async def register(self, session_id: str, *, owner: dict[str, Any] | None = None) -> None:
+    async def register(
+        self, session_id: str, *, owner: dict[str, Any] | None = None, handshake: dict[str, Any] | None = None
+    ) -> None:
         await self.initialize()
         now = time.time()
         # A re-register of a live id refreshes it rather than resetting created_at,
         # and never silently revives a terminated session.
         await self._conn.execute(
-            f"INSERT INTO {self._table} (session_id, tenant_id, created_at, last_seen_at, terminated, owner) "
-            "VALUES (?, ?, ?, ?, 0, ?) "
-            "ON CONFLICT(session_id, tenant_id) DO UPDATE SET last_seen_at = excluded.last_seen_at",
-            (session_id, self._tenant_key, now, now, self._encode_owner(owner)),
+            f"INSERT INTO {self._table} "
+            "(session_id, tenant_id, created_at, last_seen_at, terminated, owner, handshake) "
+            "VALUES (?, ?, ?, ?, 0, ?, ?) "
+            "ON CONFLICT(session_id, tenant_id) DO UPDATE SET last_seen_at = excluded.last_seen_at, "
+            "handshake = COALESCE(handshake, excluded.handshake)",
+            (session_id, self._tenant_key, now, now, self._encode_json(owner), self._encode_json(handshake)),
         )
         await self._conn.commit()
 
     async def get(self, session_id: str) -> SessionRecord | None:
         await self.initialize()
         async with self._conn.execute(
-            f"SELECT session_id, created_at, last_seen_at, terminated, owner FROM {self._table} "
+            f"SELECT session_id, created_at, last_seen_at, terminated, owner, handshake FROM {self._table} "
             "WHERE session_id = ? AND tenant_id = ?",
             (session_id, self._tenant_key),
         ) as cursor:
@@ -259,7 +281,8 @@ class SQLiteSessionRegistry(_SQLSessionRegistry):
             created_at=row[1],
             last_seen_at=row[2],
             terminated=bool(row[3]),
-            owner=self._decode_owner(row[4]),
+            owner=self._decode_json(row[4]),
+            handshake=self._decode_json(row[5]),
         )
 
     async def touch(self, session_id: str) -> None:
@@ -280,7 +303,10 @@ class SQLiteSessionRegistry(_SQLSessionRegistry):
 
     async def list_sessions(self, *, include_terminated: bool = False, limit: int = 100) -> list[SessionRecord]:
         await self.initialize()
-        query = f"SELECT session_id, created_at, last_seen_at, terminated, owner FROM {self._table} WHERE tenant_id = ?"
+        query = (
+            f"SELECT session_id, created_at, last_seen_at, terminated, owner, handshake FROM {self._table} "
+            "WHERE tenant_id = ?"
+        )
         params: list[Any] = [self._tenant_key]
         if not include_terminated:
             query += " AND terminated = 0"
@@ -294,7 +320,8 @@ class SQLiteSessionRegistry(_SQLSessionRegistry):
                 created_at=r[1],
                 last_seen_at=r[2],
                 terminated=bool(r[3]),
-                owner=self._decode_owner(r[4]),
+                owner=self._decode_json(r[4]),
+                handshake=self._decode_json(r[5]),
             )
             for r in rows
         ]
@@ -335,9 +362,12 @@ class PostgresSessionRegistry(_SQLSessionRegistry):
             "  last_seen_at DOUBLE PRECISION NOT NULL,"
             "  terminated BOOLEAN NOT NULL DEFAULT FALSE,"
             "  owner JSONB,"
+            "  handshake JSONB,"
             "  PRIMARY KEY (session_id, tenant_id)"
             ")"
         )
+        # Tables created before 2.2 have no handshake column.
+        await self._pool.execute(f"ALTER TABLE {self._table} ADD COLUMN IF NOT EXISTS handshake JSONB")
         self._ready = True
 
     @property
@@ -346,24 +376,29 @@ class PostgresSessionRegistry(_SQLSessionRegistry):
         # column uses '' for "no tenant" to keep the key usable.
         return self._tenant_id or ""
 
-    async def register(self, session_id: str, *, owner: dict[str, Any] | None = None) -> None:
+    async def register(
+        self, session_id: str, *, owner: dict[str, Any] | None = None, handshake: dict[str, Any] | None = None
+    ) -> None:
         await self.initialize()
         now = time.time()
         await self._pool.execute(
-            f"INSERT INTO {self._table} (session_id, tenant_id, created_at, last_seen_at, terminated, owner) "
-            "VALUES ($1, $2, $3, $4, FALSE, $5) "
-            "ON CONFLICT (session_id, tenant_id) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at",
+            f"INSERT INTO {self._table} "
+            "(session_id, tenant_id, created_at, last_seen_at, terminated, owner, handshake) "
+            "VALUES ($1, $2, $3, $4, FALSE, $5, $6) "
+            "ON CONFLICT (session_id, tenant_id) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at, "
+            f"handshake = COALESCE({self._table}.handshake, EXCLUDED.handshake)",
             session_id,
             self._tenant_key,
             now,
             now,
-            self._encode_owner(owner),
+            self._encode_json(owner),
+            self._encode_json(handshake),
         )
 
     async def get(self, session_id: str) -> SessionRecord | None:
         await self.initialize()
         row = await self._pool.fetchrow(
-            f"SELECT session_id, created_at, last_seen_at, terminated, owner FROM {self._table} "
+            f"SELECT session_id, created_at, last_seen_at, terminated, owner, handshake FROM {self._table} "
             "WHERE session_id = $1 AND tenant_id = $2",
             session_id,
             self._tenant_key,
@@ -375,7 +410,8 @@ class PostgresSessionRegistry(_SQLSessionRegistry):
             created_at=row["created_at"],
             last_seen_at=row["last_seen_at"],
             terminated=bool(row["terminated"]),
-            owner=self._decode_owner(row["owner"]),
+            owner=self._decode_json(row["owner"]),
+            handshake=self._decode_json(row["handshake"]),
         )
 
     async def touch(self, session_id: str) -> None:
@@ -399,7 +435,8 @@ class PostgresSessionRegistry(_SQLSessionRegistry):
     async def list_sessions(self, *, include_terminated: bool = False, limit: int = 100) -> list[SessionRecord]:
         await self.initialize()
         query = (
-            f"SELECT session_id, created_at, last_seen_at, terminated, owner FROM {self._table} WHERE tenant_id = $1"
+            f"SELECT session_id, created_at, last_seen_at, terminated, owner, handshake FROM {self._table} "
+            "WHERE tenant_id = $1"
         )
         if not include_terminated:
             query += " AND terminated = FALSE"
@@ -411,7 +448,8 @@ class PostgresSessionRegistry(_SQLSessionRegistry):
                 created_at=r["created_at"],
                 last_seen_at=r["last_seen_at"],
                 terminated=bool(r["terminated"]),
-                owner=self._decode_owner(r["owner"]),
+                owner=self._decode_json(r["owner"]),
+                handshake=self._decode_json(r["handshake"]),
             )
             for r in rows
         ]
@@ -455,10 +493,12 @@ class RedisSessionRegistry(SessionRegistry):
     async def initialize(self) -> None:
         """No schema to create; Redis keys are made on write."""
 
-    async def register(self, session_id: str, *, owner: dict[str, Any] | None = None) -> None:
+    async def register(
+        self, session_id: str, *, owner: dict[str, Any] | None = None, handshake: dict[str, Any] | None = None
+    ) -> None:
         now = time.time()
         key = self._key(session_id)
-        existing = await self._redis.hmget(key, ["created_at", "terminated"])
+        existing = await self._redis.hmget(key, ["created_at", "terminated", "handshake"])
         created = _to_str(existing[0]) or repr(now)
         # Preserve an existing terminated flag: re-registering an id must never
         # revive a session that was ended, or it could be adopted again. The SQL
@@ -470,6 +510,9 @@ class RedisSessionRegistry(SessionRegistry):
             "last_seen_at": repr(now),
             "terminated": terminated,
             "owner": json.dumps(owner, sort_keys=True) if owner is not None else "",
+            # Like the SQL backends, a re-register keeps the handshake first recorded.
+            "handshake": _to_str(existing[2])
+            or (json.dumps(handshake, sort_keys=True) if handshake is not None else ""),
         }
         async with self._redis.pipeline(transaction=False) as pipe:
             pipe.hset(key, mapping=mapping)
@@ -497,6 +540,7 @@ class RedisSessionRegistry(SessionRegistry):
             last_seen_at=float(data.get("last_seen_at") or 0.0),
             terminated=data.get("terminated") == "1",
             owner=owner,
+            handshake=_json_object(data.get("handshake") or ""),
         )
 
     async def touch(self, session_id: str) -> None:
@@ -560,6 +604,18 @@ class RedisSessionRegistry(SessionRegistry):
             pipe.zrem(self._index_key, *names)
             await pipe.execute()
         return len(names)
+
+
+def _json_object(raw: str) -> dict[str, Any] | None:
+    """Decode a JSON object stored as text, or None if absent or unreadable."""
+    if not raw:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        logger.warning("Ignoring an unreadable JSON field on a session record")
+        return None
+    return decoded if isinstance(decoded, dict) else None
 
 
 def _to_str(value: Any) -> str | None:
