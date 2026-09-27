@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from anyio.abc import TaskStatus
-    from starlette.types import Receive, Scope, Send
+    from starlette.types import Message, Receive, Scope, Send
 
     from mcp_persist.sessions import SessionRegistry
 
@@ -119,23 +119,49 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
             # the client, matching how the SDK hides an owner mismatch.
 
         known_before = set(self._server_instances)
-        await super()._handle_stateful_request(scope, receive, send)
-        await self._reconcile(known_before, session_id, requestor)
+        registered: set[str] = set()
+
+        async def send_once_registered(message: Message) -> None:
+            # A new session is recorded before the response that hands the client
+            # its id goes out. Recording it afterwards left a window in which a
+            # client that went straight to another worker found no record and
+            # got a 404.
+            if message["type"] == "http.response.start" and message["status"] < 400:
+                new_id = _response_session_id(message)
+                if new_id is not None and new_id not in known_before and new_id not in registered:
+                    registered.add(new_id)
+                    await self._register(new_id, requestor)
+            await send(message)
+
+        await super()._handle_stateful_request(scope, receive, send_once_registered)
+        await self._reconcile(known_before, session_id, requestor, registered)
+
+    async def _register(self, session_id: str, requestor: dict[str, Any] | None) -> None:
+        try:
+            await self._registry.register(session_id, owner=requestor)
+        except Exception:
+            # A registry outage costs this session its durability, not its
+            # response: the client still gets a working session on this worker.
+            logger.exception("Failed to record session %s in the durable registry", session_id[:64])
 
     async def _reconcile(
         self,
         known_before: set[str],
         session_id: str | None,
         requestor: dict[str, Any] | None,
+        registered: set[str],
     ) -> None:
         """Record what the upstream handler just did.
 
         Rather than reimplement the SDK's session creation to learn the new id,
         diff the manager's own instance map across the call. That keeps this
-        working if the creation path changes shape upstream.
+        working if the creation path changes shape upstream. A new session is
+        normally recorded already, as its response went out; this catches one
+        whose id reached the client some other way.
         """
         for new_id in set(self._server_instances) - known_before:
-            await self._registry.register(new_id, owner=requestor)
+            if new_id not in registered:
+                await self._register(new_id, requestor)
             self._hook_termination(self._server_instances[new_id], new_id)
 
         if session_id is None:
@@ -275,6 +301,15 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
             await self._registry.touch(session_id)
             await transport.handle_request(scope, receive, send)
             return True
+
+
+def _response_session_id(message: Message) -> str | None:
+    """The ``Mcp-Session-Id`` a response start message assigns, if any."""
+    header = MCP_SESSION_ID_HEADER.lower().encode("latin-1")
+    for name, value in message.get("headers", ()):
+        if name.lower() == header:
+            return value.decode("latin-1")
+    return None
 
 
 def _requestor_of(scope: Scope) -> dict[str, Any] | None:

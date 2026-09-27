@@ -276,3 +276,28 @@ def test_session_record_as_dict_is_json_shaped() -> None:
         "owner": None,
         "metadata": {},
     }
+
+
+async def test_a_new_session_is_recorded_before_the_client_learns_its_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The session was registered after the initialize response had gone out, so
+    # a client that went straight to another worker could beat the write and get
+    # a 404. A slow registry write makes that window wide enough to hit reliably.
+    from mcp_persist.sessions import SQLiteSessionRegistry
+
+    real_register = SQLiteSessionRegistry.register
+
+    async def slow_register(self, session_id, *, owner=None):  # type: ignore[no-untyped-def]
+        await anyio.sleep(0.5)
+        await real_register(self, session_id, owner=owner)
+
+    monkeypatch.setattr(SQLiteSessionRegistry, "register", slow_register)
+
+    db = str(tmp_path / "events.db")
+    worker_a, worker_b = _free_port(), _free_port()
+    app_a = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=True)
+    app_b = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=True)
+    async with _serve(app_a, worker_a) as url_a, _serve(app_b, worker_b) as url_b:
+        session_id = await _initialize(url_a)
+        assert await _reconnect_status(url_b, session_id) == 200
