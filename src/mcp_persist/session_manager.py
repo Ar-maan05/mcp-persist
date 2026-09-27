@@ -26,6 +26,8 @@ is public for callers who wire the session manager themselves.
 
 from __future__ import annotations
 
+import contextlib
+import inspect
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
@@ -43,12 +45,19 @@ from starlette.requests import Request
 from mcp_persist.sessions import _owner_matches
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from anyio.abc import TaskStatus
     from starlette.types import Receive, Scope, Send
 
     from mcp_persist.sessions import SessionRegistry
 
 logger = logging.getLogger(__name__)
+
+# mcp 2.2 moved the idle timeout into the transport: it takes `idle_timeout`,
+# builds its own `idle_scope` in connect(), and pushes the deadline back while
+# requests are in flight. Earlier SDKs left all of that to the manager.
+_TRANSPORT_OWNS_IDLE_TIMEOUT = "idle_timeout" in inspect.signature(StreamableHTTPServerTransport.__init__).parameters
 
 
 class ResumableSessionManager(StreamableHTTPSessionManager):
@@ -81,6 +90,20 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
             )
         self._registry = registry
         self._adopt_sessions = adopt_sessions
+        # Set once the manager starts shutting down. From mcp 2.2 the SDK
+        # terminates every session's transport as its task is cancelled, and a
+        # restart must not be recorded as the client ending its sessions: that
+        # would make the very restart durable sessions exist for unrecoverable.
+        self._shutting_down = False
+
+    @contextlib.asynccontextmanager
+    async def run(self) -> AsyncIterator[None]:
+        async with super().run():
+            try:
+                yield
+            finally:
+                # Runs before the SDK's own teardown cancels the session tasks.
+                self._shutting_down = True
 
     async def _handle_stateful_request(self, scope: Scope, receive: Receive, send: Send) -> None:
         request = Request(scope, receive)
@@ -143,6 +166,10 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
             try:
                 await original()
             finally:
+                if self._shutting_down:
+                    # The process is going away, not the session: leave it live
+                    # in the registry so the next process can adopt it.
+                    return
                 try:
                     await registry.terminate(session_id)
                 except Exception:  # pragma: no cover - never break teardown
@@ -189,12 +216,16 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
                 await self._server_instances[session_id].handle_request(scope, receive, send)
                 return True
 
+            transport_kwargs: dict[str, Any] = {}
+            if _TRANSPORT_OWNS_IDLE_TIMEOUT:
+                transport_kwargs["idle_timeout"] = self.session_idle_timeout
             transport = StreamableHTTPServerTransport(
                 mcp_session_id=session_id,
                 is_json_response_enabled=self.json_response,
                 event_store=self.event_store,
                 security_settings=self.security_settings,
                 retry_interval=self.retry_interval,
+                **transport_kwargs,
             )
             if requestor is not None:
                 # The registry round-trips the context as a plain dict (it has to
@@ -210,10 +241,16 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
                     read_stream, write_stream = streams
                     task_status.started()
                     try:
-                        idle_scope = anyio.CancelScope()
-                        if self.session_idle_timeout is not None:
-                            idle_scope.deadline = anyio.current_time() + self.session_idle_timeout
-                            transport.idle_scope = idle_scope
+                        if _TRANSPORT_OWNS_IDLE_TIMEOUT:
+                            # The transport built its scope in connect() and moves
+                            # the deadline itself; a fixed deadline set here would
+                            # expire an active session.
+                            idle_scope = transport.idle_scope or anyio.CancelScope()
+                        else:
+                            idle_scope = anyio.CancelScope()
+                            if self.session_idle_timeout is not None:
+                                idle_scope.deadline = anyio.current_time() + self.session_idle_timeout
+                                transport.idle_scope = idle_scope
                         with idle_scope:
                             await serve_loop(
                                 self.app,
