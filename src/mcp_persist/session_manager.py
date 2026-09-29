@@ -206,6 +206,15 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
                 await self._register(new_id, requestor, handshake)
             self._hook_termination(self._server_instances[new_id], new_id)
 
+        # Recorded as its response started, then gone before the request ended:
+        # from mcp 2.2 the SDK discards a session whose opening request is
+        # cancelled or fails, before any hook here could see it terminate.
+        # Left alone, the registry would hand a session that never got going to
+        # the next worker to ask.
+        if not self._shutting_down:
+            for new_id in registered - set(self._server_instances):
+                await self._record_termination(new_id)
+
         if session_id is None:
             return
         transport = self._server_instances.get(session_id)

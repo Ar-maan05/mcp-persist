@@ -488,10 +488,11 @@ async def test_a_request_cancelled_after_creating_a_session_still_records_its_en
         async with manager.run():
             with cancel_scope:
                 await manager.handle_request(scope, receive, send)
-            assert len(manager._server_instances) == 1
-            session_id = next(iter(manager._server_instances))
-            assert (await registry.get(session_id)) is not None
-            # The session idles out (0.3s) with nothing in flight.
+            [recorded] = await registry.list_sessions(include_terminated=True)
+            session_id = recorded.session_id
+            # mcp 2.0 keeps the session and it idles out (0.3s) with nothing in
+            # flight; from 2.2 the SDK discards it as soon as the request that
+            # opened it is cancelled. Either way it has ended.
             with anyio.fail_after(5):
                 while session_id in manager._server_instances:
                     await anyio.sleep(0.05)
