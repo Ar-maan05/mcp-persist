@@ -431,3 +431,176 @@ async def test_a_registry_outage_after_lookup_does_not_fail_the_request(
         assert (await _call(url, session_id, "ping"))["result"] == {}
         listed = await _call(url, session_id, "tools/list")
         assert [tool["name"] for tool in listed["result"]["tools"]] == ["echo"]
+
+
+async def test_a_request_cancelled_after_creating_a_session_still_records_its_end() -> None:
+    # `_reconcile` is where a new session's termination hook is installed, and it
+    # ran only if the upstream handler returned. A request cancelled once the
+    # session existed (a client that hung up, a timeout around the handler) left
+    # it unhooked, so when the session later idled out the registry kept listing
+    # it as live and any worker would adopt a session that had ended.
+    import aiosqlite
+
+    from mcp_persist.session_manager import ResumableSessionManager
+
+    conn = await aiosqlite.connect(":memory:")
+    store = SQLiteEventStore(conn, table_name="events", ttl=None)
+    await store.initialize()
+    registry = session_registry_for(store)
+    await registry.initialize()
+    manager = ResumableSessionManager(
+        app=_make_mcp()._lowlevel_server, event_store=store, registry=registry, session_idle_timeout=0.3
+    )
+    body = json.dumps(_INIT_BODY).encode()
+    headers = [(k.lower().encode(), v.encode()) for k, v in _HEADERS.items()]
+    headers.append((b"content-length", str(len(body)).encode()))
+    scope: dict[str, Any] = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "headers": headers,
+        "server": ("127.0.0.1", 80),
+        "client": ("127.0.0.1", 1234),
+        "scheme": "http",
+        "http_version": "1.1",
+    }
+    delivered = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    cancel_scope = anyio.CancelScope()
+
+    async def send(message: dict[str, Any]) -> None:
+        if message["type"] == "http.response.start":
+            # The session exists and has been recorded; now the request goes away.
+            cancel_scope.cancel()
+        await anyio.lowlevel.checkpoint()
+
+    try:
+        async with manager.run():
+            with cancel_scope:
+                await manager.handle_request(scope, receive, send)
+            assert len(manager._server_instances) == 1
+            session_id = next(iter(manager._server_instances))
+            assert (await registry.get(session_id)) is not None
+            # The session idles out (0.3s) with nothing in flight.
+            with anyio.fail_after(5):
+                while session_id in manager._server_instances:
+                    await anyio.sleep(0.05)
+            await anyio.sleep(0.1)
+            record = await registry.get(session_id)
+            assert record is not None and record.terminated
+    finally:
+        await conn.close()
+
+
+def _user(client_id: str) -> Any:
+    from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+    from mcp.server.auth.provider import AccessToken
+
+    return AuthenticatedUser(AccessToken(token="t", client_id=client_id, scopes=[], subject=client_id))
+
+
+async def _asgi_post(
+    manager: Any, body: dict[str, Any], session_id: str | None, user: Any
+) -> tuple[int, bytes, str | None]:
+    """Drive one POST through ``manager`` without a server; returns (status, body, new session id)."""
+    raw = json.dumps(body).encode()
+    headers = [(k.lower().encode(), v.encode()) for k, v in _HEADERS.items()]
+    headers.append((b"content-length", str(len(raw)).encode()))
+    if session_id is not None:
+        headers += [(b"mcp-session-id", session_id.encode()), (b"mcp-protocol-version", b"2025-06-18")]
+    scope: dict[str, Any] = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "headers": headers,
+        "server": ("127.0.0.1", 80),
+        "client": ("127.0.0.1", 1234),
+        "scheme": "http",
+        "http_version": "1.1",
+    }
+    if user is not None:
+        scope["user"] = user
+    sent = False
+    status = 0
+    chunks: list[bytes] = []
+    new_id: str | None = None
+
+    async def receive() -> dict[str, Any]:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": raw, "more_body": False}
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    async def send(message: dict[str, Any]) -> None:
+        nonlocal status, new_id
+        if message["type"] == "http.response.start":
+            status = message["status"]
+            for name, value in message["headers"]:
+                if name.lower() == b"mcp-session-id":
+                    new_id = value.decode()
+        elif message["type"] == "http.response.body":
+            chunks.append(message.get("body", b""))
+
+    with anyio.fail_after(10):
+        await manager.handle_request(scope, receive, send)
+    return status, b"".join(chunks), new_id
+
+
+@pytest.mark.parametrize("creator", ["alice", None])
+async def test_a_refused_request_does_not_end_the_session_for_its_owner(creator: str | None) -> None:
+    # A worker that does not hold a session, and declines to adopt it (wrong
+    # credential), answers 404. That 404 said nothing about the session, but
+    # `_reconcile` read "not held here" as "ended" and marked it terminated in
+    # the shared registry, so anyone who knew a session id could end it for
+    # everyone by sending one request with the wrong credential.
+    import aiosqlite
+
+    from mcp_persist.session_manager import ResumableSessionManager
+
+    conn = await aiosqlite.connect(":memory:")
+    store = SQLiteEventStore(conn, table_name="events", ttl=None)
+    await store.initialize()
+    registry = session_registry_for(store)
+    await registry.initialize()
+
+    def make() -> ResumableSessionManager:
+        return ResumableSessionManager(app=_make_mcp()._lowlevel_server, event_store=store, registry=registry)
+
+    owner = _user(creator) if creator else None
+    intruder = _user("mallory")
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            worker_a, worker_b, worker_c = make(), make(), make()
+            for worker in (worker_a, worker_b, worker_c):
+                await stack.enter_async_context(worker.run())
+            status, _, session_id = await _asgi_post(worker_a, _INIT_BODY, None, owner)
+            assert status == 200 and session_id
+
+            refused, _, _ = await _asgi_post(
+                worker_b, {"jsonrpc": "2.0", "id": 1, "method": "ping"}, session_id, intruder
+            )
+            assert refused == 404
+            record = await registry.get(session_id)
+            assert record is not None and not record.terminated
+
+            # The rightful owner can still reach it, on a worker that never held it.
+            status, body, _ = await _asgi_post(
+                worker_c, {"jsonrpc": "2.0", "id": 2, "method": "ping"}, session_id, owner
+            )
+            assert status == 200, body
+    finally:
+        await conn.close()

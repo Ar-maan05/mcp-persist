@@ -159,10 +159,18 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
             await send(message)
 
         opening = session_id is None
-        await super()._handle_stateful_request(
-            scope, receive_and_keep_opening_body if opening else receive, send_once_registered
-        )
-        await self._reconcile(known_before, session_id, requestor, registered, _initialize_params(opening_body))
+        try:
+            await super()._handle_stateful_request(
+                scope, receive_and_keep_opening_body if opening else receive, send_once_registered
+            )
+        finally:
+            # Also when the request is cancelled or raises: the session may
+            # already exist by then, and this is where its termination hook is
+            # installed. Without it a session created by a request that went
+            # away idled out unrecorded and stayed adoptable. Shielded so the
+            # cancellation that got us here does not cut the bookkeeping short.
+            with anyio.CancelScope(shield=True):
+                await self._reconcile(known_before, session_id, requestor, registered, _initialize_params(opening_body))
 
     async def _register(
         self, session_id: str, requestor: dict[str, Any] | None, handshake: dict[str, Any] | None
@@ -202,8 +210,12 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
             return
         transport = self._server_instances.get(session_id)
         if transport is None:
-            # Gone after handling: an explicit DELETE is the usual reason.
-            await self._record_termination(session_id)
+            # Gone after handling: an explicit DELETE is the usual reason. Only
+            # if this worker held it going in; an id it never had (declined
+            # adoption, a wrong credential) just got a 404, which says nothing
+            # about the session, and must not end it for its real owner.
+            if session_id in known_before:
+                await self._record_termination(session_id)
         elif transport.is_terminated:  # pragma: no cover - terminate() hook normally wins
             await self._record_termination(session_id)
         else:
