@@ -203,11 +203,25 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
         transport = self._server_instances.get(session_id)
         if transport is None:
             # Gone after handling: an explicit DELETE is the usual reason.
-            await self._registry.terminate(session_id)
+            await self._record_termination(session_id)
         elif transport.is_terminated:  # pragma: no cover - terminate() hook normally wins
-            await self._registry.terminate(session_id)
+            await self._record_termination(session_id)
         else:
+            await self._touch(session_id)
+
+    async def _touch(self, session_id: str) -> None:
+        try:
             await self._registry.touch(session_id)
+        except Exception:
+            # Only the session's last-seen time is lost; the request it belongs
+            # to has been, or is about to be, served either way.
+            logger.exception("Failed to update session %s in the durable registry", session_id[:64])
+
+    async def _record_termination(self, session_id: str) -> None:
+        try:
+            await self._registry.terminate(session_id)
+        except Exception:
+            logger.exception("Failed to record termination of session %s", session_id[:64])
 
     def _hook_termination(self, transport: Any, session_id: str) -> None:
         """Mark the registry when this transport terminates, however that happens.
@@ -220,7 +234,6 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
         if getattr(transport, "_mcp_persist_termination_hooked", False):
             return
         original = transport.terminate
-        registry = self._registry
 
         async def terminate_and_record() -> None:
             try:
@@ -230,10 +243,7 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
                     # The process is going away, not the session: leave it live
                     # in the registry so the next process can adopt it.
                     return
-                try:
-                    await registry.terminate(session_id)
-                except Exception:  # pragma: no cover - never break teardown
-                    logger.exception("Failed to record termination of session %s", session_id[:64])
+                await self._record_termination(session_id)
 
         try:
             transport.terminate = terminate_and_record
@@ -326,7 +336,7 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
 
             assert self._task_group is not None
             await self._task_group.start(run_server)
-            await self._registry.touch(session_id)
+            await self._touch(session_id)
             await transport.handle_request(scope, receive, send)
             return True
 

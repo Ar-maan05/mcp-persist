@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **An adopted durable session serves ordinary requests.** A process that adopted a session started a fresh connection that had never seen the client's `initialize`, and the SDK refuses every method but `ping` until it has, so after a restart or on another worker `tools/list`, `tools/call` and the rest failed with `-32602`. The `initialize` params are now recorded with the session, and the adopting process restores the handshake from them. Sessions recorded before this release have no handshake and are adopted as before.
+- **A session registry outage no longer fails requests.** Looking a session up and recording a new one already tolerated an unreachable registry, but updating a session's last-seen time and recording its end did not. A worker adopting a session answered `500` even though it was ready to serve it, and requests on live sessions raised after their response had gone out. Those writes are now logged and skipped, like the others.
 
 ### Added
 - `SessionRecord.handshake`, and a `handshake=` keyword on `SessionRegistry.register`. The SQL registries add a `handshake` column to an existing table on startup. A custom registry whose `register` does not take `handshake` keeps working; its sessions are adopted uninitialized.

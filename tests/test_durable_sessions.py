@@ -403,3 +403,31 @@ async def test_a_registry_without_the_handshake_keyword_still_works(tmp_path: Pa
             assert (await _call(url, session_id, "ping"))["result"] == {}
     finally:
         SQLiteSessionRegistry.register = original  # type: ignore[method-assign]
+
+
+async def test_a_registry_outage_after_lookup_does_not_fail_the_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Lookups and registration already tolerated a registry outage, but the
+    # bookkeeping writes did not: a failing `touch` during adoption raised after
+    # the transport was built and before it saw the request, so the client got a
+    # 500 for a session this worker was ready to serve.
+    from mcp_persist.sessions import SQLiteSessionRegistry
+
+    db = str(tmp_path / "events.db")
+    port = _free_port()
+    app1 = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=True)
+    async with _serve(app1, port) as url:
+        session_id = await _initialize(url)
+
+    async def registry_down(self, session_id):  # type: ignore[no-untyped-def]
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr(SQLiteSessionRegistry, "touch", registry_down)
+    monkeypatch.setattr(SQLiteSessionRegistry, "terminate", registry_down)
+
+    app2 = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=True)
+    async with _serve(app2, port) as url:
+        assert (await _call(url, session_id, "ping"))["result"] == {}
+        listed = await _call(url, session_id, "tools/list")
+        assert [tool["name"] for tool in listed["result"]["tools"]] == ["echo"]
