@@ -498,24 +498,22 @@ class RedisSessionRegistry(SessionRegistry):
     ) -> None:
         now = time.time()
         key = self._key(session_id)
-        existing = await self._redis.hmget(key, ["created_at", "terminated", "handshake"])
-        created = _to_str(existing[0]) or repr(now)
-        # Preserve an existing terminated flag: re-registering an id must never
-        # revive a session that was ended, or it could be adopted again. The SQL
-        # backends get this from ON CONFLICT touching only last_seen_at.
-        terminated = _to_str(existing[1]) or "0"
-        mapping = {
-            "session_id": session_id,
-            "created_at": created,
-            "last_seen_at": repr(now),
-            "terminated": terminated,
-            "owner": json.dumps(owner, sort_keys=True) if owner is not None else "",
-            # Like the SQL backends, a re-register keeps the handshake first recorded.
-            "handshake": _to_str(existing[2])
-            or (json.dumps(handshake, sort_keys=True) if handshake is not None else ""),
-        }
-        async with self._redis.pipeline(transaction=False) as pipe:
-            pipe.hset(key, mapping=mapping)
+        # Every field that is fixed at creation is written with HSETNX inside one
+        # MULTI/EXEC, so a re-register never reads the hash and writes it back.
+        # A read-then-write let a `terminate` that landed in between be overwritten
+        # with a stale terminated="0", reviving an ended session that could then
+        # be adopted again. The SQL backends get the same from ON CONFLICT.
+        # The owner is fixed at creation too: adoption compares the caller against
+        # it, so a re-register must not be able to rebind the session.
+        async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.hsetnx(key, "session_id", session_id)
+            pipe.hsetnx(key, "created_at", repr(now))
+            pipe.hsetnx(key, "terminated", "0")
+            pipe.hsetnx(key, "owner", json.dumps(owner, sort_keys=True) if owner is not None else "")
+            if handshake is not None:
+                # Like the SQL backends, a re-register keeps the handshake first recorded.
+                pipe.hsetnx(key, "handshake", json.dumps(handshake, sort_keys=True))
+            pipe.hset(key, "last_seen_at", repr(now))
             if self._ttl is not None:
                 pipe.expire(key, self._ttl)
             pipe.zadd(self._index_key, {session_id: now})

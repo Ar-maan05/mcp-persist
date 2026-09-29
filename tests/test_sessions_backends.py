@@ -219,6 +219,89 @@ async def test_handshake_round_trips_and_the_first_one_is_kept(registry) -> None
     assert [r.handshake for r in await registry.list_sessions() if r.session_id == "sess-h"] == [handshake]
 
 
+async def test_re_register_never_rebinds_the_owner(registry) -> None:
+    owner = {"client_id": "a", "issuer": "https://idp", "subject": "alice"}
+    await registry.register("sess-o", owner=owner)
+
+    # Adoption compares the requesting principal against this record, so a
+    # re-register naming someone else must not become a way to take the session.
+    await registry.register("sess-o", owner={"client_id": "b", "issuer": "https://idp", "subject": "mallory"})
+    record = await registry.get("sess-o")
+    assert record is not None and record.owner == owner
+
+    await registry.register("sess-anon")
+    await registry.register("sess-anon", owner=owner)
+    anon = await registry.get("sess-anon")
+    assert anon is not None and anon.owner is None
+
+
+class _EndsBeforeTheTransaction:
+    """Wraps a pipeline so the racing `terminate` lands as it is opened."""
+
+    def __init__(self, pipe, racer):
+        self._pipe = pipe
+        self._racer = racer
+
+    async def __aenter__(self):
+        await self._racer.fire()
+        return await self._pipe.__aenter__()
+
+    async def __aexit__(self, *exc):
+        return await self._pipe.__aexit__(*exc)
+
+
+async def test_redis_register_cannot_revive_a_session_ended_mid_register() -> None:
+    client = fakeredis.FakeRedis()
+    try:
+        registry = session_registry_for(RedisEventStore(client, key_prefix="racetest:"))
+        await registry.register("sess-r")
+
+        class EndsTheSessionAfterTheFirstCommand:
+            """Lets one `terminate` land inside register, between its read and its write.
+
+            After the first plain command (the read a read-then-write register
+            starts with), or else just before it opens a transaction.
+            """
+
+            def __init__(self, inner):
+                self._inner = inner
+                self._fired = False
+
+            async def fire(self):
+                if not self._fired:
+                    self._fired = True
+                    await registry.terminate("sess-r")
+
+            def __getattr__(self, name):
+                attr = getattr(self._inner, name)
+                if not callable(attr):
+                    return attr
+
+                if name == "pipeline":
+
+                    def open_pipeline(*args, **kwargs):
+                        return _EndsBeforeTheTransaction(attr(*args, **kwargs), self)
+
+                    return open_pipeline
+
+                async def call(*args, **kwargs):
+                    result = await attr(*args, **kwargs)
+                    await self.fire()
+                    return result
+
+                return call
+
+        real = registry._redis
+        registry._redis = EndsTheSessionAfterTheFirstCommand(real)
+        await registry.register("sess-r")
+        registry._redis = real
+
+        record = await registry.get("sess-r")
+        assert record is not None and record.terminated
+    finally:
+        await client.aclose()
+
+
 async def test_sqlite_table_from_before_the_handshake_column_is_upgraded() -> None:
     conn = await aiosqlite.connect(":memory:")
     try:
