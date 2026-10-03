@@ -5,10 +5,10 @@ returns the matching backend's :meth:`create` context manager, so a deployment
 can pick its store from config without branching on the backend in application
 code::
 
-    from mcp_persist import event_store_from_env
+    from mcp_persist import SessionScopedSessionManager, event_store_from_env
 
     async with event_store_from_env() as store:
-        manager = StreamableHTTPSessionManager(app=..., event_store=store)
+        manager = SessionScopedSessionManager(app=..., event_store=store)
         ...
 
 Variables:

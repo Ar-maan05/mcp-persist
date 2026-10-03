@@ -130,10 +130,11 @@ _UNKNOWN: Any = object()
 async def _owning_stream(store: EventStore, event_id: EventId) -> StreamId | None:
     """The stream ``event_id`` belongs to, None if there is no such event, or ``_UNKNOWN``.
 
-    Every backend in this package has a ``_stream_id_for_event(event_id)``
+    The SQLite, Redis and Postgres stores have a ``_stream_id_for_event(event_id)``
     lookup (``BatchingEventStore`` passes it through to the store it wraps). A
-    store without one, or with one of a different shape, gets ``_UNKNOWN`` and
-    the replay is checked after the fact instead.
+    store without one, or with one of a different shape (``ChainedEventStore``'s
+    takes the store as well), gets ``_UNKNOWN`` and the replay is checked after
+    the fact instead.
     """
     lookup = getattr(store, "_stream_id_for_event", None)
     if lookup is None:

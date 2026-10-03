@@ -2,10 +2,11 @@
 
 Wire SSE stream resumability into a :class:`~mcp.server.mcpserver.MCPServer`
 with a single call. :func:`with_persistence` takes the ``MCPServer`` instance and
-returns a runnable Starlette ASGI app with a
-:class:`~mcp.server.streamable_http_manager.StreamableHTTPSessionManager`
-already wired to an :class:`~mcp.server.streamable_http.EventStore`, managing the
-store and manager lifecycle for you via the app's lifespan.
+returns a runnable Starlette ASGI app with a session manager
+(:class:`~mcp_persist.SessionScopedSessionManager`, or
+:class:`~mcp_persist.ResumableSessionManager` with durable sessions) already
+wired to an :class:`~mcp.server.streamable_http.EventStore`, managing the store
+and manager lifecycle for you via the app's lifespan.
 
 Three ways to supply the store, in resolution order:
 
@@ -94,8 +95,8 @@ def with_persistence(
     """Return a Starlette ASGI app serving ``mcp`` with SSE resumability.
 
     The returned app mounts the MCP endpoint at ``mcp_path`` (default ``/mcp``)
-    and, through its lifespan, opens the event store, runs a
-    ``StreamableHTTPSessionManager`` bound to it, and tears both down on
+    and, through its lifespan, opens the event store, runs a session manager
+    (``SessionScopedSessionManager``) bound to it, and tears both down on
     shutdown. Pass it straight to uvicorn, or mount/compose it in a larger
     Starlette app.
 
@@ -125,7 +126,7 @@ def with_persistence(
         key_prefix: Redis key prefix.
         max_stream_length: Redis per-stream cap.
         session_idle_timeout: Optional idle timeout in seconds for stateful
-            sessions, forwarded to ``StreamableHTTPSessionManager``.
+            sessions, forwarded to the session manager.
         durable_sessions: Record session ids in the store alongside the events,
             and resume a session this process did not create instead of
             answering 404. This is what makes resumability survive a restart or

@@ -6,14 +6,16 @@ Requires the redis extra:
 Quickstart:
     import redis.asyncio as aioredis
     from mcp.server.mcpserver import MCPServer
-    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-    from mcp_persist import RedisEventStore
+    from mcp_persist import RedisEventStore, SessionScopedSessionManager
 
     mcp = MCPServer(name="MyServer")
     redis_client = aioredis.from_url("redis://localhost:6379")
     store = RedisEventStore(redis_client, ttl=3600)
 
-    session_manager = StreamableHTTPSessionManager(
+    # SessionScopedSessionManager, not the SDK's StreamableHTTPSessionManager:
+    # the SDK files events by request id, so sessions sharing a store would be
+    # replayed each other's events.
+    session_manager = SessionScopedSessionManager(
         app=mcp._lowlevel_server,  # the low-level Server that MCPServer wraps
         event_store=store,
     )
