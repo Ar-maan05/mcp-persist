@@ -191,10 +191,12 @@ mcp-persist sessions purge --older-than 30d
 ```
 
 ```
-SESSION ID                         LAST SEEN (UTC)            STATE
-9f2c1e04c7b64a1e8d3f5a6b7c8d9e0f   2026-08-01T09:41:12+00:00  live
-1a7b3c5d9e2f4068b1c3d5e7f9a0b2c4   2026-08-01T09:12:55+00:00  live
+SESSION ID                         LAST SEEN (UTC)            STATE       CLIENT
+9f2c1e04c7b64a1e8d3f5a6b7c8d9e0f   2026-08-01T09:41:12+00:00  live        claude-code 2.1.0
+1a7b3c5d9e2f4068b1c3d5e7f9a0b2c4   2026-08-01T09:12:55+00:00  live        mcp-inspector 0.9.1
 ```
+
+`CLIENT` is the name and version the client sent in its `initialize`, with control characters replaced; it is `-` for sessions recorded by an earlier release, which did not keep the handshake.
 
 `list` shows only live sessions unless `--all` is passed, and defaults to 50
 (`--limit`). `show` and `terminate` exit non-zero when the id does not exist, so
