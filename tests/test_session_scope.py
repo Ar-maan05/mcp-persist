@@ -267,3 +267,22 @@ def test_a_table_the_sdk_assigns_later_is_scoped_too() -> None:
     assert carried._event_store.session_id == "alice"
     assert isinstance(added._event_store, SessionScopedEventStore)
     assert added._event_store.session_id == "bob"
+
+
+def test_a_store_scoped_to_another_session_is_rescoped() -> None:
+    # A scoped view handed to the manager as its event store must not make every
+    # session share that view's scope.
+    shared: Any = object()
+    preset = SessionScopedEventStore(shared, "someone-else")
+
+    class _Transport:
+        def __init__(self) -> None:
+            self._event_store: Any = preset
+
+    manager = SessionScopedSessionManager(app=object(), event_store=preset)  # type: ignore[arg-type]
+    alice, bob = _Transport(), _Transport()
+    manager._server_instances["alice"] = alice  # type: ignore[assignment]
+    manager._server_instances["bob"] = bob  # type: ignore[assignment]
+
+    assert alice._event_store.session_id == "alice" and alice._event_store.store is shared
+    assert bob._event_store.session_id == "bob" and bob._event_store.store is shared

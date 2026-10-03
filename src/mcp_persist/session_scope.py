@@ -212,6 +212,13 @@ def _scope_transport(transport: Any, session_id: str, shared: EventStore | None)
             "no longer keeps the event store where expected. Please report this."
         )
     current = transport._event_store
-    if current is None or isinstance(current, SessionScopedEventStore):
+    if current is None:
         return
+    if isinstance(current, SessionScopedEventStore):
+        if current.session_id == session_id:
+            return
+        # Scoped to some other session (a scoped view passed in as the manager's
+        # store, say): scope the store underneath it to this session instead,
+        # rather than letting every session share that one scope.
+        current = current.store
     transport._event_store = SessionScopedEventStore(current, session_id)
