@@ -352,3 +352,65 @@ async def test_redis_a_partial_session_hash_is_not_a_session() -> None:
             await client.aclose()
         except AttributeError:  # redis-py < 5.0
             await client.close(close_connection_pool=True)
+
+
+@pytest.mark.anyio
+async def test_redis_registry_transactions_stay_within_one_cluster_slot() -> None:
+    # On Redis Cluster every key in a MULTI/EXEC must hash to one slot. register
+    # once wrapped the session hash and the session index (a different slot) in
+    # one transaction, so it raised CrossSlotTransactionError on every call there,
+    # and durable sessions were never recorded. This client refuses the same thing.
+    from redis.crc import key_slot
+
+    real = fakeredis.FakeRedis()
+
+    class _SlotCheckingPipeline:
+        def __init__(self, inner, transaction):
+            self._inner = inner
+            self._transaction = transaction
+            self._slots: set[int] = set()
+
+        async def __aenter__(self):
+            await self._inner.__aenter__()
+            return self
+
+        async def __aexit__(self, *exc):
+            return await self._inner.__aexit__(*exc)
+
+        def __getattr__(self, name):
+            command = getattr(self._inner, name)
+            if name == "execute" or not callable(command):
+                return command
+
+            def queue(key, *args, **kwargs):
+                self._slots.add(key_slot(key.encode() if isinstance(key, str) else key))
+                command(key, *args, **kwargs)
+                return self
+
+            return queue
+
+        async def execute(self):
+            if self._transaction and len(self._slots) > 1:
+                raise AssertionError(f"transaction spans {len(self._slots)} cluster slots")
+            return await self._inner.execute()
+
+    class _ClusterRules:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def pipeline(self, transaction=True, **kwargs):
+            return _SlotCheckingPipeline(real.pipeline(transaction=transaction, **kwargs), transaction)
+
+    try:
+        registry = session_registry_for(RedisEventStore(_ClusterRules(), key_prefix="slots:"), ttl=60)
+        await registry.register("sess-c", owner={"client_id": "a"}, handshake={"protocolVersion": "x"})
+        await registry.touch("sess-c")
+        await registry.terminate("sess-c")
+        record = await registry.get("sess-c")
+        assert record is not None and record.terminated and record.owner == {"client_id": "a"}
+        assert [r.session_id for r in await registry.list_sessions(include_terminated=True)] == ["sess-c"]
+    finally:
+        try:
+            await real.aclose()
+        except AttributeError:  # redis-py < 5.0
+            await real.close(close_connection_pool=True)

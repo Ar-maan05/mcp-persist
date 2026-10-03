@@ -527,6 +527,10 @@ class RedisSessionRegistry(SessionRegistry):
         # be adopted again. The SQL backends get the same from ON CONFLICT.
         # The owner is fixed at creation too: adoption compares the caller against
         # it, so a re-register must not be able to rebind the session.
+        #
+        # The transaction touches the session's own key only. On Redis Cluster a
+        # MULTI/EXEC must stay within one hash slot, and the index is another key,
+        # so it is updated after; the session is complete and adoptable either way.
         async with self._redis.pipeline(transaction=True) as pipe:
             pipe.hsetnx(key, "session_id", session_id)
             pipe.hsetnx(key, "created_at", repr(now))
@@ -538,8 +542,8 @@ class RedisSessionRegistry(SessionRegistry):
             pipe.hset(key, "last_seen_at", repr(now))
             if self._ttl is not None:
                 pipe.expire(key, self._ttl)
-            pipe.zadd(self._index_key, {session_id: now})
             await pipe.execute()
+        await self._redis.zadd(self._index_key, {session_id: now})
 
     async def get(self, session_id: str) -> SessionRecord | None:
         raw = await self._redis.hgetall(self._key(session_id))
