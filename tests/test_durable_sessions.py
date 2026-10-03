@@ -413,6 +413,40 @@ async def test_an_open_adopted_stream_does_not_block_other_sessions(tmp_path: Pa
                 assert await _initialize(url)
 
 
+async def test_an_adopted_session_reports_its_handshake_complete(tmp_path: Path) -> None:
+    # The client finished its handshake, notifications/initialized included, with
+    # the process that created the session. Server code that waits for that (on
+    # the connection's `initialized` event) before talking to the client must not
+    # wait forever on the process that adopts it.
+    def make() -> MCPServer:
+        mcp = MCPServer(name="HandshakeServer")
+
+        @mcp.tool()
+        def handshake_done(ctx: Context) -> dict[str, bool]:
+            # Low-level handlers see this as `ctx.connection`; an MCPServer tool
+            # only reaches it through the session.
+            connection = ctx.request_context.session._connection  # pyright: ignore[reportPrivateUsage]
+            return {"done": connection.initialized.is_set()}
+
+        return mcp
+
+    db = str(tmp_path / "events.db")
+    port = _free_port()
+    app1 = with_persistence(make(), backend="sqlite", url=db, durable_sessions=True)
+    async with _serve(app1, port) as url:
+        session_id = await _initialize(url)
+        headers = {**_HEADERS, "Mcp-Session-Id": session_id, "Mcp-Protocol-Version": "2025-06-18"}
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            await client.post(url, json={"jsonrpc": "2.0", "method": "notifications/initialized"}, headers=headers)
+        before = await _call(url, session_id, "tools/call", {"name": "handshake_done", "arguments": {}})
+        assert before["result"]["structuredContent"] == {"done": True}
+
+    app2 = with_persistence(make(), backend="sqlite", url=db, durable_sessions=True)
+    async with _serve(app2, port) as url:
+        after = await _call(url, session_id, "tools/call", {"name": "handshake_done", "arguments": {}})
+        assert after["result"]["structuredContent"] == {"done": True}
+
+
 async def test_the_handshake_is_recorded_with_the_session(tmp_path: Path) -> None:
     db = str(tmp_path / "events.db")
     port = _free_port()
