@@ -170,7 +170,7 @@ Redis data layout:
 ```
 
 - **Atomic monotonic IDs** via Redis `INCR`: collision-free across concurrent workers. The counter is never given a TTL (even when `ttl` is set), so IDs stay monotonic across idle periods; only the event and stream keys expire.
-- **Replay is O(log N + M)**: one `ZRANGEBYSCORE` range-scans the stream's sorted set, then each of the M matched events is fetched with its own `HGET`. That's one network round-trip per replayed event: fine for typical resume sizes, worth knowing for very long streams.
+- **Replay is O(log N + M)**: on a standalone Redis a server-side script reads the stream's sorted set and the matching payloads together, 1000 events per call, so replaying M events takes about M/1000 round trips and no single call holds the server for long. On Redis Cluster, or a server without scripting, it is one `ZRANGEBYSCORE` followed by one pipelined fetch of every payload.
 - **TTL support**: automatic expiry of event/stream keys to prevent unbounded memory growth
 - **Atomic writes**: each event's hash, sorted-set entry, and TTLs are written in a single transactional pipeline, so a mid-write crash can't orphan a hash or leave a key without its expiry
 - **Multi-tenant isolation** via configurable `key_prefix`

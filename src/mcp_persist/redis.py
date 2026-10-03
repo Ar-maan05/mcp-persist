@@ -96,6 +96,30 @@ end
 return 1
 """
 
+# Read one chunk of a stream for replay in a single round trip: the ids in
+# (ARGV[1], ARGV[2]] from the stream index, at most ARGV[3] of them, each followed
+# by its payload (false, so nil to the client, when the event hash is gone).
+#
+# KEYS[1] = stream-index (sorted set) key
+# KEYS[2] = event-key prefix (the id is appended inside the script)
+#
+# Like _STORE_EVENT_LUA it builds keys inside the script, so it is only run on a
+# standalone Redis. The chunk bound keeps each call short: a script blocks the
+# server while it runs, and one call over a whole long stream would too.
+_REPLAY_CHUNK_LUA = """
+local ids = redis.call('ZRANGEBYSCORE', KEYS[1], ARGV[1], ARGV[2], 'LIMIT', 0, tonumber(ARGV[3]))
+local out = {}
+for i, id in ipairs(ids) do
+  out[2 * i - 1] = id
+  out[2 * i] = redis.call('HGET', KEYS[2] .. id, 'payload')
+end
+return out
+"""
+
+# Events read per replay script call. Large enough that a replay is a handful of
+# round trips, small enough that no single call holds the server for long.
+_REPLAY_CHUNK = 1000
+
 _script_error_types: tuple[type[BaseException], ...] | None = None
 
 
@@ -232,6 +256,7 @@ class RedisEventStore(EventStore):
         # See _write_event.
         self._write_script: Any = None
         self._raise_counter_script: Any = None
+        self._replay_script: Any = None
         self._script_ok: bool | None = None
         self.unreadable_events = 0
 
@@ -699,42 +724,9 @@ class RedisEventStore(EventStore):
 
         segments = await self._get_stream_segments(resolved_stream_id)
 
-        # We need to collect all matching event IDs across all segments,
-        # then pipeline their payload fetch.
-        event_info: list[tuple[EventId, StreamId]] = []
-
-        for stream, min_id, max_id in segments:
-            low = last_int
-            if min_id is not None and min_id > low:
-                low = min_id
-            if max_id is not None and low >= max_id:
-                continue
-
-            max_score = str(max_id) if max_id is not None else "+inf"
-
-            raw_ids = await self._redis.zrangebyscore(
-                self._stream_key(stream),
-                min=low + 1,
-                max=max_score,
-            )
-            if raw_ids:
-                for r in raw_ids:
-                    event_info.append((cast(EventId, self._decode(r)), stream))
-
-        if not event_info:
-            return resolved_stream_id
-
-        # Fetch every payload in one pipelined round-trip rather than a blocking
-        # HGET per event. transaction=False keeps it cluster-safe (the hashes
-        # can live on different nodes).
-        async with self._redis.pipeline(transaction=False) as pipe:
-            for eid, _ in event_info:
-                pipe.hget(self._event_key(eid), "payload")
-            payloads = await pipe.execute()
-
         stale_by_stream: dict[StreamId, list[EventId]] = {}
 
-        for (eid, stream), payload_raw in zip(event_info, payloads):
+        async for eid, stream, payload_raw in self._replay_payloads(segments, last_int):
             if payload_raw is None:
                 # The payload hash has expired but its ID lingered in the stream
                 # index; collect it so the sorted set can't grow without bound
@@ -784,6 +776,72 @@ class RedisEventStore(EventStore):
                 await pipe.execute()
 
         return resolved_stream_id
+
+    async def _replay_payloads(
+        self, segments: list[tuple[StreamId, int | None, int | None]], after: int
+    ) -> AsyncIterator[tuple[EventId, StreamId, Any]]:
+        """Yield ``(event_id, stream, raw_payload)`` for every event after ``after``, in order.
+
+        ``raw_payload`` is None when the event's hash is gone but its id is still in
+        the stream index. Uses :data:`_REPLAY_CHUNK_LUA` where the write path may
+        use scripts, and the pipelined reads otherwise.
+        """
+        for stream, min_id, max_id in segments:
+            low = after
+            if min_id is not None and min_id > low:
+                low = min_id
+            if max_id is not None and low >= max_id:
+                continue
+            if self._script_ok is not False and self._scripting_possible():
+                try:
+                    async for item in self._replay_segment_scripted(stream, low, max_id):
+                        yield item
+                    continue
+                except _scripting_error_types() as exc:
+                    if self._script_ok is True:
+                        raise
+                    logger.debug("Redis server-side scripting unavailable (%s); using pipelined reads", exc)
+                    self._script_ok = False
+            async for item in self._replay_segment_pipelined(stream, low, max_id):
+                yield item
+
+    async def _replay_segment_scripted(
+        self, stream: StreamId, low: int, max_id: int | None
+    ) -> AsyncIterator[tuple[EventId, StreamId, Any]]:
+        if self._replay_script is None:
+            self._replay_script = self._redis.register_script(_REPLAY_CHUNK_LUA)
+        max_score = str(max_id) if max_id is not None else "+inf"
+        stream_key = self._stream_key(stream)
+        prefix = f"{self._prefix}event:"
+        while True:
+            # A script failure on the very first chunk is a probe result the caller
+            # turns into the pipelined fallback; nothing has been yielded yet.
+            flat = await self._replay_script(keys=[stream_key, prefix], args=[f"({low}", max_score, _REPLAY_CHUNK])
+            self._script_ok = True
+            for i in range(0, len(flat), 2):
+                eid = cast(EventId, self._decode(flat[i]))
+                yield eid, stream, flat[i + 1]
+            if len(flat) < 2 * _REPLAY_CHUNK:
+                return
+            low = int(self._decode(flat[-2]) or low)
+
+    async def _replay_segment_pipelined(
+        self, stream: StreamId, low: int, max_id: int | None
+    ) -> AsyncIterator[tuple[EventId, StreamId, Any]]:
+        max_score = str(max_id) if max_id is not None else "+inf"
+        raw_ids = await self._redis.zrangebyscore(self._stream_key(stream), min=low + 1, max=max_score)
+        if not raw_ids:
+            return
+        ids = [cast(EventId, self._decode(r)) for r in raw_ids]
+        # Every payload in one pipelined round trip rather than an HGET per event.
+        # transaction=False keeps it cluster-safe (the hashes can live on
+        # different nodes).
+        async with self._redis.pipeline(transaction=False) as pipe:
+            for eid in ids:
+                pipe.hget(self._event_key(eid), "payload")
+            payloads = await pipe.execute()
+        for eid, payload_raw in zip(ids, payloads):
+            yield eid, stream, payload_raw
 
     async def fork_stream(
         self,

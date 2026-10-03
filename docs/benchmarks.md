@@ -55,4 +55,4 @@ What the shape of these results reflects (and should hold across environments):
   but every write serializes through the single `INCR` counter (see the write
   ceiling note in [architecture.md](architecture.md#2-concurrency--write-semantics)), while Postgres has much higher per-call latency but its
   pooled connections run many stores concurrently.
-- **Replay**: SQLite and Postgres fetch a stream's events in one indexed query, while the Redis backend issues a `zrangebyscore` followed by a single pipelined execution to fetch payloads concurrently, keeping the entire replay latency bounded to exactly two network round-trips.
+- **Replay**: SQLite and Postgres fetch a stream's events in one indexed query. On a standalone Redis, a server-side script returns each 1000-event chunk of the stream with its payloads in one call; on Redis Cluster it is a `zrangebyscore` followed by one pipelined fetch of the payloads. The Redis numbers in the table predate the chunked script, which roughly halved a 10,000-event replay in our measurements.
