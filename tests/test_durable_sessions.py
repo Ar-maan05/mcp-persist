@@ -364,6 +364,30 @@ async def test_an_adopted_session_serves_ordinary_requests_after_a_restart(tmp_p
         assert called["result"]["structuredContent"] == {"echo": "hi"}
 
 
+async def test_an_open_adopted_stream_does_not_block_other_sessions(tmp_path: Path) -> None:
+    # Adoption served the request while holding the manager's session creation
+    # lock, and a standalone GET stream stays open as long as its client does.
+    # After a restart, where every client reconnects at once, the first one to
+    # resume held the lock for good: no other session could be adopted or created
+    # on that worker.
+    db = str(tmp_path / "events.db")
+    port = _free_port()
+
+    app1 = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=True)
+    async with _serve(app1, port) as url:
+        first = await _initialize(url)
+        second = await _initialize(url)
+
+    app2 = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=True)
+    async with _serve(app2, port) as url, httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        headers = {**_HEADERS, "Mcp-Session-Id": first}
+        async with client.stream("GET", url, headers=headers) as held_open:
+            assert held_open.status_code == 200
+            with anyio.fail_after(5):
+                assert await _reconnect_status(url, second) == 200
+                assert await _initialize(url)
+
+
 async def test_the_handshake_is_recorded_with_the_session(tmp_path: Path) -> None:
     db = str(tmp_path / "events.db")
     port = _free_port()

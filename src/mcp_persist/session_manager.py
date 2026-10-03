@@ -53,7 +53,7 @@ if TYPE_CHECKING:
     from anyio.abc import TaskStatus
     from starlette.types import Message, Receive, Scope, Send
 
-    from mcp_persist.sessions import SessionRegistry
+    from mcp_persist.sessions import SessionRecord, SessionRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -303,63 +303,79 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
 
         async with self._session_creation_lock:
             # Another request may have adopted it while we waited for the lock.
-            if session_id in self._server_instances:
-                await self._server_instances[session_id].handle_request(scope, receive, send)
-                return True
+            transport = self._server_instances.get(session_id)
+            adopted_here = transport is None
+            if transport is None:
+                transport = await self._start_adopted(session_id, requestor, record)
 
-            transport_kwargs: dict[str, Any] = {}
-            if _TRANSPORT_OWNS_IDLE_TIMEOUT:
-                transport_kwargs["idle_timeout"] = self.session_idle_timeout
-            transport = StreamableHTTPServerTransport(
-                mcp_session_id=session_id,
-                is_json_response_enabled=self.json_response,
-                event_store=self.event_store,
-                security_settings=self.security_settings,
-                retry_interval=self.retry_interval,
-                **transport_kwargs,
-            )
-            if requestor is not None:
-                # The registry round-trips the context as a plain dict (it has to
-                # be JSON), and AuthorizationContext is a TypedDict, so this is
-                # the same shape by construction.
-                self._session_owners[session_id] = cast("AuthorizationContext", requestor)
-            self._server_instances[session_id] = transport
-            self._hook_termination(transport, session_id)
-            logger.info("Adopted session %s from the durable registry", session_id[:64])
-
-            async def run_server(*, task_status: TaskStatus[None] = anyio.TASK_STATUS_IGNORED) -> None:
-                async with transport.connect() as streams:
-                    read_stream, write_stream = streams
-                    task_status.started()
-                    try:
-                        if _TRANSPORT_OWNS_IDLE_TIMEOUT:
-                            # The transport built its scope in connect() and moves
-                            # the deadline itself; a fixed deadline set here would
-                            # expire an active session.
-                            idle_scope = transport.idle_scope or anyio.CancelScope()
-                        else:
-                            idle_scope = anyio.CancelScope()
-                            if self.session_idle_timeout is not None:
-                                idle_scope.deadline = anyio.current_time() + self.session_idle_timeout
-                                transport.idle_scope = idle_scope
-                        with idle_scope:
-                            await self._serve_adopted(read_stream, write_stream, session_id, record.handshake)
-                        if idle_scope.cancelled_caught:
-                            self._server_instances.pop(session_id, None)
-                            self._session_owners.pop(session_id, None)
-                            await transport.terminate()
-                    except Exception:
-                        logger.exception("Adopted session %s crashed", session_id[:64])
-                    finally:
-                        if self._server_instances.get(session_id) is transport and not transport.is_terminated:
-                            del self._server_instances[session_id]
-                            self._session_owners.pop(session_id, None)
-
-            assert self._task_group is not None
-            await self._task_group.start(run_server)
+        # Served outside the lock. The request can be a standalone GET stream
+        # that stays open for as long as the client is connected, and while the
+        # lock is held no session can be created or adopted on this worker; a
+        # restart, where every client reconnects at once, would stall behind
+        # the first one.
+        if adopted_here:
             await self._touch(session_id)
-            await transport.handle_request(scope, receive, send)
-            return True
+        await transport.handle_request(scope, receive, send)
+        return True
+
+    async def _start_adopted(
+        self, session_id: str, requestor: dict[str, Any] | None, record: SessionRecord
+    ) -> StreamableHTTPServerTransport:
+        """Create the transport for an adopted session and start serving it.
+
+        Called with ``_session_creation_lock`` held, so it must not wait on a request.
+        """
+        transport_kwargs: dict[str, Any] = {}
+        if _TRANSPORT_OWNS_IDLE_TIMEOUT:
+            transport_kwargs["idle_timeout"] = self.session_idle_timeout
+        transport = StreamableHTTPServerTransport(
+            mcp_session_id=session_id,
+            is_json_response_enabled=self.json_response,
+            event_store=self.event_store,
+            security_settings=self.security_settings,
+            retry_interval=self.retry_interval,
+            **transport_kwargs,
+        )
+        if requestor is not None:
+            # The registry round-trips the context as a plain dict (it has to
+            # be JSON), and AuthorizationContext is a TypedDict, so this is
+            # the same shape by construction.
+            self._session_owners[session_id] = cast("AuthorizationContext", requestor)
+        self._server_instances[session_id] = transport
+        self._hook_termination(transport, session_id)
+        logger.info("Adopted session %s from the durable registry", session_id[:64])
+
+        async def run_server(*, task_status: TaskStatus[None] = anyio.TASK_STATUS_IGNORED) -> None:
+            async with transport.connect() as streams:
+                read_stream, write_stream = streams
+                task_status.started()
+                try:
+                    if _TRANSPORT_OWNS_IDLE_TIMEOUT:
+                        # The transport built its scope in connect() and moves
+                        # the deadline itself; a fixed deadline set here would
+                        # expire an active session.
+                        idle_scope = transport.idle_scope or anyio.CancelScope()
+                    else:
+                        idle_scope = anyio.CancelScope()
+                        if self.session_idle_timeout is not None:
+                            idle_scope.deadline = anyio.current_time() + self.session_idle_timeout
+                            transport.idle_scope = idle_scope
+                    with idle_scope:
+                        await self._serve_adopted(read_stream, write_stream, session_id, record.handshake)
+                    if idle_scope.cancelled_caught:
+                        self._server_instances.pop(session_id, None)
+                        self._session_owners.pop(session_id, None)
+                        await transport.terminate()
+                except Exception:
+                    logger.exception("Adopted session %s crashed", session_id[:64])
+                finally:
+                    if self._server_instances.get(session_id) is transport and not transport.is_terminated:
+                        del self._server_instances[session_id]
+                        self._session_owners.pop(session_id, None)
+
+        assert self._task_group is not None
+        await self._task_group.start(run_server)
+        return transport
 
     async def _serve_adopted(
         self, read_stream: Any, write_stream: Any, session_id: str, handshake: dict[str, Any] | None
