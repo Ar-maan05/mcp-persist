@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SessionRecord.handshake`, and a `handshake=` keyword on `SessionRegistry.register`. The SQL registries add a `handshake` column to an existing table on startup. A custom registry whose `register` does not take `handshake` keeps working; its sessions are adopted uninitialized.
 - Python 3.14 is supported and tested. CI also runs the suite against the oldest release of every runtime dependency the package allows (mcp 2.0.0, redis 4.2.0, and so on), and checks the built wheel installs and imports on its own.
 
+### Changed
+- The encryption docs no longer claim that a party who can write to the store cannot forge events. Encryption at rest protects payload confidentiality and catches an encrypted payload edited in place or moved to another stream, but a store still reads unencrypted payloads as they are (so data from before encryption stays readable), and a writer can delete or reorder events. The threat model in `docs/encryption.md` now says so.
 
 ## [2.1.1] - 2026-09-26
 

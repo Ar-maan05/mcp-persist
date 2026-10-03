@@ -173,15 +173,9 @@ they mean a key a stored payload names is no longer on the ring.
 
 What encryption at rest protects against, and what it does not:
 
-- **Protects**: an attacker (or a co-tenant service) that can read the backing
-  store directly (Redis memory/RDB/AOF, a Postgres table or its backups, a SQLite
-  file) sees only ciphertext for event payloads. A party that can write to the
-  store cannot forge or silently alter a payload: GCM authentication rejects it on
-  read.
-- **Does not protect**: stream IDs and event IDs are stored in the clear (they are
-  index keys, not payloads), so this is payload confidentiality, not metadata
-  confidentiality. It also does not protect data in memory in the running process,
-  in transit (use TLS for that), or against an attacker who also holds the key.
+- **Protects**: an attacker (or a co-tenant service) that can read the backing store directly (Redis memory/RDB/AOF, a Postgres table or its backups, a SQLite file) sees only ciphertext for event payloads. An encrypted payload edited in place, or copied to another stream or record, fails GCM authentication and is skipped on read.
+- **Does not protect against a party that can write to the store.** Encryption is for confidentiality; it does not make the store tamper-proof. A store reads unencrypted payloads as they are (so data written before encryption was turned on stays readable), so a writer can insert plaintext events of its own. It can also delete events, or reorder or repeat events within one stream, since the event id is not part of what is authenticated, and `en:` payloads written before 2.1.1 carry no location binding at all. If the backing store's writers are not trusted, encryption at rest is not the control for that.
+- **Does not protect**: stream IDs and event IDs are stored in the clear (they are index keys, not payloads), so this is payload confidentiality, not metadata confidentiality. It also does not protect data in memory in the running process, in transit (use TLS for that), or against an attacker who also holds the key.
 - **Key management is yours**: the security of the scheme reduces to the secrecy of
   the keys. Keep them in a secrets manager or KMS, not in source. Losing a key
   means losing the ability to read events written under it.

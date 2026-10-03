@@ -41,6 +41,12 @@ and records their record id as GCM associated data, written with the
 like any other tamper. Payloads written before this (``en:``) carry no binding
 and stay readable; they age out through ttl/retention as usual.
 
+None of this makes the store tamper-proof against a party that can write to it:
+unencrypted payloads are read as they are (so data from before encryption was
+turned on stays readable), which lets such a writer insert plaintext events, and
+it can still delete events or reorder them within a stream. Encryption here is
+for confidentiality.
+
 A reader older than 2.1.1 does not know the ``ea:`` marker. For a rolling
 upgrade across that boundary, set ``bind_context=False`` (or
 ``MCP_PERSIST_ENCRYPTION_BIND_CONTEXT=0``) until every reader is upgraded, then
