@@ -689,6 +689,30 @@ async def test_store_replay_records_blocked_for_foreign_session(store):
     assert (stream_id, session_id, events, blocked) == ("sess-1:s", "sess-2", 0, True)
 
 
+@pytest.mark.anyio
+async def test_store_replay_refuses_a_foreign_id_without_reading_it(store):
+    # The store can name an event's stream, so a foreign id is refused before the
+    # other session's stream is read, decrypted and held in memory.
+    anchor = await store.store_event("sess-1:s", None)
+    await store.store_event("sess-1:s", SAMPLE_NOTIFICATION)
+    reads = 0
+    original = store.replay_events_after
+
+    async def counting(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return await original(*args, **kwargs)
+
+    store.replay_events_after = counting
+    rec = ProxyReplayRecorder()
+
+    out = [item async for item in _store_replay(store, anchor, session_id="sess-2", metrics=rec)]
+
+    assert out == []
+    assert reads == 0
+    assert rec.calls[0][:4] == ("sess-1:s", "sess-2", 0, True)
+
+
 # ── CORS (browser clients hit the proxy directly) ────────────────────────────
 
 
