@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `SessionScopedSessionManager`, a drop-in for the SDK's `StreamableHTTPSessionManager` that keeps each session's events to itself in a shared store, and `SessionScopedEventStore`, the per-session view of a store it gives each transport. See the Security entry above.
 - `mcp-persist sessions list` and the dashboard's sessions table show each session's client (`name version` from its `initialize`), and `SessionRecord.client` exposes it. The client chooses that text, so control characters are replaced and it is capped at 64 characters before it reaches a terminal. Sessions recorded without a handshake show `-`.
-- `SessionRecord.handshake`, and a `handshake=` keyword on `SessionRegistry.register`. The SQL registries add a `handshake` column to an existing table on startup. A custom registry whose `register` does not take `handshake` keeps working; its sessions are adopted uninitialized.
+- `SessionRecord.handshake`, and a `handshake=` keyword on `SessionRegistry.register`. The SQL registries add a `handshake` column to an existing table on startup, and only when it is missing, so an application role that can read and write the table but does not own it still starts. A custom registry whose `register` does not take `handshake` keeps working; its sessions are adopted uninitialized.
 - Python 3.14 is supported and tested. CI also runs the suite against the oldest release of every runtime dependency the package allows (mcp 2.0.0, redis 4.2.0, and so on), and checks the built wheel installs and imports on its own.
 
 ### Changed

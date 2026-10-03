@@ -240,7 +240,7 @@ class SQLiteSessionRegistry(_SQLSessionRegistry):
         self._ready = True
 
     async def _add_handshake_column(self) -> None:
-        """Add the ``handshake`` column to a table created before 2.2."""
+        """Add the ``handshake`` column to a table created by an earlier release."""
         bare = self._table.strip('"')
         async with self._conn.execute(f"SELECT 1 FROM pragma_table_info('{bare}') WHERE name = 'handshake'") as cursor:
             if await cursor.fetchone() is None:
@@ -388,8 +388,17 @@ class PostgresSessionRegistry(_SQLSessionRegistry):
             "  PRIMARY KEY (session_id, tenant_id)"
             ")"
         )
-        # Tables created before 2.2 have no handshake column.
-        await self._pool.execute(f"ALTER TABLE {self._table} ADD COLUMN IF NOT EXISTS handshake JSONB")
+        # Tables created by an earlier release have no handshake column. Look
+        # before altering: ALTER TABLE needs the table's owner and an exclusive
+        # lock even when the column is already there, and the application role
+        # is often not the owner.
+        has_handshake = await self._pool.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = $1::regclass "
+            "AND attname = 'handshake' AND NOT attisdropped)",
+            self._table,
+        )
+        if not has_handshake:
+            await self._pool.execute(f"ALTER TABLE {self._table} ADD COLUMN IF NOT EXISTS handshake JSONB")
         self._ready = True
 
     @property

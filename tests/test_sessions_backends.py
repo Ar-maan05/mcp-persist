@@ -14,6 +14,7 @@ which is how CI runs it), so a backend cannot drift from the others.
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import aiosqlite
 import fakeredis.aioredis as fakeredis
@@ -414,3 +415,101 @@ async def test_redis_registry_transactions_stay_within_one_cluster_slot() -> Non
             await real.aclose()
         except AttributeError:  # redis-py < 5.0
             await real.close(close_connection_pool=True)
+
+
+@pytest.mark.anyio
+async def test_postgres_registry_starts_as_a_role_that_does_not_own_the_table() -> None:
+    # initialize() ran ALTER TABLE ... ADD COLUMN IF NOT EXISTS every time. That
+    # needs the table's owner even when the column exists, so an application role
+    # with only read/write grants (the usual least-privilege setup) failed to start.
+    if not POSTGRES_URL:
+        pytest.skip("set MCP_TEST_POSTGRES_URL to run the Postgres session registry tests")
+    import uuid
+
+    import asyncpg
+
+    from mcp_persist.sessions import PostgresSessionRegistry
+
+    role = f"app_{uuid.uuid4().hex[:8]}"
+    table = f"sessions_{uuid.uuid4().hex[:8]}"
+
+    class _Store:
+        def __init__(self, pool: Any) -> None:
+            self._pool = pool
+            self._tenant_id = None
+
+    admin = await asyncpg.create_pool(POSTGRES_URL, min_size=1, max_size=2)
+    try:
+        await PostgresSessionRegistry(_Store(admin), table_name=table).initialize()  # created by the owner
+        await admin.execute(f'CREATE ROLE "{role}" LOGIN')
+        await admin.execute(f'GRANT SELECT, INSERT, UPDATE, DELETE ON "{table}" TO "{role}"')
+        await admin.execute(f'GRANT USAGE, CREATE ON SCHEMA public TO "{role}"')
+
+        app = await asyncpg.create_pool(POSTGRES_URL, user=role, min_size=1, max_size=2)
+        try:
+            registry = PostgresSessionRegistry(_Store(app), table_name=table)
+            await registry.initialize()
+            await registry.register("sess-app", handshake={"protocolVersion": "x"})
+            record = await registry.get("sess-app")
+            assert record is not None and record.handshake == {"protocolVersion": "x"}
+        finally:
+            await app.close()
+    finally:
+        await admin.execute(f'DROP TABLE IF EXISTS "{table}"')
+        await admin.execute(f'REVOKE ALL ON SCHEMA public FROM "{role}"')
+        await admin.execute(f'DROP ROLE IF EXISTS "{role}"')
+        await admin.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+async def test_a_registry_table_from_an_earlier_release_gains_the_handshake_column(backend: str) -> None:
+    # A table created before handshakes were recorded has no handshake column;
+    # initialize() adds it, and only then.
+    import uuid
+
+    from mcp_persist.sessions import PostgresSessionRegistry, SQLiteSessionRegistry
+
+    table = f"old_sessions_{uuid.uuid4().hex[:8]}"
+    if backend == "sqlite":
+        conn = await aiosqlite.connect(":memory:")
+        try:
+            await conn.execute(
+                f"CREATE TABLE {table} (session_id TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT '', "
+                "created_at REAL NOT NULL, last_seen_at REAL NOT NULL, terminated INTEGER NOT NULL DEFAULT 0, "
+                "owner TEXT, PRIMARY KEY (session_id, tenant_id))"
+            )
+            store = SQLiteEventStore(conn, table_name="events", ttl=None)
+            await store.initialize()
+            registry: Any = SQLiteSessionRegistry(store, table_name=table)
+            await registry.initialize()
+            await registry.register("sess-old", handshake={"protocolVersion": "x"})
+            record = await registry.get("sess-old")
+        finally:
+            await conn.close()
+    else:
+        if not POSTGRES_URL:
+            pytest.skip("set MCP_TEST_POSTGRES_URL to run the Postgres session registry tests")
+        import asyncpg
+
+        class _Store:
+            def __init__(self, pool: Any) -> None:
+                self._pool = pool
+                self._tenant_id = None
+
+        pool = await asyncpg.create_pool(POSTGRES_URL, min_size=1, max_size=2)
+        try:
+            await pool.execute(
+                f"CREATE TABLE \"{table}\" (session_id TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT '', "
+                "created_at DOUBLE PRECISION NOT NULL, last_seen_at DOUBLE PRECISION NOT NULL, "
+                "terminated BOOLEAN NOT NULL DEFAULT FALSE, owner JSONB, PRIMARY KEY (session_id, tenant_id))"
+            )
+            registry = PostgresSessionRegistry(_Store(pool), table_name=table)
+            await registry.initialize()
+            await registry.register("sess-old", handshake={"protocolVersion": "x"})
+            record = await registry.get("sess-old")
+        finally:
+            await pool.execute(f'DROP TABLE IF EXISTS "{table}"')
+            await pool.close()
+
+    assert record is not None and record.handshake == {"protocolVersion": "x"}
