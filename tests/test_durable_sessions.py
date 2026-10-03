@@ -842,6 +842,51 @@ async def test_a_concurrent_request_does_not_claim_another_clients_new_session()
         await conn.close()
 
 
+async def test_shutting_down_mid_request_leaves_the_session_live() -> None:
+    # When the manager shuts down while a request is still running, the SDK drops
+    # the session's transport, and the request's own bookkeeping read "gone after
+    # handling" as the client ending the session. A restart then found it
+    # terminated, which is the case durable sessions exist for.
+    import aiosqlite
+
+    from mcp_persist.session_manager import ResumableSessionManager
+
+    mcp = MCPServer(name="SlowServer")
+
+    @mcp.tool()
+    async def slow() -> str:
+        await anyio.sleep(30)
+        return "ok"
+
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        store = SQLiteEventStore(conn, table_name="events", ttl=None)
+        await store.initialize()
+        registry = session_registry_for(store)
+        await registry.initialize()
+        manager = ResumableSessionManager(app=mcp._lowlevel_server, event_store=store, registry=registry)
+        call = {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "slow", "arguments": {}}}
+
+        async with anyio.create_task_group() as outer:
+            async with manager.run():
+                status, _, session_id = await _asgi_post(manager, _INIT_BODY, None, None)
+                assert status == 200 and session_id
+
+                async def call_slow_tool() -> None:
+                    with contextlib.suppress(BaseException):
+                        await _asgi_post(manager, call, session_id, None)
+
+                outer.start_soon(call_slow_tool)
+                await anyio.sleep(0.3)  # the call is in flight when the manager shuts down
+            await anyio.sleep(0.5)
+            outer.cancel_scope.cancel()
+
+        record = await registry.get(session_id)
+        assert record is not None and not record.terminated
+    finally:
+        await conn.close()
+
+
 async def _tool_call_event_ids(client: httpx.AsyncClient, url: str, session_id: str, message: str) -> list[str]:
     """Call ``echo`` with JSON-RPC id 7 on ``session_id``; return the SSE event ids it got."""
     body = {

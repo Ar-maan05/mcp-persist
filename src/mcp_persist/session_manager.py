@@ -258,7 +258,9 @@ class ResumableSessionManager(SessionScopedSessionManager):
             # if this worker held it going in; an id it never had (declined
             # adoption, a wrong credential) just got a 404, which says nothing
             # about the session, and must not end it for its real owner.
-            if session_id in known_before:
+            # And not while shutting down: the SDK drops every session's
+            # transport then, which is the process going away, not the session.
+            if session_id in known_before and not self._shutting_down:
                 await self._record_termination(session_id)
         elif transport.is_terminated:  # pragma: no cover - terminate() hook normally wins
             await self._record_termination(session_id)
