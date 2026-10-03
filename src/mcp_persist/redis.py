@@ -308,12 +308,13 @@ class RedisEventStore(EventStore):
             yield store
         finally:
             # redis-py >= 5.0 exposes aclose(); 4.2–4.x only has close() (the
-            # declared floor is redis>=4.2.0). Mirror the guard the test suite
-            # already uses so create() works across the supported range.
+            # declared floor is redis>=4.2.0). On 4.x a from_url() client does
+            # not own its connection pool, so a bare close() leaves the socket
+            # open: one leaked connection per create(). Close the pool explicitly.
             try:
                 await client.aclose()
             except AttributeError:  # pragma: no cover - depends on installed redis-py version
-                await client.close()
+                await client.close(close_connection_pool=True)
 
     # Key helpers
 

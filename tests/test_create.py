@@ -104,14 +104,20 @@ async def test_redis_create_closes_client_on_body_error(monkeypatch):
 
 @pytest.mark.anyio
 async def test_redis_create_falls_back_to_close_without_aclose(monkeypatch):
-    """redis-py < 5.0 has no aclose(); create() must fall back to close()."""
+    """redis-py < 5.0 has no aclose(); create() must fall back to close().
+
+    And it must close the pool too: a 4.x from_url() client does not own its
+    pool, so a bare close() would leave the connection open.
+    """
 
     class _LegacyClient:
         def __init__(self) -> None:
             self.close_called = False
+            self.close_connection_pool: bool | None = None
 
-        async def close(self) -> None:
+        async def close(self, close_connection_pool: bool | None = None) -> None:
             self.close_called = True
+            self.close_connection_pool = close_connection_pool
 
     client = _LegacyClient()
 
@@ -123,6 +129,7 @@ async def test_redis_create_falls_back_to_close_without_aclose(monkeypatch):
         assert isinstance(store, RedisEventStore)
 
     assert client.close_called is True
+    assert client.close_connection_pool is True
 
 
 # ── SQLite ──────────────────────────────────────────────────────────────────

@@ -53,7 +53,7 @@ async def redis_client():
         try:
             await client.aclose()
         except AttributeError:
-            await client.close()
+            await client.close(close_connection_pool=True)
 
 
 @pytest.mark.anyio
@@ -166,7 +166,7 @@ async def test_redis_resource_cleanup():
         try:
             await client.aclose()
         except AttributeError:
-            await client.close()
+            await client.close(close_connection_pool=True)
 
     # Give time for socket closures
     await asyncio.sleep(0.2)
@@ -177,3 +177,24 @@ async def test_redis_resource_cleanup():
 
     # Verify no file descriptor leak
     assert fd_diff <= 3
+
+
+@pytest.mark.anyio
+async def test_redis_create_releases_its_connection():
+    """create() closes the connection it opened, on every supported redis-py.
+
+    On redis-py 4.x a from_url() client does not own its pool, so a bare close()
+    left the socket open: one leaked connection per create().
+    """
+    if not REAL_REDIS_URL:
+        pytest.skip("Counting real FDs requires a real Redis server URL")
+
+    fds_before = get_open_fds()
+
+    for _ in range(20):
+        async with RedisEventStore.create(REAL_REDIS_URL, key_prefix="create-cleanup:", ttl=3600) as store:
+            await store.store_event("clean-stream", SAMPLE_MSG)
+
+    await asyncio.sleep(0.2)
+
+    assert get_open_fds() - fds_before <= 3

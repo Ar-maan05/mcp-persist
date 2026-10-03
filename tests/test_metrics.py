@@ -255,7 +255,7 @@ async def test_redis_store_and_replay_fire_metrics():
         try:
             await client.aclose()
         except AttributeError:
-            await client.close()
+            await client.close(close_connection_pool=True)
 
 
 # ── Proxy replay hook (optional, feature-detected) ─────────────────────────────

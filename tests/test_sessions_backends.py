@@ -67,7 +67,7 @@ async def registry(request):
             try:
                 await client.aclose()
             except AttributeError:  # redis-py < 5.0
-                await client.close()
+                await client.close(close_connection_pool=True)
 
     else:
         if not POSTGRES_URL:
@@ -305,7 +305,7 @@ async def test_redis_register_cannot_revive_a_session_ended_mid_register() -> No
         try:
             await client.aclose()
         except AttributeError:  # redis-py < 5.0
-            await client.close()
+            await client.close(close_connection_pool=True)
 
 
 async def test_sqlite_table_from_before_the_handshake_column_is_upgraded() -> None:

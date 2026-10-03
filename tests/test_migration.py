@@ -66,7 +66,7 @@ async def redis_store():
         try:
             await client.aclose()
         except AttributeError:
-            await client.close()
+            await client.close(close_connection_pool=True)
 
 
 @pytest.mark.anyio

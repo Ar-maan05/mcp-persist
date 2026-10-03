@@ -73,7 +73,7 @@ async def records(request):
             try:
                 await client.aclose()
             except AttributeError:  # redis-py < 5.0
-                await client.close()
+                await client.close(close_connection_pool=True)
 
     else:
         if not POSTGRES_URL:
@@ -272,7 +272,7 @@ async def test_redis_index_does_not_grow_past_the_ttl() -> None:
         try:
             await client.aclose()
         except AttributeError:  # redis-py < 5.0
-            await client.close()
+            await client.close(close_connection_pool=True)
 
 
 async def test_redis_ttl_uses_the_records_own_age() -> None:
@@ -300,7 +300,7 @@ async def test_redis_ttl_uses_the_records_own_age() -> None:
         try:
             await client.aclose()
         except AttributeError:  # redis-py < 5.0
-            await client.close()
+            await client.close(close_connection_pool=True)
 
 
 async def test_duplicate_ids_are_not_reported_as_written(records) -> None:
