@@ -631,6 +631,48 @@ async def test_a_refused_request_does_not_end_the_session_for_its_owner(creator:
         await conn.close()
 
 
+async def test_a_refused_request_does_not_refresh_the_session() -> None:
+    # On the worker that holds the session, the SDK refuses a request with the
+    # wrong credential (404), but the bookkeeping afterwards still touched the
+    # registry record, so anyone who knew a session id could keep it looking
+    # active, and out of an age-based purge, indefinitely.
+    import aiosqlite
+
+    from mcp_persist.session_manager import ResumableSessionManager
+
+    conn = await aiosqlite.connect(":memory:")
+    store = SQLiteEventStore(conn, table_name="events", ttl=None)
+    await store.initialize()
+    registry = session_registry_for(store)
+    await registry.initialize()
+    try:
+        manager = ResumableSessionManager(app=_make_mcp()._lowlevel_server, event_store=store, registry=registry)
+        async with manager.run():
+            status, _, session_id = await _asgi_post(manager, _INIT_BODY, None, _user("alice"))
+            assert status == 200 and session_id
+            before = await registry.get(session_id)
+            assert before is not None
+
+            await anyio.sleep(0.05)
+            refused, _, _ = await _asgi_post(
+                manager, {"jsonrpc": "2.0", "id": 1, "method": "ping"}, session_id, _user("mallory")
+            )
+            assert refused == 404
+            after = await registry.get(session_id)
+            assert after is not None and after.last_seen_at == before.last_seen_at
+
+            # The owner's own requests still count as activity.
+            await anyio.sleep(0.05)
+            status, _, _ = await _asgi_post(
+                manager, {"jsonrpc": "2.0", "id": 2, "method": "ping"}, session_id, _user("alice")
+            )
+            assert status == 200
+            touched = await registry.get(session_id)
+            assert touched is not None and touched.last_seen_at > before.last_seen_at
+    finally:
+        await conn.close()
+
+
 async def _tool_call_event_ids(client: httpx.AsyncClient, url: str, session_id: str, message: str) -> list[str]:
     """Call ``echo`` with JSON-RPC id 7 on ``session_id``; return the SSE event ids it got."""
     body = {

@@ -137,6 +137,7 @@ class ResumableSessionManager(SessionScopedSessionManager):
         known_before = set(self._server_instances)
         registered: set[str] = set()
         opening_body = bytearray()
+        refused = False
 
         async def receive_and_keep_opening_body() -> Message:
             # Only a request without a session id can open one, and it has to be
@@ -153,6 +154,9 @@ class ResumableSessionManager(SessionScopedSessionManager):
             # its id goes out. Recording it afterwards left a window in which a
             # client that went straight to another worker found no record and
             # got a 404.
+            nonlocal refused
+            if message["type"] == "http.response.start" and message["status"] >= 400:
+                refused = True
             if message["type"] == "http.response.start" and message["status"] < 400:
                 new_id = _response_session_id(message)
                 if new_id is not None and new_id not in known_before and new_id not in registered:
@@ -172,7 +176,9 @@ class ResumableSessionManager(SessionScopedSessionManager):
             # away idled out unrecorded and stayed adoptable. Shielded so the
             # cancellation that got us here does not cut the bookkeeping short.
             with anyio.CancelScope(shield=True):
-                await self._reconcile(known_before, session_id, requestor, registered, _initialize_params(opening_body))
+                await self._reconcile(
+                    known_before, session_id, requestor, registered, _initialize_params(opening_body), refused=refused
+                )
 
     async def _register(
         self, session_id: str, requestor: dict[str, Any] | None, handshake: dict[str, Any] | None
@@ -194,6 +200,8 @@ class ResumableSessionManager(SessionScopedSessionManager):
         requestor: dict[str, Any] | None,
         registered: set[str],
         handshake: dict[str, Any] | None,
+        *,
+        refused: bool = False,
     ) -> None:
         """Record what the upstream handler just did.
 
@@ -229,7 +237,9 @@ class ResumableSessionManager(SessionScopedSessionManager):
                 await self._record_termination(session_id)
         elif transport.is_terminated:  # pragma: no cover - terminate() hook normally wins
             await self._record_termination(session_id)
-        else:
+        elif not refused:
+            # A refused request (the wrong credential gets a 404 here too) is not
+            # activity on the session, and must not keep its record looking live.
             await self._touch(session_id)
 
     async def _touch(self, session_id: str) -> None:
