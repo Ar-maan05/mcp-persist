@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_SESSION_TABLE = "mcp_sessions"
 
 
+# Longest client label SessionRecord.client returns; a client chooses its own name.
+_MAX_CLIENT_LABEL = 64
+
+
 @dataclass(frozen=True)
 class SessionRecord:
     """A session as the registry knows it.
@@ -74,6 +78,23 @@ class SessionRecord:
     metadata: dict[str, Any] = field(default_factory=dict)
     handshake: dict[str, Any] | None = None
 
+    @property
+    def client(self) -> str | None:
+        """The client's ``name version`` from its recorded ``initialize``, or None.
+
+        Both come from the client, so the text is made safe to print: control
+        characters (a terminal escape sequence, say) are replaced and it is
+        capped at :data:`_MAX_CLIENT_LABEL` characters.
+        """
+        info = (self.handshake or {}).get("clientInfo")
+        if not isinstance(info, dict):
+            return None
+        parts = [str(info[k]) for k in ("name", "version") if isinstance(info.get(k), (str, int, float))]
+        if not parts:
+            return None
+        label = "".join(c if c.isprintable() else "?" for c in " ".join(parts))
+        return label if len(label) <= _MAX_CLIENT_LABEL else label[: _MAX_CLIENT_LABEL - 3] + "..."
+
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable view, for the CLI and for logs."""
         return {
@@ -84,6 +105,7 @@ class SessionRecord:
             "owner": self.owner,
             "metadata": self.metadata,
             "handshake": self.handshake,
+            "client": self.client,
         }
 
 

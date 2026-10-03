@@ -350,7 +350,7 @@ _PAGE = """
     <h2>Sessions</h2>
     <div class="scroll">
       <table>
-        <thead><tr><th>Session</th><th>Last seen</th><th>State</th></tr></thead>
+        <thead><tr><th>Session</th><th>Client</th><th>Last seen</th><th>State</th></tr></thead>
         <tbody id="sessions"></tbody>
       </table>
     </div>
@@ -423,17 +423,18 @@ async function refresh() {
   try {
     const s = await getJSON('/api/sessions');
     $('sessions').innerHTML = !s.available
-      ? `<tr><td colspan="3" class="empty">${esc(s.reason)}</td></tr>`
+      ? `<tr><td colspan="4" class="empty">${esc(s.reason)}</td></tr>`
       : (s.sessions.length ? s.sessions.map(r => `
           <tr>
             <td class="mono">${esc(r.session_id)}</td>
+            <td>${esc(r.client ?? '')}</td>
             <td>${esc(when(r.last_seen_at))}</td>
             <td>${r.terminated ? '<span class="tag error">terminated</span>'
                                : '<span class="tag result">live</span>'}</td>
           </tr>`).join('')
-        : '<tr><td colspan="3" class="empty">No sessions recorded. Is durable_sessions enabled?</td></tr>');
+        : '<tr><td colspan="4" class="empty">No sessions recorded. Is durable_sessions enabled?</td></tr>');
   } catch (e) {
-    $('sessions').innerHTML = `<tr><td colspan="3" class="empty err">${esc(e.message)}</td></tr>`;
+    $('sessions').innerHTML = `<tr><td colspan="4" class="empty err">${esc(e.message)}</td></tr>`;
   }
 }
 

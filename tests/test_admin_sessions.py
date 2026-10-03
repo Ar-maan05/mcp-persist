@@ -17,7 +17,7 @@ from mcp_persist import SQLiteEventStore, session_registry_for
 from mcp_persist._admin import main
 
 
-def _seed(db: str, *ids: str) -> None:
+def _seed(db: str, *ids: str, handshake: dict[str, object] | None = None) -> None:
     """Create the session records the CLI will read.
 
     Synchronous on purpose: the CLI calls ``asyncio.run`` itself, which cannot
@@ -29,7 +29,7 @@ def _seed(db: str, *ids: str) -> None:
             registry = session_registry_for(store)
             await registry.initialize()
             for session_id in ids:
-                await registry.register(session_id)
+                await registry.register(session_id, handshake=handshake)
 
     asyncio.run(go())
 
@@ -119,3 +119,23 @@ def test_missing_id_and_stray_flag_are_rejected(
 
     assert _run(monkeypatch, db, "list", "--older-than", "1d") == 2
     assert "only applies" in capsys.readouterr().err
+
+
+def test_list_names_each_sessions_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = str(tmp_path / "e.db")
+    _seed(db, "sess-known", handshake={"clientInfo": {"name": "inspector", "version": "0.9"}})
+    _seed(db, "sess-legacy")
+
+    assert _run(monkeypatch, db, "list") == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split()[-1] == "CLIENT"
+    known = next(line for line in lines if line.startswith("sess-known"))
+    legacy = next(line for line in lines if line.startswith("sess-legacy"))
+    assert known.endswith("inspector 0.9")
+    assert legacy.endswith(" -")
+
+    assert _run(monkeypatch, db, "list", "--json") == 0
+    clients = {s["session_id"]: s["client"] for s in json.loads(capsys.readouterr().out)["sessions"]}
+    assert clients == {"sess-known": "inspector 0.9", "sess-legacy": None}

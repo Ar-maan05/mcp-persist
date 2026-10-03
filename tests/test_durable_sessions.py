@@ -300,7 +300,32 @@ def test_session_record_as_dict_is_json_shaped() -> None:
         "owner": None,
         "metadata": {},
         "handshake": None,
+        "client": None,
     }
+
+
+def _with_client_info(info: object) -> SessionRecord:
+    return SessionRecord(session_id="s", created_at=1.0, last_seen_at=2.0, handshake={"clientInfo": info})
+
+
+def test_session_record_names_its_client() -> None:
+    assert _with_client_info({"name": "claude-code", "version": "2.1.0"}).client == "claude-code 2.1.0"
+    assert _with_client_info({"name": "bare"}).client == "bare"
+    assert SessionRecord(session_id="s", created_at=1.0, last_seen_at=2.0).client is None
+    assert _with_client_info("not an object").client is None
+    assert _with_client_info({"name": {"nested": True}}).client is None
+
+
+def test_session_record_client_is_safe_to_print() -> None:
+    # The client picks its own name, and the CLI prints it to an operator's
+    # terminal: an escape sequence in it must not reach the terminal intact.
+    hostile = _with_client_info({"name": "evil\x1b]0;pwned\x07\x1b[2J", "version": "1\n2"}).client
+    assert hostile is not None
+    assert all(c.isprintable() for c in hostile)
+    assert "\x1b" not in hostile and "\n" not in hostile
+
+    long = _with_client_info({"name": "x" * 500}).client
+    assert long is not None and len(long) == 64 and long.endswith("...")
 
 
 async def test_a_new_session_is_recorded_before_the_client_learns_its_id(
