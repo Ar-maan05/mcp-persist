@@ -99,6 +99,12 @@ jobs:
           uv pip install -r floors.txt
           uv pip list
 
+      # Compile warnings only show up when a file is actually compiled, and a
+      # warm bytecode cache skips that. Newer Pythons add new ones (3.14 warns
+      # about a return/break/continue that leaves a finally block, PEP 765).
+      - name: Compile with syntax warnings as errors
+        run: uv run --no-sync python -W error::SyntaxWarning -m compileall -q -f src tests examples benchmarks
+
       - name: Tests (pytest, real Redis + Postgres)
         run: uv run --no-sync pytest tests/ -v
         env:
