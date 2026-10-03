@@ -25,7 +25,7 @@ import anyio
 import httpx2 as httpx
 import pytest
 import uvicorn
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from starlette.applications import Starlette
 
 from mcp_persist import SQLiteEventStore, with_persistence
@@ -762,6 +762,106 @@ async def _run_attack(url: str, alice: str, mallory: str) -> None:
         await _tool_call_event_ids(client, url, alice, "alice-secret")
         received = await _resume(client, url, mallory, planted[-1])
     assert "alice-secret" not in received
+
+
+def _make_chatty_mcp() -> MCPServer:
+    mcp = MCPServer(name="ChattyServer")
+
+    @mcp.tool()
+    async def chatty(ctx: Context) -> str:
+        await ctx.info("working")
+        await ctx.report_progress(1, 2, "half")
+        return "done-result"
+
+    return mcp
+
+
+@pytest.mark.parametrize("durable", [False, True], ids=["plain", "durable-after-restart"])
+async def test_a_session_resumes_its_own_stream(tmp_path: Path, durable: bool) -> None:
+    # The other half of keeping sessions apart: a client resuming a stream of
+    # its own still gets the rest of it. The transport is handed its stream back
+    # without the session prefix, which it needs to match the request id.
+    db = str(tmp_path / "events.db")
+    port = _free_port()
+    call = {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "chatty", "arguments": {}}}
+    call["params"]["_meta"] = {"progressToken": "tok"}  # type: ignore[index]
+
+    app1 = with_persistence(_make_chatty_mcp(), backend="sqlite", url=db, durable_sessions=durable)
+    async with _serve(app1, port) as url:
+        session_id = await _initialize(url)
+        headers = {**_HEADERS, "Mcp-Session-Id": session_id, "Mcp-Protocol-Version": "2025-06-18"}
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            response = await client.post(url, json=call, headers=headers)
+        assert "done-result" in response.text
+        ids = [line[len("id:") :].strip() for line in response.text.splitlines() if line.startswith("id:")]
+        assert len(ids) >= 2, response.text
+        if not durable:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                resumed = await _resume(client, url, session_id, ids[0])
+
+    if durable:
+        app2 = with_persistence(_make_chatty_mcp(), backend="sqlite", url=db, durable_sessions=True)
+        async with _serve(app2, port) as url, httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            resumed = await _resume(client, url, session_id, ids[0])
+
+    assert "done-result" in resumed
+    assert '"working"' not in resumed  # only what came after the resumed-from event
+
+
+async def test_a_resumed_stream_carries_on_live(tmp_path: Path) -> None:
+    # The client drops the response of a request that is still running, resumes
+    # it, and gets the result live once the tool finishes. The transport routes
+    # live events by request id, so the stream it is handed back after the
+    # replay must be the bare request id, not the session-prefixed one stored.
+    finish = anyio.Event()
+    mcp = MCPServer(name="SlowServer")
+
+    @mcp.tool()
+    async def slow(ctx: Context) -> str:
+        await ctx.info("working")
+        await finish.wait()
+        return "done-result"
+
+    # 2025-11-25 so the transport sends a priming event once a resumed stream is
+    # attached to the request again: the tool is only let finish after that, or
+    # its result would reach the client through the replay instead of live.
+    version = "2025-11-25"
+    init = {**_INIT_BODY, "params": {**_INIT_BODY["params"], "protocolVersion": version}}
+    call = {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "slow", "arguments": {}}}
+    db = str(tmp_path / "events.db")
+    port = _free_port()
+    app = with_persistence(mcp, backend="sqlite", url=db)
+    async with _serve(app, port) as url, httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        opened = await client.post(url, json=init, headers=_HEADERS)
+        session_id = opened.headers["mcp-session-id"]
+        headers = {**_HEADERS, "Mcp-Session-Id": session_id, "Mcp-Protocol-Version": version}
+        await client.post(url, json={"jsonrpc": "2.0", "method": "notifications/initialized"}, headers=headers)
+
+        first_id = None
+        async with client.stream("POST", url, json=call, headers=headers) as response:
+            async for line in response.aiter_lines():
+                if line.startswith("id:"):
+                    first_id = line[len("id:") :].strip()
+                    break  # hang up mid-request
+        assert first_id is not None
+
+        resumed: list[str] = []
+        with anyio.fail_after(10):
+            async with client.stream("GET", url, headers={**headers, "Last-Event-ID": first_id}) as response:
+                assert response.status_code == 200
+                ids_seen = 0
+                async for line in response.aiter_lines():
+                    resumed.append(line)
+                    if line.startswith("id:"):
+                        ids_seen += 1
+                        if ids_seen == 2:  # the replayed "working", then the priming event
+                            finish.set()
+                    if "done-result" in line:
+                        break
+
+    text = "\n".join(resumed)
+    assert '"working"' in text
+    assert "done-result" in text
 
 
 async def test_streams_are_stored_under_their_session(tmp_path: Path) -> None:
