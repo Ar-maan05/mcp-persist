@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **Sessions no longer replay each other's events.** The SDK's transport names the streams it stores after the JSON-RPC request id they belong to (or `_GET_stream`), not the session, and every session shares the event store. Two sessions that both sent a request with id `7` wrote into one stream, and resuming it with `Last-Event-ID` replayed both sessions' events. Clients number their requests from 0 or 1, so this happened in ordinary use: a client resuming a stream could be handed another session's response, under the request id it was waiting on. And anyone with a session could read other sessions' tool results by sending a request with a common id and resuming from their own event id. This affected `with_persistence()`, with or without durable sessions, and any store passed to the SDK's `StreamableHTTPSessionManager` directly, as the docs and examples showed. `with_persistence()` and `ResumableSessionManager` now give each session a view of the store that names its streams `<session_id>:<stream>` and replays a stream only to the session that owns it. **If you wire a store into the SDK's manager yourself, switch to `SessionScopedSessionManager`**, which takes the same arguments. Events stored before upgrading carry no session prefix, so a client resuming from one of them after the upgrade gets nothing replayed, as if it had expired. `PersistenceProxy` was not affected: it already scoped streams to sessions.
 - **A request refused by one worker can no longer end a session for everyone.** When a worker did not hold a session and declined to adopt it (the request carried the wrong credential), it answered `404` and then recorded the session as terminated in the shared registry, treating "not held here" as "ended". Anyone who knew or guessed a live session id could send one request with any other credential to any worker that did not hold it, and the real owner could no longer resume the session after a restart or on another worker. A termination is now recorded only when the worker held the session as the request began and does not afterwards (an explicit `DELETE`).
 
 ### Fixed
@@ -20,8 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`RedisEventStore.create()` no longer leaks a connection on redis-py 4.x.** On redis-py older than 5.0, a client made with `from_url()` does not own its connection pool, so the `close()` that `create()` falls back to there released the connection to the pool but never closed it: one open socket per `create()`, closed only by the garbage collector, by which point its event loop could be gone (`RuntimeError: Event loop is closed`). `create()` now closes the pool explicitly. redis-py 5.0 and later were not affected.
 
 ### Added
+- `SessionScopedSessionManager`, a drop-in for the SDK's `StreamableHTTPSessionManager` that keeps each session's events to itself in a shared store, and `SessionScopedEventStore`, the per-session view of a store it gives each transport. See the Security entry above.
 - `SessionRecord.handshake`, and a `handshake=` keyword on `SessionRegistry.register`. The SQL registries add a `handshake` column to an existing table on startup. A custom registry whose `register` does not take `handshake` keeps working; its sessions are adopted uninitialized.
 - Python 3.14 is supported and tested. CI also runs the suite against the oldest release of every runtime dependency the package allows (mcp 2.0.0, redis 4.2.0, and so on), and checks the built wheel installs and imports on its own.
+
 
 ## [2.1.1] - 2026-09-26
 

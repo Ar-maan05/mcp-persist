@@ -1,8 +1,6 @@
 # Examples
 
-Minimal, runnable MCP servers showing how to add `mcp-persist` resumability: the
-`with_persistence()` plugin one-liner, plus each backend wired manually into a
-real [`StreamableHTTPSessionManager`](https://github.com/modelcontextprotocol/python-sdk).
+Minimal, runnable MCP servers showing how to add `mcp-persist` resumability: the `with_persistence()` plugin one-liner, plus each backend wired manually into a `SessionScopedSessionManager` (the SDK's session manager, with each session kept to its own events).
 
 All serve MCP at `http://localhost:8000/mcp`. The three backend servers share the
 same note-taking API; the plugin server is a minimal echo server.

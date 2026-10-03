@@ -67,6 +67,7 @@ from mcp_persist.retention import (
 )
 from mcp_persist.scheduler import ArchiveScheduler, PurgeScheduler, RetentionScheduler
 from mcp_persist.session_manager import ResumableSessionManager
+from mcp_persist.session_scope import SessionScopedEventStore, SessionScopedSessionManager
 from mcp_persist.sessions import (
     PostgresSessionRegistry,
     RedisSessionRegistry,
@@ -126,6 +127,8 @@ __all__ = [
     "SQLiteSessionRegistry",
     "SessionRecord",
     "SessionRegistry",
+    "SessionScopedEventStore",
+    "SessionScopedSessionManager",
     "StoredEvent",
     "__version__",
     "archive_expired_batch",

@@ -47,7 +47,7 @@ either tier:
 from mcp_persist import ChainedEventStore
 
 store = ChainedEventStore(hot=hot, cold=cold)
-# hand `store` to StreamableHTTPSessionManager / with_persistence / the proxy
+# hand `store` to SessionScopedSessionManager / with_persistence / the proxy
 ```
 
 New events are written to the hot store only. On `replay_events_after`, the chain

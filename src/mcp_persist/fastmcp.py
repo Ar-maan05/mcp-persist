@@ -46,6 +46,7 @@ from starlette.routing import Mount
 from mcp_persist.config import build_store_context, env_flag, event_store_from_env
 from mcp_persist.recorder import DEFAULT_MAX_QUEUE
 from mcp_persist.records import PayloadPolicy
+from mcp_persist.session_scope import SessionScopedSessionManager
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -399,7 +400,7 @@ async def _run_manager(
         await registry.initialize()
         manager = ResumableSessionManager(app=mcp._lowlevel_server, event_store=store, registry=registry, **kwargs)
     else:
-        manager = StreamableHTTPSessionManager(app=mcp._lowlevel_server, event_store=store, **kwargs)
+        manager = SessionScopedSessionManager(app=mcp._lowlevel_server, event_store=store, **kwargs)
 
     app.state.session_manager = manager
     app.state.event_store = store

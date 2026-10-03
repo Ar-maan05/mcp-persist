@@ -55,8 +55,7 @@ import contextlib
 
 import asyncpg
 from mcp.server.mcpserver import MCPServer
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp_persist import PostgresEventStore
+from mcp_persist import PostgresEventStore, SessionScopedSessionManager
 
 mcp = MCPServer(name="MyServer")
 
@@ -68,7 +67,7 @@ async def lifespan(app):
         store = PostgresEventStore(pool, ttl=3600)
         await store.initialize()  # SQLite/Postgres only; Redis has no initialize()
 
-        manager = StreamableHTTPSessionManager(
+        manager = SessionScopedSessionManager(
             app=mcp._lowlevel_server,  # the low-level Server MCPServer wraps
             event_store=store,
             session_idle_timeout=300,  # seconds
@@ -89,13 +88,13 @@ forever; treat that as a misconfiguration in production.
 without branching in code, build the store from the environment:
 
 ```python
-from mcp_persist import event_store_from_env
+from mcp_persist import SessionScopedSessionManager, event_store_from_env
 
 # MCP_PERSIST_BACKEND=postgres
 # MCP_PERSIST_URL=postgresql://localhost/mydb
 # MCP_PERSIST_TTL=3600
 async with event_store_from_env() as store:  # opens + closes the connection
-    manager = StreamableHTTPSessionManager(app=mcp._lowlevel_server, event_store=store)
+    manager = SessionScopedSessionManager(app=mcp._lowlevel_server, event_store=store)
     async with manager.run():
         yield
 ```

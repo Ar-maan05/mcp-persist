@@ -41,10 +41,10 @@ from mcp.server.auth.middleware.bearer_auth import (
 from mcp.server.connection import Connection
 from mcp.server.runner import ServerRunner, serve_connection
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER, StreamableHTTPServerTransport
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
 from starlette.requests import Request
 
+from mcp_persist.session_scope import SessionScopedSessionManager
 from mcp_persist.sessions import _owner_matches
 
 if TYPE_CHECKING:
@@ -68,11 +68,13 @@ _TRANSPORT_OWNS_IDLE_TIMEOUT = "idle_timeout" in inspect.signature(StreamableHTT
 _MAX_HANDSHAKE_BODY_BYTES = 64 * 1024
 
 
-class ResumableSessionManager(StreamableHTTPSessionManager):
+class ResumableSessionManager(SessionScopedSessionManager):
     """A ``StreamableHTTPSessionManager`` backed by a durable session registry.
 
     Every session this manager creates is recorded in the registry, and every
     session id it does not recognize is looked up there before being rejected.
+    Like :class:`~mcp_persist.SessionScopedSessionManager`, which it builds on,
+    it keeps each session's events out of every other session's replays.
 
     Args:
         registry: Where sessions are recorded. Share the event store's backend

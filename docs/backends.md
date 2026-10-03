@@ -13,18 +13,16 @@ decision and the `with_persistence()` one-liner, see the
 
 ## Manual wiring (advanced or non-MCPServer)
 
-`with_persistence()` is the fast path on MCPServer. When you are not on MCPServer, or
-you want to own the wiring yourself, construct a store and hand it to
-`StreamableHTTPSessionManager`. The backends are interchangeable; pick per
-[Choosing a backend](../README.md#backends--choosing-one).
+`with_persistence()` is the fast path on MCPServer. When you are not on MCPServer, or you want to own the wiring yourself, construct a store and hand it to `SessionScopedSessionManager`. The backends are interchangeable; pick per [Choosing a backend](../README.md#backends--choosing-one).
+
+`SessionScopedSessionManager` is the SDK's `StreamableHTTPSessionManager` with one change, and it takes the same arguments. **Do not hand a store to the SDK's manager directly.** The SDK names the streams it stores after JSON-RPC request ids, not sessions, so two sessions that both send a request with id `7` share a stream, and either one resuming it is replayed the other's events too. Clients number their requests from 0 or 1, so this happens without anyone trying. The scoped manager gives each session a view of the store that names its streams `<session_id>:<stream>` and replays a stream only to the session that owns it. `with_persistence()` and `ResumableSessionManager` already use it.
 
 ### SQLite
 
 ```python
 import aiosqlite
 from mcp.server.mcpserver import MCPServer
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp_persist import SQLiteEventStore
+from mcp_persist import SQLiteEventStore, SessionScopedSessionManager
 
 mcp = MCPServer(name="MyServer")
 
@@ -32,7 +30,7 @@ conn = await aiosqlite.connect("events.db")
 store = SQLiteEventStore(conn, ttl=3600)  # 1 hour TTL
 await store.initialize()
 
-session_manager = StreamableHTTPSessionManager(
+session_manager = SessionScopedSessionManager(
     app=mcp._lowlevel_server,  # the low-level Server that MCPServer wraps
     event_store=store,
 )
@@ -43,15 +41,14 @@ session_manager = StreamableHTTPSessionManager(
 ```python
 import redis.asyncio as aioredis
 from mcp.server.mcpserver import MCPServer
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp_persist import RedisEventStore
+from mcp_persist import RedisEventStore, SessionScopedSessionManager
 
 mcp = MCPServer(name="MyServer")
 
 redis_client = aioredis.from_url("redis://localhost:6379")
 store = RedisEventStore(redis_client, ttl=3600)  # 1 hour TTL
 
-session_manager = StreamableHTTPSessionManager(
+session_manager = SessionScopedSessionManager(
     app=mcp._lowlevel_server,  # the low-level Server that MCPServer wraps
     event_store=store,
 )
@@ -62,8 +59,7 @@ session_manager = StreamableHTTPSessionManager(
 ```python
 import asyncpg
 from mcp.server.mcpserver import MCPServer
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp_persist import PostgresEventStore
+from mcp_persist import PostgresEventStore, SessionScopedSessionManager
 
 mcp = MCPServer(name="MyServer")
 
@@ -71,7 +67,7 @@ pool = await asyncpg.create_pool("postgresql://localhost/mydb")
 store = PostgresEventStore(pool, ttl=3600)  # 1 hour TTL
 await store.initialize()
 
-session_manager = StreamableHTTPSessionManager(
+session_manager = SessionScopedSessionManager(
     app=mcp._lowlevel_server,  # the low-level Server that MCPServer wraps
     event_store=store,
 )

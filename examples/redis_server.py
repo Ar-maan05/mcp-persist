@@ -32,11 +32,10 @@ from typing import Any
 import redis.asyncio as aioredis
 import uvicorn
 from mcp.server.mcpserver import MCPServer
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
-from mcp_persist import RedisEventStore
+from mcp_persist import RedisEventStore, SessionScopedSessionManager
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 
@@ -129,7 +128,7 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
     try:
         store = RedisEventStore(redis_client, key_prefix=KEY_PREFIX, ttl=3600)
 
-        session_manager = StreamableHTTPSessionManager(
+        session_manager = SessionScopedSessionManager(
             app=mcp._lowlevel_server,
             event_store=store,
             session_idle_timeout=300,

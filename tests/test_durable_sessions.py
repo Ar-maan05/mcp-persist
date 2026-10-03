@@ -629,3 +629,83 @@ async def test_a_refused_request_does_not_end_the_session_for_its_owner(creator:
             assert status == 200, body
     finally:
         await conn.close()
+
+
+async def _tool_call_event_ids(client: httpx.AsyncClient, url: str, session_id: str, message: str) -> list[str]:
+    """Call ``echo`` with JSON-RPC id 7 on ``session_id``; return the SSE event ids it got."""
+    body = {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"message": message}},
+    }
+    headers = {**_HEADERS, "Mcp-Session-Id": session_id, "Mcp-Protocol-Version": "2025-06-18"}
+    response = await client.post(url, json=body, headers=headers)
+    assert response.status_code == 200, response.text
+    assert message in response.text
+    return [line[len("id:") :].strip() for line in response.text.splitlines() if line.startswith("id:")]
+
+
+async def _resume(client: httpx.AsyncClient, url: str, session_id: str, last_event_id: str) -> str:
+    """Everything a GET resuming ``session_id`` from ``last_event_id`` is sent within a second."""
+    headers = {
+        **_HEADERS,
+        "Mcp-Session-Id": session_id,
+        "Mcp-Protocol-Version": "2025-06-18",
+        "Last-Event-ID": last_event_id,
+    }
+    received = ""
+    with anyio.move_on_after(1.0):
+        async with client.stream("GET", url, headers=headers) as response:
+            assert response.status_code == 200
+            async for chunk in response.aiter_text():
+                received += chunk
+    return received
+
+
+@pytest.mark.parametrize("durable", [False, True], ids=["plain", "durable-after-restart"])
+async def test_a_session_cannot_replay_another_sessions_events(tmp_path: Path, durable: bool) -> None:
+    # The SDK names the streams it stores after JSON-RPC request ids, not
+    # sessions, and every session shares the store. A request id another session
+    # also used put both sessions' events in one stream, and resuming it replayed
+    # them all: here the second session reads the first one's tool result by
+    # resuming from an event id of its own.
+    db = str(tmp_path / "events.db")
+    port = _free_port()
+
+    app1 = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=durable)
+    async with _serve(app1, port) as url:
+        alice = await _initialize(url)
+        mallory = await _initialize(url)
+        if not durable:
+            await _run_attack(url, alice, mallory)
+
+    if durable:
+        # After a restart both sessions are adopted, which builds their
+        # transports outside the SDK; they must be isolated the same way.
+        app2 = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=True)
+        async with _serve(app2, port) as url:
+            await _run_attack(url, alice, mallory)
+
+
+async def _run_attack(url: str, alice: str, mallory: str) -> None:
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        planted = await _tool_call_event_ids(client, url, mallory, "mallory-own")
+        assert planted, "expected the tool call to be stored as an event"
+        await _tool_call_event_ids(client, url, alice, "alice-secret")
+        received = await _resume(client, url, mallory, planted[-1])
+    assert "alice-secret" not in received
+
+
+async def test_streams_are_stored_under_their_session(tmp_path: Path) -> None:
+    db = str(tmp_path / "events.db")
+    port = _free_port()
+    app = with_persistence(_make_mcp(), backend="sqlite", url=db)
+    async with _serve(app, port) as url:
+        session_id = await _initialize(url)
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            await _tool_call_event_ids(client, url, session_id, "hello")
+
+    async with SQLiteEventStore.create(db) as store:
+        streams = [stream async for stream in store.list_streams()]
+    assert streams and all(stream.startswith(f"{session_id}:") for stream in streams), streams

@@ -76,14 +76,13 @@ The live store is exposed on `app.state.event_store`, so you can run a
 server. No extra dependency is required: `starlette` and the session manager ship
 with `mcp`. See [`examples/fastmcp_plugin_server.py`](examples/fastmcp_plugin_server.py).
 
-Under the hood, whichever setup you use, it's the same layering: a
-`StreamableHTTPSessionManager` backed by a durable `EventStore` you choose.
+Under the hood, whichever setup you use, it's the same layering: the SDK's session manager backed by a durable `EventStore` you choose, with each session scoped to its own events (`SessionScopedSessionManager`).
 
 ```
 MCP Server
      │
      ▼
-StreamableHTTPSessionManager
+SessionScopedSessionManager
      │
      ▼
 EventStore
@@ -92,9 +91,7 @@ EventStore
  └─ PostgreSQL
 ```
 
-> **Not using MCPServer, or want to own the wiring yourself?** Build a store and pass
-> it to `StreamableHTTPSessionManager` directly; see
-> [Manual wiring](docs/backends.md#manual-wiring-advanced-or-non-mcpserver).
+> **Not using MCPServer, or want to own the wiring yourself?** Build a store and pass it to `SessionScopedSessionManager`, a drop-in for the SDK's `StreamableHTTPSessionManager`. Do not pass it to the SDK's manager directly: it files events by request id rather than session, so sessions would be replayed each other's events. See [Manual wiring](docs/backends.md#manual-wiring-advanced-or-non-mcpserver).
 
 ## Surviving a restart: `durable_sessions=True`
 
@@ -388,9 +385,7 @@ Full treatment, including the Redis write-ceiling caveat, in
 
 ## Examples
 
-The [`examples/`](examples/) directory contains minimal, runnable MCP servers:
-the `with_persistence()` one-liner, plus each backend wired manually into a real
-[`StreamableHTTPSessionManager`](https://github.com/modelcontextprotocol/python-sdk):
+The [`examples/`](examples/) directory contains minimal, runnable MCP servers: the `with_persistence()` one-liner, plus each backend wired manually into a `SessionScopedSessionManager`:
 
 | File | Approach | Run |
 |---|---|---|
