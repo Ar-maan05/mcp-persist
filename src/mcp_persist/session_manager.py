@@ -27,6 +27,7 @@ is public for callers who wire the session manager themselves.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import inspect
 import json
 import logging
@@ -63,6 +64,13 @@ logger = logging.getLogger(__name__)
 # builds its own `idle_scope` in connect(), and pushes the deadline back while
 # requests are in flight. Earlier SDKs left all of that to the manager.
 _TRANSPORT_OWNS_IDLE_TIMEOUT = "idle_timeout" in inspect.signature(StreamableHTTPServerTransport.__init__).parameters
+
+# The ids of the sessions added to the manager by the request being handled. The
+# SDK creates a session's transport inside the request that opens it, so the
+# session table's add hook (see _on_session_added) runs in that request's context.
+_created_by_this_request: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "mcp_persist_created_by_this_request", default=None
+)
 
 # The largest opening request body inspected for its `initialize` params. A real
 # initialize is a few hundred bytes; anything past this is not worth buffering
@@ -138,6 +146,8 @@ class ResumableSessionManager(SessionScopedSessionManager):
 
         known_before = set(self._server_instances)
         registered: set[str] = set()
+        created: list[str] = []
+        created_token = _created_by_this_request.set(created)
         opening_body = bytearray()
         refused = False
 
@@ -177,9 +187,16 @@ class ResumableSessionManager(SessionScopedSessionManager):
             # installed. Without it a session created by a request that went
             # away idled out unrecorded and stayed adoptable. Shielded so the
             # cancellation that got us here does not cut the bookkeeping short.
+            _created_by_this_request.reset(created_token)
             with anyio.CancelScope(shield=True):
                 await self._reconcile(
-                    known_before, session_id, requestor, registered, _initialize_params(opening_body), refused=refused
+                    known_before,
+                    session_id,
+                    requestor,
+                    registered,
+                    _initialize_params(opening_body),
+                    refused=refused,
+                    created=created,
                 )
 
     async def _register(
@@ -204,19 +221,25 @@ class ResumableSessionManager(SessionScopedSessionManager):
         handshake: dict[str, Any] | None,
         *,
         refused: bool = False,
+        created: list[str] | None = None,
     ) -> None:
         """Record what the upstream handler just did.
 
-        Rather than reimplement the SDK's session creation to learn the new id,
-        diff the manager's own instance map across the call. That keeps this
-        working if the creation path changes shape upstream. A new session is
-        normally recorded already, as its response went out; this catches one
-        whose id reached the client some other way.
+        ``created`` is the sessions this request added to the manager, learned
+        from the session table rather than by reimplementing the SDK's session
+        creation. A new session is normally recorded already, as its response
+        went out; this catches one whose id reached the client some other way.
+        Only this request's own sessions are considered: a session another
+        client opened meanwhile is not this requestor's to record, and recording
+        it first would bind it to the wrong owner for good.
         """
-        for new_id in set(self._server_instances) - known_before:
+        for new_id in created or ():
+            transport = self._server_instances.get(new_id)
+            if transport is None:
+                continue
             if new_id not in registered:
                 await self._register(new_id, requestor, handshake)
-            self._hook_termination(self._server_instances[new_id], new_id)
+            self._hook_termination(transport, new_id)
 
         # Recorded as its response started, then gone before the request ended:
         # from mcp 2.2 the SDK discards a session whose opening request is
@@ -343,6 +366,11 @@ class ResumableSessionManager(SessionScopedSessionManager):
             await self._touch(session_id)
         await transport.handle_request(scope, receive, send)
         return True
+
+    def _on_session_added(self, session_id: str) -> None:
+        created = _created_by_this_request.get()
+        if created is not None:
+            created.append(session_id)
 
     def _at_session_limit(self) -> bool:
         limit = getattr(self, "max_sessions", None)  # added in mcp 2.2

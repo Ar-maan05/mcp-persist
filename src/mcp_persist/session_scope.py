@@ -193,6 +193,11 @@ class _SessionScopedTransports(dict[str, "StreamableHTTPServerTransport"]):
     def __setitem__(self, session_id: str, transport: StreamableHTTPServerTransport) -> None:
         _scope_transport(transport, session_id, self._manager.event_store)
         super().__setitem__(session_id, transport)
+        # Lets a subclass learn which request created a session: the SDK adds it
+        # from inside that request's own task.
+        on_added = getattr(self._manager, "_on_session_added", None)
+        if on_added is not None:
+            on_added(session_id)
 
 
 def _scope_transport(transport: Any, session_id: str, shared: EventStore | None) -> None:

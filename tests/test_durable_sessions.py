@@ -773,6 +773,75 @@ async def test_adoption_respects_the_session_limit() -> None:
         await conn.close()
 
 
+async def test_a_concurrent_request_does_not_claim_another_clients_new_session() -> None:
+    # Every request used to register each session that appeared on the worker
+    # while it ran, under its own principal. A slow request from mallory that was
+    # in flight while alice opened a session could record alice's session first,
+    # as mallory's, and a re-register keeps the first owner: alice was then
+    # refused her own session on any other worker.
+    import aiosqlite
+
+    from mcp_persist.session_manager import ResumableSessionManager
+
+    mcp = MCPServer(name="SlowServer")
+
+    @mcp.tool()
+    async def slow() -> str:
+        await anyio.sleep(0.5)
+        return "ok"
+
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        store = SQLiteEventStore(conn, table_name="events", ttl=None)
+        await store.initialize()
+        registry = session_registry_for(store)
+        await registry.initialize()
+        register = registry.register
+
+        async def slow_for_alice(session_id: str, **kwargs: Any) -> None:
+            # Alice's own write takes a network round trip; that is the window.
+            if (kwargs.get("owner") or {}).get("client_id") == "alice":
+                await anyio.sleep(0.5)
+            await register(session_id, **kwargs)
+
+        registry.register = slow_for_alice  # type: ignore[method-assign]
+
+        def make() -> ResumableSessionManager:
+            return ResumableSessionManager(app=mcp._lowlevel_server, event_store=store, registry=registry)
+
+        alice, mallory = _user("alice"), _user("mallory")
+        worker_a, worker_b = make(), make()
+        async with worker_a.run(), worker_b.run():
+            status, _, mallory_session = await _asgi_post(worker_a, _INIT_BODY, None, mallory)
+            assert status == 200 and mallory_session
+            opened: list[str | None] = []
+
+            async def mallory_calls_slow_tool() -> None:
+                call = {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "slow", "arguments": {}}}
+                await _asgi_post(worker_a, call, mallory_session, mallory)
+
+            async def alice_opens_a_session() -> None:
+                await anyio.sleep(0.2)  # while mallory's call is in flight
+                opened.append((await _asgi_post(worker_a, _INIT_BODY, None, alice))[2])
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(mallory_calls_slow_tool)
+                tg.start_soon(alice_opens_a_session)
+
+            alice_session = opened[0]
+            assert alice_session
+            record = await registry.get(alice_session)
+            assert record is not None and record.owner is not None
+            assert record.owner["client_id"] == "alice"
+
+            status, body, _ = await _asgi_post(
+                worker_b, {"jsonrpc": "2.0", "id": 2, "method": "ping"}, alice_session, alice
+            )
+            assert status == 200, body
+    finally:
+        await conn.close()
+
+
 async def _tool_call_event_ids(client: httpx.AsyncClient, url: str, session_id: str, message: str) -> list[str]:
     """Call ``echo`` with JSON-RPC id 7 on ``session_id``; return the SSE event ids it got."""
     body = {
