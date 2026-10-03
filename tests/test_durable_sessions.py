@@ -1116,6 +1116,34 @@ async def test_a_resumed_stream_carries_on_live(tmp_path: Path) -> None:
     assert "done-result" in text
 
 
+@pytest.mark.parametrize("durable", [False, True], ids=["plain", "durable"])
+async def test_a_session_cannot_resume_from_another_sessions_event_id(tmp_path: Path, durable: bool) -> None:
+    # The other route to someone else's events: resume your own session from an
+    # event id that belongs to theirs (ids are sequential and easy to guess). The
+    # session prefix alone does not stop this; the ownership check on replay does.
+    db = str(tmp_path / "events.db")
+    port = _free_port()
+    call = {
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {"name": "chatty", "arguments": {}, "_meta": {"progressToken": "tok"}},
+    }
+    app = with_persistence(_make_chatty_mcp(), backend="sqlite", url=db, durable_sessions=durable)
+    async with _serve(app, port) as url, httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        alice = await _initialize(url)
+        mallory = await _initialize(url)
+        headers = {**_HEADERS, "Mcp-Session-Id": alice, "Mcp-Protocol-Version": "2025-06-18"}
+        response = await client.post(url, json=call, headers=headers)
+        alice_ids = [line[len("id:") :].strip() for line in response.text.splitlines() if line.startswith("id:")]
+        assert len(alice_ids) >= 2 and "done-result" in response.text
+
+        stolen = await _resume(client, url, mallory, alice_ids[0])
+
+    assert "done-result" not in stolen
+    assert '"almost"' not in stolen
+
+
 async def test_streams_are_stored_under_their_session(tmp_path: Path) -> None:
     db = str(tmp_path / "events.db")
     port = _free_port()
