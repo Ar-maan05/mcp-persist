@@ -329,3 +329,26 @@ async def test_sqlite_table_from_before_the_handshake_column_is_upgraded() -> No
         assert new is not None and new.handshake == {"protocolVersion": "2025-06-18"}
     finally:
         await conn.close()
+
+
+@pytest.mark.anyio
+async def test_redis_a_partial_session_hash_is_not_a_session() -> None:
+    # `touch` checks the key exists and then writes last_seen_at in a second round
+    # trip. If the session's ttl expires in between, that write recreates the hash
+    # with only last_seen_at in it: no created_at, no owner, terminated unset. Read
+    # back as a record, that was an expired session alive again, adoptable by any
+    # unauthenticated caller. `register` always writes created_at, so a hash
+    # without it was never registered and is not a session.
+    client = fakeredis.FakeRedis()
+    try:
+        registry = session_registry_for(RedisEventStore(client, key_prefix="partial:"))
+        await client.hset("partial:session:sess-expired", "last_seen_at", "123.0")
+        await client.zadd("partial:sessions", {"sess-expired": 123.0})
+
+        assert await registry.get("sess-expired") is None
+        assert [r.session_id for r in await registry.list_sessions(include_terminated=True)] == []
+    finally:
+        try:
+            await client.aclose()
+        except AttributeError:  # redis-py < 5.0
+            await client.close(close_connection_pool=True)
