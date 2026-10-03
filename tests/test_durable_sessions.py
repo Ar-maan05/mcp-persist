@@ -887,6 +887,30 @@ async def test_shutting_down_mid_request_leaves_the_session_live() -> None:
         await conn.close()
 
 
+async def test_deleting_an_adopted_session_forgets_it(tmp_path: Path) -> None:
+    # A DELETE that is the first request to an adopted session terminated it, but
+    # its transport stayed in the session table for good: the server task's
+    # cleanup only removes a live one.
+    db = str(tmp_path / "events.db")
+    port = _free_port()
+
+    app1 = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=True)
+    async with _serve(app1, port) as url:
+        session_id = await _initialize(url)
+
+    app2 = with_persistence(_make_mcp(), backend="sqlite", url=db, durable_sessions=True)
+    async with _serve(app2, port) as url:
+        headers = {**_HEADERS, "Mcp-Session-Id": session_id, "Mcp-Protocol-Version": "2025-06-18"}
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            response = await client.delete(url, headers=headers)
+        assert response.status_code == 200, response.text
+        manager = app2.state.session_manager
+        assert session_id not in manager._server_instances
+        assert session_id not in manager._session_owners
+        record = await app2.state.session_registry.get(session_id)
+        assert record is not None and record.terminated
+
+
 async def _tool_call_event_ids(client: httpx.AsyncClient, url: str, session_id: str, message: str) -> list[str]:
     """Call ``echo`` with JSON-RPC id 7 on ``session_id``; return the SSE event ids it got."""
     body = {

@@ -367,6 +367,13 @@ class ResumableSessionManager(SessionScopedSessionManager):
         if adopted_here:
             await self._touch(session_id)
         await transport.handle_request(scope, receive, send)
+        if transport.is_terminated and self._server_instances.get(session_id) is transport:
+            # The request ended the session (a DELETE). The server task's cleanup
+            # only removes a transport that is still live, so forget it here, as
+            # the SDK does on its own path; left in the table it would hold its
+            # memory and, from mcp 2.2, a place under the session limit.
+            del self._server_instances[session_id]
+            self._session_owners.pop(session_id, None)
         return True
 
     def _on_session_added(self, session_id: str) -> None:
