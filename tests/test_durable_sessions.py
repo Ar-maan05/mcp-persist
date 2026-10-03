@@ -732,6 +732,47 @@ async def test_the_termination_hook_does_not_swallow_errors(shutting_down: bool)
         await conn.close()
 
 
+async def test_adoption_respects_the_session_limit() -> None:
+    # mcp 2.2 caps the sessions a manager holds (max_sessions) and answers a new
+    # one past the cap with a 503. Adoption opened sessions without asking, so a
+    # restarted worker could end up holding any number of them.
+    import inspect
+
+    import aiosqlite
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    from mcp_persist.session_manager import ResumableSessionManager
+
+    if "max_sessions" not in inspect.signature(StreamableHTTPSessionManager.__init__).parameters:
+        pytest.skip("this SDK has no session limit")
+
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        store = SQLiteEventStore(conn, table_name="events", ttl=None)
+        await store.initialize()
+        registry = session_registry_for(store)
+        await registry.initialize()
+
+        def make() -> ResumableSessionManager:
+            return ResumableSessionManager(
+                app=_make_mcp()._lowlevel_server, event_store=store, registry=registry, max_sessions=1
+            )
+
+        creator, adopter = make(), make()
+        async with creator.run(), adopter.run():
+            _, _, first = await _asgi_post(creator, _INIT_BODY, None, None)
+            assert first
+            # Fill the adopter's one slot with a session of its own.
+            status, _, own = await _asgi_post(adopter, _INIT_BODY, None, None)
+            assert status == 200 and own
+
+            status, body, _ = await _asgi_post(adopter, {"jsonrpc": "2.0", "id": 1, "method": "ping"}, first, None)
+            assert status == 503, body
+            assert first not in adopter._server_instances
+    finally:
+        await conn.close()
+
+
 async def _tool_call_event_ids(client: httpx.AsyncClient, url: str, session_id: str, message: str) -> list[str]:
     """Call ``echo`` with JSON-RPC id 7 on ``session_id``; return the SSE event ids it got."""
     body = {

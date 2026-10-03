@@ -42,7 +42,9 @@ from mcp.server.connection import Connection
 from mcp.server.runner import ServerRunner, serve_connection
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER, StreamableHTTPServerTransport
 from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
+from mcp_types import INTERNAL_ERROR, ErrorData, JSONRPCError
 from starlette.requests import Request
+from starlette.responses import Response
 
 from mcp_persist.session_scope import SessionScopedSessionManager
 from mcp_persist.sessions import _owner_matches
@@ -318,8 +320,19 @@ class ResumableSessionManager(SessionScopedSessionManager):
             # Another request may have adopted it while we waited for the lock.
             transport = self._server_instances.get(session_id)
             adopted_here = transport is None
-            if transport is None:
+            if transport is None and not self._at_session_limit():
                 transport = await self._start_adopted(session_id, requestor, record)
+
+        if transport is None:
+            # An adopted session is an open session like any other, so it counts
+            # against the SDK's limit (mcp 2.2+), and is refused the same way.
+            logger.warning(
+                "Refusing to adopt session %s: %d sessions are already open",
+                session_id[:64],
+                len(self._server_instances),
+            )
+            await _too_many_sessions(scope, receive, send)
+            return True
 
         # Served outside the lock. The request can be a standalone GET stream
         # that stays open for as long as the client is connected, and while the
@@ -330,6 +343,10 @@ class ResumableSessionManager(SessionScopedSessionManager):
             await self._touch(session_id)
         await transport.handle_request(scope, receive, send)
         return True
+
+    def _at_session_limit(self) -> bool:
+        limit = getattr(self, "max_sessions", None)  # added in mcp 2.2
+        return limit is not None and len(self._server_instances) >= limit
 
     async def _start_adopted(
         self, session_id: str, requestor: dict[str, Any] | None, record: SessionRecord
@@ -417,6 +434,15 @@ class ResumableSessionManager(SessionScopedSessionManager):
                 connection.protocol_version = protocol_version
                 connection.initialized.set()
         await serve_connection(self.app, dispatcher, connection=connection, lifespan_state=self._lifespan_state)
+
+
+async def _too_many_sessions(scope: Scope, receive: Receive, send: Send) -> None:
+    """The SDK's answer when its session limit is reached: a 503 with a JSON-RPC error."""
+    body = JSONRPCError(jsonrpc="2.0", id=None, error=ErrorData(code=INTERNAL_ERROR, message="Too many open sessions"))
+    response = Response(
+        body.model_dump_json(by_alias=True, exclude_unset=True), status_code=503, media_type="application/json"
+    )
+    await response(scope, receive, send)
 
 
 def _initialize_params(body: bytes | bytearray) -> dict[str, Any] | None:
