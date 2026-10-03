@@ -5,10 +5,16 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from mcp.server.streamable_http import EventMessage
+from mcp.server.streamable_http import EventMessage, EventStore
 from mcp_types import JSONRPCRequest
 
-from mcp_persist import SessionScopedEventStore, SessionScopedSessionManager, SQLiteEventStore
+from mcp_persist import (
+    BatchingEventStore,
+    RedisEventStore,
+    SessionScopedEventStore,
+    SessionScopedSessionManager,
+    SQLiteEventStore,
+)
 from mcp_persist.session_scope import _scope_transport
 
 pytestmark = pytest.mark.anyio
@@ -132,3 +138,111 @@ def test_a_manager_without_an_event_store_leaves_transports_alone() -> None:
     manager._server_instances["alice"] = transport  # type: ignore[assignment]
 
     assert transport._event_store is None
+
+
+class _NoLookupStore(EventStore):
+    """A minimal third-party store: replays, but cannot say whose an event is up front."""
+
+    def __init__(self, inner: SQLiteEventStore) -> None:
+        self._inner = inner
+
+    async def store_event(self, stream_id: str, message: Any) -> str:
+        return await self._inner.store_event(stream_id, message)
+
+    async def replay_events_after(self, last_event_id: str, send_callback: Any) -> str | None:
+        return await self._inner.replay_events_after(last_event_id, send_callback)
+
+
+async def test_a_foreign_id_is_refused_without_reading_the_stream() -> None:
+    # With a store that can name an event's stream, a foreign Last-Event-ID is
+    # refused before the replay runs, so the other session's events are never
+    # read, decrypted or held in memory.
+    async with SQLiteEventStore.create(":memory:") as shared:
+        first = await SessionScopedEventStore(shared, "alice").store_event("7", _message("a1"))
+        await SessionScopedEventStore(shared, "alice").store_event("7", _message("alice-secret"))
+
+        calls = 0
+        original = shared.replay_events_after
+
+        async def counting(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            return await original(*args, **kwargs)
+
+        shared.replay_events_after = counting  # type: ignore[method-assign]
+        stream_id, sent = await _replay(SessionScopedEventStore(shared, "mallory"), first)
+
+    assert (stream_id, sent) == (None, [])
+    assert calls == 0
+
+
+async def test_an_owned_replay_is_streamed_through_not_buffered() -> None:
+    # Each event reaches the transport while the store is still replaying, so a
+    # long replay keeps the transport's backpressure instead of being held in
+    # memory first.
+    async with SQLiteEventStore.create(":memory:") as shared:
+        alice = SessionScopedEventStore(shared, "alice")
+        first = await alice.store_event("7", _message("a1"))
+        for tag in ("a2", "a3"):
+            await alice.store_event("7", _message(tag))
+
+        store_replaying = False
+        original = shared.replay_events_after
+
+        async def tracking(*args: Any, **kwargs: Any) -> Any:
+            nonlocal store_replaying
+            store_replaying = True
+            try:
+                return await original(*args, **kwargs)
+            finally:
+                store_replaying = False
+
+        shared.replay_events_after = tracking  # type: ignore[method-assign]
+        delivered_mid_replay: list[bool] = []
+
+        async def callback(event: EventMessage) -> None:
+            delivered_mid_replay.append(store_replaying)
+
+        stream_id = await alice.replay_events_after(first, callback)
+
+    assert stream_id == "7"
+    assert delivered_mid_replay == [True, True]
+
+
+@pytest.mark.parametrize("owner", ["alice", "mallory"])
+async def test_a_store_without_a_lookup_is_still_isolated(owner: str) -> None:
+    async with SQLiteEventStore.create(":memory:") as inner:
+        shared = _NoLookupStore(inner)
+        first = await SessionScopedEventStore(shared, "alice").store_event("7", _message("a1"))
+        await SessionScopedEventStore(shared, "alice").store_event("7", _message("alice-secret"))
+
+        stream_id, sent = await _replay(SessionScopedEventStore(shared, owner), first)
+
+    if owner == "alice":
+        assert (stream_id, sent) == ("7", ["alice-secret"])
+    else:
+        assert (stream_id, sent) == (None, [])
+
+
+async def test_batching_store_lookups_pass_through() -> None:
+    # BatchingEventStore wraps Redis or Postgres and hands the lookup through.
+    import fakeredis.aioredis as fakeredis
+
+    client = fakeredis.FakeRedis()
+    shared = BatchingEventStore(RedisEventStore(client, ttl=3600), flush_max_events=100)
+    try:
+        alice = SessionScopedEventStore(shared, "alice")
+        first = await alice.store_event("7", _message("a1"))
+        await alice.store_event("7", _message("a2"))
+
+        own = await _replay(alice, first)
+        foreign = await _replay(SessionScopedEventStore(shared, "mallory"), first)
+    finally:
+        await shared.aclose()
+        try:
+            await client.aclose()
+        except AttributeError:  # redis-py < 5.0
+            await client.close(close_connection_pool=True)
+
+    assert own == ("7", ["a2"])
+    assert foreign == (None, [])

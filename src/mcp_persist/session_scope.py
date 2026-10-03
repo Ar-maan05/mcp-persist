@@ -26,6 +26,7 @@ replayed, as it would after the event aged out.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -77,29 +78,76 @@ class SessionScopedEventStore(EventStore):
         return await self._store.store_event(self._prefix + stream_id, message)
 
     async def replay_events_after(self, last_event_id: EventId, send_callback: EventCallback) -> StreamId | None:
-        # The store only says which stream an event id belongs to once it has
-        # replayed it, so hold the replay back until ownership is known. It is
-        # one stream after one id, the same amount the client would be sent.
+        owner = await _owning_stream(self._store, last_event_id)
+        if owner is not _UNKNOWN:
+            # The store can say whose event this is up front: refuse a foreign
+            # id before reading anything, and stream an owned replay straight
+            # through, keeping the transport's backpressure.
+            if owner is None:
+                return None
+            if not self._owns(owner, last_event_id):
+                return None
+            stream_id = await self._store.replay_events_after(last_event_id, send_callback)
+            return self._unprefixed(stream_id)
+
+        # Otherwise the store only says which stream an event id belongs to once
+        # it has replayed it, so hold the replay back until ownership is known.
+        # It is one stream after one id, the same amount the client would be sent.
         replayed: list[EventMessage] = []
 
         async def collect(event: EventMessage) -> None:
             replayed.append(event)
 
         stream_id = await self._store.replay_events_after(last_event_id, collect)
-        if stream_id is None:
-            return None
-        if not stream_id.startswith(self._prefix):
-            logger.warning(
-                "Blocked a replay across sessions: Last-Event-ID %s belongs to stream %s, not session %s",
-                str(last_event_id)[:64],
-                stream_id[:128],
-                self._session_id[:64],
-            )
+        if stream_id is None or not self._owns(stream_id, last_event_id):
             return None
         for event in replayed:
             await send_callback(event)
+        return self._unprefixed(stream_id)
+
+    def _owns(self, stream_id: str, last_event_id: EventId) -> bool:
+        if stream_id.startswith(self._prefix):
+            return True
+        logger.warning(
+            "Blocked a replay across sessions: Last-Event-ID %s belongs to stream %s, not session %s",
+            str(last_event_id)[:64],
+            stream_id[:128],
+            self._session_id[:64],
+        )
+        return False
+
+    def _unprefixed(self, stream_id: StreamId | None) -> StreamId | None:
         # The transport matches the stream against its own request ids.
+        if stream_id is None or not stream_id.startswith(self._prefix):
+            return None
         return stream_id[len(self._prefix) :]
+
+
+# Returned by _owning_stream when the store cannot answer the question.
+_UNKNOWN: Any = object()
+
+
+async def _owning_stream(store: EventStore, event_id: EventId) -> StreamId | None:
+    """The stream ``event_id`` belongs to, None if there is no such event, or ``_UNKNOWN``.
+
+    Every backend in this package has a ``_stream_id_for_event(event_id)``
+    lookup (``BatchingEventStore`` passes it through to the store it wraps). A
+    store without one, or with one of a different shape, gets ``_UNKNOWN`` and
+    the replay is checked after the fact instead.
+    """
+    lookup = getattr(store, "_stream_id_for_event", None)
+    if lookup is None:
+        return _UNKNOWN
+    try:
+        if len(inspect.signature(lookup).parameters) != 1:
+            return _UNKNOWN
+    except (TypeError, ValueError):
+        return _UNKNOWN
+    try:
+        return await lookup(event_id)
+    except AttributeError:
+        # BatchingEventStore over a store that has no lookup of its own.
+        return _UNKNOWN
 
 
 class SessionScopedSessionManager(StreamableHTTPSessionManager):
