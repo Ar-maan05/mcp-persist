@@ -698,6 +698,40 @@ async def test_a_refused_request_does_not_refresh_the_session() -> None:
         await conn.close()
 
 
+@pytest.mark.parametrize("shutting_down", [False, True])
+async def test_the_termination_hook_does_not_swallow_errors(shutting_down: bool) -> None:
+    # During shutdown the hook skipped recording with a `return` inside its
+    # `finally`, which discarded whatever terminate() raised, including the
+    # cancellation shutdown delivers. Python 3.14 warns about exactly this.
+    import aiosqlite
+
+    from mcp_persist.session_manager import ResumableSessionManager
+
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        store = SQLiteEventStore(conn, table_name="events", ttl=None)
+        await store.initialize()
+        registry = session_registry_for(store)
+        await registry.initialize()
+        await registry.register("sess-1")
+        manager = ResumableSessionManager(app=_make_mcp()._lowlevel_server, event_store=store, registry=registry)
+        manager._shutting_down = shutting_down
+
+        class _Transport:
+            async def terminate(self) -> None:
+                raise RuntimeError("terminate failed")
+
+        transport = _Transport()
+        manager._hook_termination(transport, "sess-1")
+        with pytest.raises(RuntimeError, match="terminate failed"):
+            await transport.terminate()
+
+        record = await registry.get("sess-1")
+        assert record is not None and record.terminated is not shutting_down
+    finally:
+        await conn.close()
+
+
 async def _tool_call_event_ids(client: httpx.AsyncClient, url: str, session_id: str, message: str) -> list[str]:
     """Call ``echo`` with JSON-RPC id 7 on ``session_id``; return the SSE event ids it got."""
     body = {

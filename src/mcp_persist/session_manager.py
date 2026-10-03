@@ -272,11 +272,12 @@ class ResumableSessionManager(SessionScopedSessionManager):
             try:
                 await original()
             finally:
-                if self._shutting_down:
-                    # The process is going away, not the session: leave it live
-                    # in the registry so the next process can adopt it.
-                    return
-                await self._record_termination(session_id)
+                # When the process is going away, not the session, leave it live
+                # in the registry so the next process can adopt it. (Not a
+                # `return` here: that would swallow whatever original() raised,
+                # the cancellation that shutdown delivers included.)
+                if not self._shutting_down:
+                    await self._record_termination(session_id)
 
         try:
             transport.terminate = terminate_and_record
