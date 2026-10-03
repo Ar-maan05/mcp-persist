@@ -769,8 +769,8 @@ def _make_chatty_mcp() -> MCPServer:
 
     @mcp.tool()
     async def chatty(ctx: Context) -> str:
-        await ctx.info("working")
-        await ctx.report_progress(1, 2, "half")
+        await ctx.report_progress(1, 2, "working")
+        await ctx.report_progress(2, 2, "almost")
         return "done-result"
 
     return mcp
@@ -818,7 +818,7 @@ async def test_a_resumed_stream_carries_on_live(tmp_path: Path) -> None:
 
     @mcp.tool()
     async def slow(ctx: Context) -> str:
-        await ctx.info("working")
+        await ctx.report_progress(1, 2, "working")
         await finish.wait()
         return "done-result"
 
@@ -827,7 +827,12 @@ async def test_a_resumed_stream_carries_on_live(tmp_path: Path) -> None:
     # its result would reach the client through the replay instead of live.
     version = "2025-11-25"
     init = {**_INIT_BODY, "params": {**_INIT_BODY["params"], "protocolVersion": version}}
-    call = {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "slow", "arguments": {}}}
+    call = {
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {"name": "slow", "arguments": {}, "_meta": {"progressToken": "tok"}},
+    }
     db = str(tmp_path / "events.db")
     port = _free_port()
     app = with_persistence(mcp, backend="sqlite", url=db)
