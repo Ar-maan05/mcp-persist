@@ -160,9 +160,20 @@ class SessionScopedSessionManager(StreamableHTTPSessionManager):
     registers it, before it has stored anything.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._server_instances = _SessionScopedTransports(self)
+    # The session table is a property so that every table the SDK assigns, in
+    # __init__ or at any later point, is wrapped. Replacing it once after
+    # __init__ would leave sessions unscoped, silently, if a later SDK release
+    # reassigned the attribute.
+    @property
+    def _server_instances(self) -> dict[str, StreamableHTTPServerTransport]:  # pyright: ignore[reportIncompatibleVariableOverride]
+        return self.__dict__["_mcp_persist_server_instances"]
+
+    @_server_instances.setter
+    def _server_instances(self, table: dict[str, StreamableHTTPServerTransport]) -> None:  # pyright: ignore[reportIncompatibleVariableOverride]
+        scoped = _SessionScopedTransports(self)
+        for session_id, transport in table.items():
+            scoped[session_id] = transport
+        self.__dict__["_mcp_persist_server_instances"] = scoped
 
 
 class _SessionScopedTransports(dict[str, "StreamableHTTPServerTransport"]):

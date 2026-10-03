@@ -246,3 +246,24 @@ async def test_batching_store_lookups_pass_through() -> None:
 
     assert own == ("7", ["a2"])
     assert foreign == (None, [])
+
+
+def test_a_table_the_sdk_assigns_later_is_scoped_too() -> None:
+    # Replacing the table once after __init__ would leave sessions unscoped,
+    # silently, if an SDK release reassigned the attribute later (in run(), say).
+    shared: Any = object()
+
+    class _Transport:
+        def __init__(self) -> None:
+            self._event_store: Any = shared
+
+    manager = SessionScopedSessionManager(app=object(), event_store=shared)  # type: ignore[arg-type]
+    carried = _Transport()
+    manager._server_instances = {"alice": carried}  # type: ignore[dict-item]
+    added = _Transport()
+    manager._server_instances["bob"] = added  # type: ignore[assignment]
+
+    assert isinstance(carried._event_store, SessionScopedEventStore)
+    assert carried._event_store.session_id == "alice"
+    assert isinstance(added._event_store, SessionScopedEventStore)
+    assert added._event_store.session_id == "bob"
