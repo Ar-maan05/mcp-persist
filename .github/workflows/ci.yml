@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,12 +15,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Lint (ruff check)
+        run: uv run ruff check .
+
+      - name: Format check (ruff format)
+        run: uv run ruff format --check .
+
+      - name: Type check (pyright)
+        run: uv run pyright src/
+
+  test:
+    name: test (${{ matrix.python-version }}, ${{ matrix.deps }} deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        deps: [latest]
+        include:
+          # The oldest release of every runtime dependency pyproject.toml
+          # allows (mcp 2.0.0, redis 4.2.0, ...). uv.lock is not committed, so
+          # the other jobs always resolve the newest releases, and nothing else
+          # would notice code that quietly needs more than the declared floor.
+          - python-version: "3.10"
+            deps: minimum
 
     services:
       redis:
@@ -55,17 +90,50 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras --dev
 
-      - name: Lint (ruff check)
-        run: uv run ruff check .
-
-      - name: Format check (ruff format)
-        run: uv run ruff format --check .
-
-      - name: Type check (pyright)
-        run: uv run pyright src/
+      - name: Downgrade runtime dependencies to their declared floors
+        if: matrix.deps == 'minimum'
+        # Only the package's own dependencies are lowered; the dev tools stay
+        # current, since their floors are not a promise to anyone.
+        run: |
+          uv pip compile pyproject.toml --all-extras --resolution lowest-direct -o floors.txt
+          uv pip install -r floors.txt
+          uv pip list
 
       - name: Tests (pytest, real Redis + Postgres)
-        run: uv run pytest tests/ -v
+        run: uv run --no-sync pytest tests/ -v
         env:
           MCP_TEST_REDIS_URL: redis://localhost:6379/0
           MCP_TEST_POSTGRES_URL: postgresql://postgres@localhost:5432/postgres
+
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      # Catches what PyPI would reject at upload time, such as metadata twine
+      # does not accept (see the hatchling pin in pyproject.toml).
+      - name: Check metadata (twine)
+        run: uvx twine check --strict dist/*
+
+      - name: Check wheel contents
+        run: uvx check-wheel-contents dist/*.whl
+
+      # Installs the wheel alone into a fresh environment, so a module or a
+      # name missing from the wheel fails here instead of on a user's machine.
+      - name: Smoke test the installed wheel
+        run: |
+          uv venv /tmp/smoke
+          uv pip install --python /tmp/smoke/bin/python dist/*.whl
+          /tmp/smoke/bin/mcp-persist --version
+          /tmp/smoke/bin/mcp-persist-proxy --version
+          /tmp/smoke/bin/python -c "import mcp_persist; missing = [n for n in mcp_persist.__all__ if not hasattr(mcp_persist, n)]; assert not missing, missing; print('mcp_persist', mcp_persist.__version__, 'exports', len(mcp_persist.__all__), 'names')"

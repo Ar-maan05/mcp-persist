@@ -70,7 +70,10 @@ async def records(request):
         finally:
             if REAL_REDIS_URL:
                 await client.flushdb()
-            await client.aclose()
+            try:
+                await client.aclose()
+            except AttributeError:  # redis-py < 5.0
+                await client.close()
 
     else:
         if not POSTGRES_URL:
@@ -266,7 +269,10 @@ async def test_redis_index_does_not_grow_past_the_ttl() -> None:
         assert await records.count() == 1
         assert [r.method for r in await records.list_records()] == ["fresh"]
     finally:
-        await client.aclose()
+        try:
+            await client.aclose()
+        except AttributeError:  # redis-py < 5.0
+            await client.close()
 
 
 async def test_redis_ttl_uses_the_records_own_age() -> None:
@@ -291,7 +297,10 @@ async def test_redis_ttl_uses_the_records_own_age() -> None:
         assert await records.store_records([_record(method="expired", recorded_at=now - 400)]) == 0
         assert await records.count() == 1
     finally:
-        await client.aclose()
+        try:
+            await client.aclose()
+        except AttributeError:  # redis-py < 5.0
+            await client.close()
 
 
 async def test_duplicate_ids_are_not_reported_as_written(records) -> None:
