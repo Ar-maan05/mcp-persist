@@ -529,25 +529,27 @@ class RedisSessionRegistry(SessionRegistry):
     ) -> None:
         now = time.time()
         key = self._key(session_id)
-        # Every field that is fixed at creation is written with HSETNX inside one
-        # MULTI/EXEC, so a re-register never reads the hash and writes it back.
-        # A read-then-write let a `terminate` that landed in between be overwritten
-        # with a stale terminated="0", reviving an ended session that could then
-        # be adopted again. The SQL backends get the same from ON CONFLICT.
-        # The owner is fixed at creation too: adoption compares the caller against
-        # it, so a re-register must not be able to rebind the session.
+        # Every field that is fixed at creation is written with HSETNX, so a
+        # re-register never reads the hash and writes it back. A read-then-write
+        # let a `terminate` that landed in between be overwritten with a stale
+        # terminated="0", reviving an ended session that could then be adopted
+        # again; the SQL backends get the same from ON CONFLICT. The owner is
+        # fixed at creation too: adoption compares the caller against it, so a
+        # re-register must not be able to rebind the session.
         #
-        # The transaction touches the session's own key only. On Redis Cluster a
-        # MULTI/EXEC must stay within one hash slot, and the index is another key,
-        # so it is updated after; the session is complete and adoptable either way.
-        async with self._redis.pipeline(transaction=True) as pipe:
+        # No MULTI/EXEC: Redis Cluster only allows one within a hash slot, and
+        # redis-py's asyncio cluster client refuses transactions outright before
+        # 6.2. HSETNX makes each field safe on its own, and created_at goes last:
+        # get() treats a hash without it as no session, so a reader never sees
+        # one half-written, without its owner.
+        async with self._redis.pipeline(transaction=False) as pipe:
             pipe.hsetnx(key, "session_id", session_id)
-            pipe.hsetnx(key, "created_at", repr(now))
             pipe.hsetnx(key, "terminated", "0")
             pipe.hsetnx(key, "owner", json.dumps(owner, sort_keys=True) if owner is not None else "")
             if handshake is not None:
                 # Like the SQL backends, a re-register keeps the handshake first recorded.
                 pipe.hsetnx(key, "handshake", json.dumps(handshake, sort_keys=True))
+            pipe.hsetnx(key, "created_at", repr(now))
             pipe.hset(key, "last_seen_at", repr(now))
             if self._ttl is not None:
                 pipe.expire(key, self._ttl)
