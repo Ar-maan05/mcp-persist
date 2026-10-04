@@ -196,6 +196,8 @@ RedisEventStore(
 > automatically on Redis Cluster or any server without scripting, so behavior is
 > identical either way.
 
+> **Redis Cluster** is supported through redis-py's asyncio `RedisCluster` client, which needs **redis-py 4.4 or newer** (4.3's cluster client cannot pipeline; 4.2 has none). Pass the client to the store yourself, for example `RedisEventStore(RedisCluster.from_url(url), ttl=3600)`; a URL handed to `create()` or `MCP_PERSIST_URL` builds a standalone client. The event store, replay and the durable session registry all run on Cluster and are tested against a cluster-mode Redis in CI.
+
 - **TTL guidance:** Set `ttl` to at least 2× your session idle timeout. If you leave it as `None`, a warning is logged and events accumulate indefinitely.
 - **Stream bounds (`max_stream_length`):** Set a positive integer to cap the size of each stream's sorted set. The oldest event IDs beyond this limit are automatically trimmed on every write, preventing unbounded memory growth on long-lived streams.
 

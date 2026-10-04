@@ -105,6 +105,18 @@ jobs:
           uv pip install -r floors.txt
           uv pip list
 
+      # A single cluster-mode node holding every slot: enough to hold the Redis
+      # code to Cluster's rules (one hash slot per transaction or script), which
+      # a standalone Redis never enforces. Host networking, so the address the
+      # node reports for itself is one the tests can reach.
+      - name: Start a cluster-mode Redis
+        run: |
+          docker run -d --name redis-cluster --network host redis:8 redis-server --port 7000 --cluster-enabled yes --cluster-config-file nodes.conf --save "" --appendonly no
+          for _ in $(seq 1 30); do docker exec redis-cluster redis-cli -p 7000 ping && break; sleep 1; done
+          docker exec redis-cluster redis-cli -p 7000 cluster addslotsrange 0 16383
+          for _ in $(seq 1 30); do docker exec redis-cluster redis-cli -p 7000 cluster info | grep -q cluster_state:ok && break; sleep 1; done
+          docker exec redis-cluster redis-cli -p 7000 cluster info | grep cluster_state:ok
+
       # Compile warnings only show up when a file is actually compiled, and a
       # warm bytecode cache skips that. Newer Pythons add new ones (3.14 warns
       # about a return/break/continue that leaves a finally block, PEP 765).
@@ -122,6 +134,7 @@ jobs:
         env:
           MCP_TEST_REDIS_URL: redis://localhost:6379/0
           MCP_TEST_POSTGRES_URL: postgresql://postgres@localhost:5432/postgres
+          MCP_TEST_REDIS_CLUSTER_URL: redis://localhost:7000/0
 
   package:
     runs-on: ubuntu-latest
