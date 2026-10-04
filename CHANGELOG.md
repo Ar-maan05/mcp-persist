@@ -5,7 +5,9 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.2.0] - 2026-10-04
+
+**A security release, with durable-session fixes and a faster Redis replay.** The headline fix: sessions could be replayed each other's events. The MCP SDK names the streams it stores after JSON-RPC request ids rather than sessions, and every session shares one event store, so two sessions that used the same request id (which clients number from 0 or 1) shared a stream, and either one resuming it received the other's events, tool results included. `with_persistence()` and `ResumableSessionManager` are fixed automatically. **If you hand a store to the SDK's `StreamableHTTPSessionManager` yourself, switch to `SessionScopedSessionManager`**, which takes the same arguments; the SDK's own manager cannot be fixed from here. Upgrading is recommended for everyone, and strongly for anyone running durable sessions, more than one worker, or Redis Cluster. One behavior to expect: events stored before the upgrade carry no session prefix, so a client that resumes from one of them after upgrading gets nothing replayed, as if the event had expired. Redis Cluster is now tested in CI and needs redis-py 4.4 or newer.
 
 ### Security
 - **Sessions no longer replay each other's events.** The SDK's transport names the streams it stores after the JSON-RPC request id they belong to (or `_GET_stream`), not the session, and every session shares the event store. Two sessions that both sent a request with id `7` wrote into one stream, and resuming it with `Last-Event-ID` replayed both sessions' events. Clients number their requests from 0 or 1, so this happened in ordinary use: a client resuming a stream could be handed another session's response, under the request id it was waiting on. And anyone with a session could read other sessions' tool results by sending a request with a common id and resuming from their own event id. This affected `with_persistence()`, with or without durable sessions, and any store passed to the SDK's `StreamableHTTPSessionManager` directly, as the docs and examples showed. `with_persistence()` and `ResumableSessionManager` now give each session a view of the store that names its streams `<session_id>:<stream>` and replays a stream only to the session that owns it. **If you wire a store into the SDK's manager yourself, switch to `SessionScopedSessionManager`**, which takes the same arguments. Events stored before upgrading carry no session prefix, so a client resuming from one of them after the upgrade gets nothing replayed, as if it had expired. `PersistenceProxy` was not affected: it already scoped streams to sessions.
@@ -517,6 +519,7 @@ breaking changes will follow semantic versioning with a major version bump.
 - Initial release with `RedisEventStore`, a Redis-backed `EventStore` for
   multi-worker / multi-process SSE resumability.
 
+[2.2.0]: https://github.com/Ar-maan05/mcp-persist/compare/v2.1.1...v2.2.0
 [2.1.1]: https://github.com/Ar-maan05/mcp-persist/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/Ar-maan05/mcp-persist/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/Ar-maan05/mcp-persist/compare/v1.12.3...v2.0.0

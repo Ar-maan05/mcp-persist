@@ -196,7 +196,7 @@ SESSION ID                         LAST SEEN (UTC)            STATE       CLIENT
 1a7b3c5d9e2f4068b1c3d5e7f9a0b2c4   2026-08-01T09:12:55+00:00  live        mcp-inspector 0.9.1
 ```
 
-`CLIENT` is the name and version the client sent in its `initialize`, with control characters replaced; it is `-` for sessions recorded by an earlier release, which did not keep the handshake.
+`CLIENT` is the name and version the client sent in its `initialize`, with control characters replaced; it is `-` for sessions recorded before 2.2.0, which did not keep the handshake.
 
 `list` shows only live sessions unless `--all` is passed, and defaults to 50
 (`--limit`). `show` and `terminate` exit non-zero when the id does not exist, so

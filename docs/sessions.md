@@ -44,7 +44,7 @@ version, capabilities, client info) are recorded with the session, and the
 process that adopts it starts the connection already initialized from them. The
 client completed `initialize` with the process that created the session and will
 not send it again; without this, an adopted session answered every method but
-`ping` with `-32602`. Sessions recorded by a release before this one carry no
+`ping` with `-32602`. Sessions recorded before 2.2.0 carry no
 handshake and are adopted uninitialized, as before.
 
 It does not restore **server-side conversation state**. A transport is a live
