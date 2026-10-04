@@ -1006,6 +1006,36 @@ async def test_concurrent_initializes_each_record_their_own_session() -> None:
         await conn.close()
 
 
+async def test_a_registry_that_stops_answering_does_not_hold_a_request_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The bookkeeping after a request runs shielded from cancellation. With no
+    # bound on it, a registry call that never returned (redis-py has no socket
+    # timeout by default) held the request open, and shutdown with it.
+    import mcp_persist.session_manager as session_manager_module
+    from mcp_persist.session_manager import ResumableSessionManager
+
+    monkeypatch.setattr(session_manager_module, "_RECONCILE_TIMEOUT_SECONDS", 0.3)
+    conn, store, registry = await _memory_registry()
+    try:
+        manager = ResumableSessionManager(app=_make_mcp()._lowlevel_server, event_store=store, registry=registry)
+        async with manager.run():
+            status, _, session_id = await _asgi_post(manager, _INIT_BODY, None, None)
+            assert status == 200 and session_id
+
+            async def never_answers(session_id: str) -> None:
+                await anyio.sleep_forever()
+
+            registry.touch = never_answers  # type: ignore[method-assign]
+            with anyio.fail_after(3):
+                status, _, _ = await _asgi_post(
+                    manager, {"jsonrpc": "2.0", "id": 1, "method": "ping"}, session_id, None
+                )
+            assert status == 200
+    finally:
+        await conn.close()
+
+
 async def _tool_call_event_ids(client: httpx.AsyncClient, url: str, session_id: str, message: str) -> list[str]:
     """Call ``echo`` with JSON-RPC id 7 on ``session_id``; return the SSE event ids it got."""
     body = {

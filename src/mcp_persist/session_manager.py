@@ -77,6 +77,11 @@ _created_by_this_request: contextvars.ContextVar[list[str] | None] = contextvars
 # a copy of, and the session is still recorded, just without its handshake.
 _MAX_HANDSHAKE_BODY_BYTES = 64 * 1024
 
+# How long the bookkeeping after a request may take. It runs shielded from
+# cancellation so it is not cut short, which without a bound would let a
+# registry that stops answering hold the request, and shutdown, forever.
+_RECONCILE_TIMEOUT_SECONDS = 10.0
+
 
 class ResumableSessionManager(SessionScopedSessionManager):
     """A ``StreamableHTTPSessionManager`` backed by a durable session registry.
@@ -188,7 +193,7 @@ class ResumableSessionManager(SessionScopedSessionManager):
             # away idled out unrecorded and stayed adoptable. Shielded so the
             # cancellation that got us here does not cut the bookkeeping short.
             _created_by_this_request.reset(created_token)
-            with anyio.CancelScope(shield=True):
+            with anyio.CancelScope(shield=True), anyio.move_on_after(_RECONCILE_TIMEOUT_SECONDS) as deadline:
                 await self._reconcile(
                     known_before,
                     session_id,
@@ -197,6 +202,11 @@ class ResumableSessionManager(SessionScopedSessionManager):
                     _initialize_params(opening_body),
                     refused=refused,
                     created=created,
+                )
+            if deadline.cancelled_caught:
+                logger.warning(
+                    "Gave up recording session state for a request after %ss; the session registry is not answering",
+                    _RECONCILE_TIMEOUT_SECONDS,
                 )
 
     async def _register(
@@ -237,9 +247,11 @@ class ResumableSessionManager(SessionScopedSessionManager):
             transport = self._server_instances.get(new_id)
             if transport is None:
                 continue
+            # Hook first: it needs no I/O, so a slow registry cannot leave the
+            # session without it.
+            self._hook_termination(transport, new_id)
             if new_id not in registered:
                 await self._register(new_id, requestor, handshake)
-            self._hook_termination(transport, new_id)
 
         # Recorded as its response started, then gone before the request ended:
         # from mcp 2.2 the SDK discards a session whose opening request is
