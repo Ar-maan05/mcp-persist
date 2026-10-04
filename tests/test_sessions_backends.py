@@ -513,3 +513,29 @@ async def test_a_registry_table_from_an_earlier_release_gains_the_handshake_colu
             await pool.close()
 
     assert record is not None and record.handshake == {"protocolVersion": "x"}
+
+
+@pytest.mark.anyio
+async def test_redis_a_hash_rebuilt_without_its_owner_is_not_a_session() -> None:
+    # register writes its fields in a plain pipeline. If an existing session's key
+    # expires partway through a re-register, the rest of the pipeline rebuilds a
+    # hash with created_at and last_seen_at but no owner and no terminated flag,
+    # which would otherwise read back as a live, ownerless session.
+    client = fakeredis.FakeRedis()
+    try:
+        registry = session_registry_for(RedisEventStore(client, key_prefix="rebuilt:"))
+        await client.hset("rebuilt:session:sess-x", mapping={"created_at": "1.0", "last_seen_at": "2.0"})
+        await client.zadd("rebuilt:sessions", {"sess-x": 2.0})
+
+        assert await registry.get("sess-x") is None
+        assert await registry.list_sessions(include_terminated=True) == []
+
+        # A complete record with no owner (an unauthenticated session) still reads back.
+        await registry.register("sess-anon")
+        record = await registry.get("sess-anon")
+        assert record is not None and record.owner is None and not record.terminated
+    finally:
+        try:
+            await client.aclose()
+        except AttributeError:  # redis-py < 5.0
+            await client.close(close_connection_pool=True)

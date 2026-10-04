@@ -561,11 +561,13 @@ class RedisSessionRegistry(SessionRegistry):
         if not raw:
             return None
         data = {_to_str(k): _to_str(v) for k, v in raw.items()}
-        if not data.get("created_at"):
-            # `register` always writes created_at. A hash without it is what a
-            # touch or terminate leaves when the key expires between their
-            # existence check and their write: not a session, and treating it as
-            # one would bring an expired session back with no owner.
+        if not data.get("created_at") or "owner" not in data or "terminated" not in data:
+            # `register` always writes created_at, owner (empty for none) and
+            # terminated. A hash missing any of them is a fragment: what a touch
+            # or terminate leaves when the key expires between their existence
+            # check and their write, or what the rest of a re-register's pipeline
+            # rebuilds if the key expires partway through it. Not a session, and
+            # treating it as one would bring an expired session back with no owner.
             return None
         owner_raw = data.get("owner") or ""
         owner: dict[str, Any] | None = None
