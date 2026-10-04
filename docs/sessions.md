@@ -39,6 +39,14 @@ what stream resumability is defined in terms of: the client reconnects quoting
 the last event id it saw, and the server replays what came after. Because the
 event store is shared, the replay is the same on any worker.
 
+It also restores the **handshake**. The client's `initialize` params (protocol
+version, capabilities, client info) are recorded with the session, and the
+process that adopts it starts the connection already initialized from them. The
+client completed `initialize` with the process that created the session and will
+not send it again; without this, an adopted session answered every method but
+`ping` with `-32602`. Sessions recorded by a release before this one carry no
+handshake and are adopted uninitialized, as before.
+
 It does not restore **server-side conversation state**. A transport is a live
 pair of streams; it cannot be serialized and moved. A tool call that was still
 running when the process died is gone, and the client finds out the way it always

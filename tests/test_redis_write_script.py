@@ -43,7 +43,7 @@ async def client():
             try:
                 await c.aclose()
             except AttributeError:
-                await c.close()
+                await c.close(close_connection_pool=True)
     else:
         yield fakeredis.FakeRedis()
 

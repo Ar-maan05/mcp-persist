@@ -1175,11 +1175,11 @@ def _run_sessions(args: argparse.Namespace) -> int:
         elif not records:
             print("no sessions recorded (is durable_sessions enabled on the server?)")
         else:
-            print(f"{'SESSION ID':<34} {'LAST SEEN (UTC)':<26} STATE")
+            print(f"{'SESSION ID':<34} {'LAST SEEN (UTC)':<26} {'STATE':<11} CLIENT")
             for record in records:
                 seen = datetime.fromtimestamp(record["last_seen_at"], tz=timezone.utc).isoformat(timespec="seconds")
                 state = "terminated" if record["terminated"] else "live"
-                print(f"{record['session_id']:<34} {seen:<26} {state}")
+                print(f"{record['session_id']:<34} {seen:<26} {state:<11} {record['client'] or '-'}")
         return 0
 
     # show / terminate

@@ -91,7 +91,7 @@ async def test_multiprocess_redis_write_visible_to_parent_replay():
         try:
             await client.aclose()
         except AttributeError:
-            await client.close()
+            await client.close(close_connection_pool=True)
 
 
 @pytest.mark.anyio

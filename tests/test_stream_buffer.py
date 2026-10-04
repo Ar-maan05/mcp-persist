@@ -219,6 +219,28 @@ async def test_cold_replay_blocks_foreign_stream(store):
 
 
 @pytest.mark.anyio
+async def test_cold_replay_refuses_a_foreign_cursor_without_reading_it(store):
+    victim = StreamBuffer("s:victim", store)
+    foreign_id = await ingest(victim, 1)
+    await ingest(victim, 2)
+    reads = 0
+    original = store.replay_events_after
+
+    async def counting(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return await original(*args, **kwargs)
+
+    store.replay_events_after = counting
+    attacker = StreamBuffer("s:attacker", store)
+    attacker.done = True
+    got = await asyncio.wait_for(collect(attacker.consume_from(foreign_id)), 5)
+
+    assert got == []
+    assert reads == 0
+
+
+@pytest.mark.anyio
 async def test_cold_replay_allows_own_stream(store):
     # The ownership guard must not regress same-stream gap replay: an evicted
     # cursor on this buffer's own stream still replays from the store.

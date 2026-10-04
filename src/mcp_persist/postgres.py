@@ -6,15 +6,17 @@ Requires the postgres extra:
 Quickstart:
     import asyncpg
     from mcp.server.mcpserver import MCPServer
-    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-    from mcp_persist import PostgresEventStore
+    from mcp_persist import PostgresEventStore, SessionScopedSessionManager
 
     mcp = MCPServer(name="MyServer")
     pool = await asyncpg.create_pool("postgresql://localhost/mydb")
     store = PostgresEventStore(pool, ttl=3600)
     await store.initialize()
 
-    session_manager = StreamableHTTPSessionManager(
+    # SessionScopedSessionManager, not the SDK's StreamableHTTPSessionManager:
+    # the SDK files events by request id, so sessions sharing a store would be
+    # replayed each other's events.
+    session_manager = SessionScopedSessionManager(
         app=mcp._lowlevel_server,  # the low-level Server that MCPServer wraps
         event_store=store,
     )

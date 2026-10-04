@@ -46,6 +46,7 @@ import httpx2 as httpx
 from mcp_persist._stream_buffer import DEFAULT_DEQUE_MAXLEN, StreamBuffer
 from mcp_persist.config import build_store_context, event_store_from_env
 from mcp_persist.metrics import dispatch_proxy_replay
+from mcp_persist.session_scope import _UNKNOWN, _owning_stream
 
 if TYPE_CHECKING:
     from contextlib import AbstractAsyncContextManager
@@ -439,7 +440,12 @@ async def _store_replay(
         collected.append((event.event_id, data))
 
     started = perf_counter()
-    owning_stream = await store.replay_events_after(after, _collect)
+    known = await _owning_stream(store, after)
+    if known is not _UNKNOWN and (known is None or not _session_owns(known, session_id)):
+        # The store named the stream up front: refused without reading it.
+        owning_stream = known
+    else:
+        owning_stream = await store.replay_events_after(after, _collect)
     owned = owning_stream is not None and _session_owns(owning_stream, session_id)
     blocked = owning_stream is not None and not owned
     if blocked:

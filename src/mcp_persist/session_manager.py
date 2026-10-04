@@ -27,7 +27,9 @@ is public for callers who wire the session manager themselves.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import inspect
+import json
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
@@ -37,11 +39,15 @@ from mcp.server.auth.middleware.bearer_auth import (
     AuthorizationContext,
     authorization_context,
 )
-from mcp.server.runner import serve_loop
+from mcp.server.connection import Connection
+from mcp.server.runner import ServerRunner, serve_connection
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER, StreamableHTTPServerTransport
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
+from mcp_types import INTERNAL_ERROR, ErrorData, JSONRPCError
 from starlette.requests import Request
+from starlette.responses import Response
 
+from mcp_persist.session_scope import SessionScopedSessionManager
 from mcp_persist.sessions import _owner_matches
 
 if TYPE_CHECKING:
@@ -50,7 +56,7 @@ if TYPE_CHECKING:
     from anyio.abc import TaskStatus
     from starlette.types import Message, Receive, Scope, Send
 
-    from mcp_persist.sessions import SessionRegistry
+    from mcp_persist.sessions import SessionRecord, SessionRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -59,12 +65,31 @@ logger = logging.getLogger(__name__)
 # requests are in flight. Earlier SDKs left all of that to the manager.
 _TRANSPORT_OWNS_IDLE_TIMEOUT = "idle_timeout" in inspect.signature(StreamableHTTPServerTransport.__init__).parameters
 
+# The ids of the sessions added to the manager by the request being handled. The
+# SDK creates a session's transport inside the request that opens it, so the
+# session table's add hook (see _on_session_added) runs in that request's context.
+_created_by_this_request: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "mcp_persist_created_by_this_request", default=None
+)
 
-class ResumableSessionManager(StreamableHTTPSessionManager):
+# The largest opening request body inspected for its `initialize` params. A real
+# initialize is a few hundred bytes; anything past this is not worth buffering
+# a copy of, and the session is still recorded, just without its handshake.
+_MAX_HANDSHAKE_BODY_BYTES = 64 * 1024
+
+# How long the bookkeeping after a request may take. It runs shielded from
+# cancellation so it is not cut short, which without a bound would let a
+# registry that stops answering hold the request, and shutdown, forever.
+_RECONCILE_TIMEOUT_SECONDS = 10.0
+
+
+class ResumableSessionManager(SessionScopedSessionManager):
     """A ``StreamableHTTPSessionManager`` backed by a durable session registry.
 
     Every session this manager creates is recorded in the registry, and every
     session id it does not recognize is looked up there before being rejected.
+    Like :class:`~mcp_persist.SessionScopedSessionManager`, which it builds on,
+    it keeps each session's events out of every other session's replays.
 
     Args:
         registry: Where sessions are recorded. Share the event store's backend
@@ -90,6 +115,12 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
             )
         self._registry = registry
         self._adopt_sessions = adopt_sessions
+        # A registry written against 2.1 has no `handshake` keyword; it keeps
+        # working, and its adopted sessions are served uninitialized as before.
+        register_params = inspect.signature(registry.register).parameters
+        self._registry_takes_handshake = "handshake" in register_params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in register_params.values()
+        )
         # Set once the manager starts shutting down. From mcp 2.2 the SDK
         # terminates every session's transport as its task is cancelled, and a
         # restart must not be recorded as the client ending its sessions: that
@@ -120,25 +151,72 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
 
         known_before = set(self._server_instances)
         registered: set[str] = set()
+        created: list[str] = []
+        created_token = _created_by_this_request.set(created)
+        opening_body = bytearray()
+        refused = False
+
+        async def receive_and_keep_opening_body() -> Message:
+            # Only a request without a session id can open one, and it has to be
+            # `initialize`. Keep a copy of its body so the handshake can be
+            # recorded with the session and restored by whichever process adopts
+            # it later.
+            message = await receive()
+            if message["type"] == "http.request" and len(opening_body) <= _MAX_HANDSHAKE_BODY_BYTES:
+                opening_body.extend(message.get("body", b""))
+            return message
 
         async def send_once_registered(message: Message) -> None:
             # A new session is recorded before the response that hands the client
             # its id goes out. Recording it afterwards left a window in which a
             # client that went straight to another worker found no record and
             # got a 404.
+            nonlocal refused
+            if message["type"] == "http.response.start" and message["status"] >= 400:
+                refused = True
             if message["type"] == "http.response.start" and message["status"] < 400:
                 new_id = _response_session_id(message)
                 if new_id is not None and new_id not in known_before and new_id not in registered:
                     registered.add(new_id)
-                    await self._register(new_id, requestor)
+                    await self._register(new_id, requestor, _initialize_params(opening_body))
             await send(message)
 
-        await super()._handle_stateful_request(scope, receive, send_once_registered)
-        await self._reconcile(known_before, session_id, requestor, registered)
-
-    async def _register(self, session_id: str, requestor: dict[str, Any] | None) -> None:
+        opening = session_id is None
         try:
-            await self._registry.register(session_id, owner=requestor)
+            await super()._handle_stateful_request(
+                scope, receive_and_keep_opening_body if opening else receive, send_once_registered
+            )
+        finally:
+            # Also when the request is cancelled or raises: the session may
+            # already exist by then, and this is where its termination hook is
+            # installed. Without it a session created by a request that went
+            # away idled out unrecorded and stayed adoptable. Shielded so the
+            # cancellation that got us here does not cut the bookkeeping short.
+            _created_by_this_request.reset(created_token)
+            with anyio.CancelScope(shield=True), anyio.move_on_after(_RECONCILE_TIMEOUT_SECONDS) as deadline:
+                await self._reconcile(
+                    known_before,
+                    session_id,
+                    requestor,
+                    registered,
+                    _initialize_params(opening_body),
+                    refused=refused,
+                    created=created,
+                )
+            if deadline.cancelled_caught:
+                logger.warning(
+                    "Gave up recording session state for a request after %ss; the session registry is not answering",
+                    _RECONCILE_TIMEOUT_SECONDS,
+                )
+
+    async def _register(
+        self, session_id: str, requestor: dict[str, Any] | None, handshake: dict[str, Any] | None
+    ) -> None:
+        try:
+            if self._registry_takes_handshake:
+                await self._registry.register(session_id, owner=requestor, handshake=handshake)
+            else:
+                await self._registry.register(session_id, owner=requestor)
         except Exception:
             # A registry outage costs this session its durability, not its
             # response: the client still gets a working session on this worker.
@@ -150,30 +228,72 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
         session_id: str | None,
         requestor: dict[str, Any] | None,
         registered: set[str],
+        handshake: dict[str, Any] | None,
+        *,
+        refused: bool = False,
+        created: list[str] | None = None,
     ) -> None:
         """Record what the upstream handler just did.
 
-        Rather than reimplement the SDK's session creation to learn the new id,
-        diff the manager's own instance map across the call. That keeps this
-        working if the creation path changes shape upstream. A new session is
-        normally recorded already, as its response went out; this catches one
-        whose id reached the client some other way.
+        ``created`` is the sessions this request added to the manager, learned
+        from the session table rather than by reimplementing the SDK's session
+        creation. A new session is normally recorded already, as its response
+        went out; this catches one whose id reached the client some other way.
+        Only this request's own sessions are considered: a session another
+        client opened meanwhile is not this requestor's to record, and recording
+        it first would bind it to the wrong owner for good.
         """
-        for new_id in set(self._server_instances) - known_before:
+        for new_id in created or ():
+            transport = self._server_instances.get(new_id)
+            if transport is None:
+                continue
+            # Hook first: it needs no I/O, so a slow registry cannot leave the
+            # session without it.
+            self._hook_termination(transport, new_id)
             if new_id not in registered:
-                await self._register(new_id, requestor)
-            self._hook_termination(self._server_instances[new_id], new_id)
+                await self._register(new_id, requestor, handshake)
+
+        # Recorded as its response started, then gone before the request ended:
+        # from mcp 2.2 the SDK discards a session whose opening request is
+        # cancelled or fails, before any hook here could see it terminate.
+        # Left alone, the registry would hand a session that never got going to
+        # the next worker to ask.
+        if not self._shutting_down:
+            for new_id in registered - set(self._server_instances):
+                await self._record_termination(new_id)
 
         if session_id is None:
             return
         transport = self._server_instances.get(session_id)
         if transport is None:
-            # Gone after handling: an explicit DELETE is the usual reason.
-            await self._registry.terminate(session_id)
+            # Gone after handling: an explicit DELETE is the usual reason. Only
+            # if this worker held it going in; an id it never had (declined
+            # adoption, a wrong credential) just got a 404, which says nothing
+            # about the session, and must not end it for its real owner.
+            # And not while shutting down: the SDK drops every session's
+            # transport then, which is the process going away, not the session.
+            if session_id in known_before and not self._shutting_down:
+                await self._record_termination(session_id)
         elif transport.is_terminated:  # pragma: no cover - terminate() hook normally wins
-            await self._registry.terminate(session_id)
-        else:
+            await self._record_termination(session_id)
+        elif not refused:
+            # A refused request (the wrong credential gets a 404 here too) is not
+            # activity on the session, and must not keep its record looking live.
+            await self._touch(session_id)
+
+    async def _touch(self, session_id: str) -> None:
+        try:
             await self._registry.touch(session_id)
+        except Exception:
+            # Only the session's last-seen time is lost; the request it belongs
+            # to has been, or is about to be, served either way.
+            logger.exception("Failed to update session %s in the durable registry", session_id[:64])
+
+    async def _record_termination(self, session_id: str) -> None:
+        try:
+            await self._registry.terminate(session_id)
+        except Exception:
+            logger.exception("Failed to record termination of session %s", session_id[:64])
 
     def _hook_termination(self, transport: Any, session_id: str) -> None:
         """Mark the registry when this transport terminates, however that happens.
@@ -186,20 +306,17 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
         if getattr(transport, "_mcp_persist_termination_hooked", False):
             return
         original = transport.terminate
-        registry = self._registry
 
         async def terminate_and_record() -> None:
             try:
                 await original()
             finally:
-                if self._shutting_down:
-                    # The process is going away, not the session: leave it live
-                    # in the registry so the next process can adopt it.
-                    return
-                try:
-                    await registry.terminate(session_id)
-                except Exception:  # pragma: no cover - never break teardown
-                    logger.exception("Failed to record termination of session %s", session_id[:64])
+                # When the process is going away, not the session, leave it live
+                # in the registry so the next process can adopt it. (Not a
+                # `return` here: that would swallow whatever original() raised,
+                # the cancellation that shutdown delivers included.)
+                if not self._shutting_down:
+                    await self._record_termination(session_id)
 
         try:
             transport.terminate = terminate_and_record
@@ -238,69 +355,158 @@ class ResumableSessionManager(StreamableHTTPSessionManager):
 
         async with self._session_creation_lock:
             # Another request may have adopted it while we waited for the lock.
-            if session_id in self._server_instances:
-                await self._server_instances[session_id].handle_request(scope, receive, send)
-                return True
+            transport = self._server_instances.get(session_id)
+            adopted_here = transport is None
+            if transport is None and not self._at_session_limit():
+                transport = await self._start_adopted(session_id, requestor, record)
 
-            transport_kwargs: dict[str, Any] = {}
-            if _TRANSPORT_OWNS_IDLE_TIMEOUT:
-                transport_kwargs["idle_timeout"] = self.session_idle_timeout
-            transport = StreamableHTTPServerTransport(
-                mcp_session_id=session_id,
-                is_json_response_enabled=self.json_response,
-                event_store=self.event_store,
-                security_settings=self.security_settings,
-                retry_interval=self.retry_interval,
-                **transport_kwargs,
+        if transport is None:
+            # An adopted session is an open session like any other, so it counts
+            # against the SDK's limit (mcp 2.2+), and is refused the same way.
+            logger.warning(
+                "Refusing to adopt session %s: %d sessions are already open",
+                session_id[:64],
+                len(self._server_instances),
             )
-            if requestor is not None:
-                # The registry round-trips the context as a plain dict (it has to
-                # be JSON), and AuthorizationContext is a TypedDict, so this is
-                # the same shape by construction.
-                self._session_owners[session_id] = cast("AuthorizationContext", requestor)
-            self._server_instances[session_id] = transport
-            self._hook_termination(transport, session_id)
-            logger.info("Adopted session %s from the durable registry", session_id[:64])
-
-            async def run_server(*, task_status: TaskStatus[None] = anyio.TASK_STATUS_IGNORED) -> None:
-                async with transport.connect() as streams:
-                    read_stream, write_stream = streams
-                    task_status.started()
-                    try:
-                        if _TRANSPORT_OWNS_IDLE_TIMEOUT:
-                            # The transport built its scope in connect() and moves
-                            # the deadline itself; a fixed deadline set here would
-                            # expire an active session.
-                            idle_scope = transport.idle_scope or anyio.CancelScope()
-                        else:
-                            idle_scope = anyio.CancelScope()
-                            if self.session_idle_timeout is not None:
-                                idle_scope.deadline = anyio.current_time() + self.session_idle_timeout
-                                transport.idle_scope = idle_scope
-                        with idle_scope:
-                            await serve_loop(
-                                self.app,
-                                read_stream,
-                                write_stream,
-                                lifespan_state=self._lifespan_state,
-                                session_id=session_id,
-                            )
-                        if idle_scope.cancelled_caught:
-                            self._server_instances.pop(session_id, None)
-                            self._session_owners.pop(session_id, None)
-                            await transport.terminate()
-                    except Exception:
-                        logger.exception("Adopted session %s crashed", session_id[:64])
-                    finally:
-                        if self._server_instances.get(session_id) is transport and not transport.is_terminated:
-                            del self._server_instances[session_id]
-                            self._session_owners.pop(session_id, None)
-
-            assert self._task_group is not None
-            await self._task_group.start(run_server)
-            await self._registry.touch(session_id)
-            await transport.handle_request(scope, receive, send)
+            await _too_many_sessions(scope, receive, send)
             return True
+
+        # Served outside the lock. The request can be a standalone GET stream
+        # that stays open for as long as the client is connected, and while the
+        # lock is held no session can be created or adopted on this worker; a
+        # restart, where every client reconnects at once, would stall behind
+        # the first one.
+        if adopted_here:
+            await self._touch(session_id)
+        await transport.handle_request(scope, receive, send)
+        if transport.is_terminated and self._server_instances.get(session_id) is transport:
+            # The request ended the session (a DELETE). The server task's cleanup
+            # only removes a transport that is still live, so forget it here, as
+            # the SDK does on its own path; left in the table it would hold its
+            # memory and, from mcp 2.2, a place under the session limit.
+            del self._server_instances[session_id]
+            self._session_owners.pop(session_id, None)
+        return True
+
+    def _on_session_added(self, session_id: str) -> None:
+        created = _created_by_this_request.get()
+        if created is not None:
+            created.append(session_id)
+
+    def _at_session_limit(self) -> bool:
+        limit = getattr(self, "max_sessions", None)  # added in mcp 2.2
+        return limit is not None and len(self._server_instances) >= limit
+
+    async def _start_adopted(
+        self, session_id: str, requestor: dict[str, Any] | None, record: SessionRecord
+    ) -> StreamableHTTPServerTransport:
+        """Create the transport for an adopted session and start serving it.
+
+        Called with ``_session_creation_lock`` held, so it must not wait on a request.
+        """
+        transport_kwargs: dict[str, Any] = {}
+        if _TRANSPORT_OWNS_IDLE_TIMEOUT:
+            transport_kwargs["idle_timeout"] = self.session_idle_timeout
+        transport = StreamableHTTPServerTransport(
+            mcp_session_id=session_id,
+            is_json_response_enabled=self.json_response,
+            event_store=self.event_store,
+            security_settings=self.security_settings,
+            retry_interval=self.retry_interval,
+            **transport_kwargs,
+        )
+        if requestor is not None:
+            # The registry round-trips the context as a plain dict (it has to
+            # be JSON), and AuthorizationContext is a TypedDict, so this is
+            # the same shape by construction.
+            self._session_owners[session_id] = cast("AuthorizationContext", requestor)
+        self._server_instances[session_id] = transport
+        self._hook_termination(transport, session_id)
+        logger.info("Adopted session %s from the durable registry", session_id[:64])
+
+        async def run_server(*, task_status: TaskStatus[None] = anyio.TASK_STATUS_IGNORED) -> None:
+            async with transport.connect() as streams:
+                read_stream, write_stream = streams
+                task_status.started()
+                try:
+                    if _TRANSPORT_OWNS_IDLE_TIMEOUT:
+                        # The transport built its scope in connect() and moves
+                        # the deadline itself; a fixed deadline set here would
+                        # expire an active session.
+                        idle_scope = transport.idle_scope or anyio.CancelScope()
+                    else:
+                        idle_scope = anyio.CancelScope()
+                        if self.session_idle_timeout is not None:
+                            idle_scope.deadline = anyio.current_time() + self.session_idle_timeout
+                            transport.idle_scope = idle_scope
+                    with idle_scope:
+                        await self._serve_adopted(read_stream, write_stream, session_id, record.handshake)
+                    if idle_scope.cancelled_caught:
+                        self._server_instances.pop(session_id, None)
+                        self._session_owners.pop(session_id, None)
+                        await transport.terminate()
+                except Exception:
+                    logger.exception("Adopted session %s crashed", session_id[:64])
+                finally:
+                    if self._server_instances.get(session_id) is transport and not transport.is_terminated:
+                        del self._server_instances[session_id]
+                        self._session_owners.pop(session_id, None)
+
+        assert self._task_group is not None
+        await self._task_group.start(run_server)
+        return transport
+
+    async def _serve_adopted(
+        self, read_stream: Any, write_stream: Any, session_id: str, handshake: dict[str, Any] | None
+    ) -> None:
+        """Serve an adopted session, with its handshake already in place.
+
+        The same dispatcher and connection ``serve_loop`` builds, except that the
+        connection starts initialized from the recorded ``initialize`` params.
+        The client finished its handshake with the process that created the
+        session and will not repeat it, and a connection that never saw it
+        refuses every method but ``ping``.
+        """
+        dispatcher: JSONRPCDispatcher[Any] = JSONRPCDispatcher(
+            read_stream, write_stream, inline_methods=frozenset({"initialize"})
+        )
+        connection = Connection.for_loop(dispatcher, session_id=session_id)
+        if handshake is not None:
+            try:
+                client_params, protocol_version = ServerRunner._negotiate_initialize(handshake)
+            except Exception:
+                logger.warning(
+                    "Recorded handshake for session %s is unreadable; serving it uninitialized", session_id[:64]
+                )
+            else:
+                connection.client_params = client_params
+                connection.protocol_version = protocol_version
+                connection.initialized.set()
+        await serve_connection(self.app, dispatcher, connection=connection, lifespan_state=self._lifespan_state)
+
+
+async def _too_many_sessions(scope: Scope, receive: Receive, send: Send) -> None:
+    """The SDK's answer when its session limit is reached: a 503 with a JSON-RPC error."""
+    body = JSONRPCError(jsonrpc="2.0", id=None, error=ErrorData(code=INTERNAL_ERROR, message="Too many open sessions"))
+    response = Response(
+        body.model_dump_json(by_alias=True, exclude_unset=True), status_code=503, media_type="application/json"
+    )
+    await response(scope, receive, send)
+
+
+def _initialize_params(body: bytes | bytearray) -> dict[str, Any] | None:
+    """The params of the ``initialize`` request in an opening request body, if any."""
+    if not body or len(body) > _MAX_HANDSHAKE_BODY_BYTES:
+        return None
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return None
+    for message in payload if isinstance(payload, list) else [payload]:
+        if isinstance(message, dict) and message.get("method") == "initialize":
+            params = message.get("params")
+            return params if isinstance(params, dict) else None
+    return None
 
 
 def _response_session_id(message: Message) -> str | None:

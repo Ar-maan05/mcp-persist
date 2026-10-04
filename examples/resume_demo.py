@@ -50,12 +50,11 @@ import aiosqlite
 import httpx2 as httpx
 import uvicorn
 from mcp.server.mcpserver import Context, MCPServer
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp_types import LATEST_PROTOCOL_VERSION
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
-from mcp_persist import SQLiteEventStore
+from mcp_persist import SessionScopedSessionManager, SQLiteEventStore
 from mcp_persist._sse_parser import SSEParser
 
 # --------------------------------------------------------------------------- #
@@ -137,7 +136,7 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
     try:
         store = SQLiteEventStore(conn, ttl=3600)
         await store.initialize()
-        manager = StreamableHTTPSessionManager(
+        manager = SessionScopedSessionManager(
             app=mcp._lowlevel_server,
             event_store=store,
             session_idle_timeout=300,

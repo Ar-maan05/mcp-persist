@@ -104,7 +104,10 @@ async def redis_store():
         yield store
     finally:
         await client.flushall()
-        await client.aclose()
+        try:
+            await client.aclose()
+        except AttributeError:  # redis-py < 5.0
+            await client.close(close_connection_pool=True)
 
 
 @pytest.mark.anyio

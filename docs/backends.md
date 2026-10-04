@@ -13,18 +13,16 @@ decision and the `with_persistence()` one-liner, see the
 
 ## Manual wiring (advanced or non-MCPServer)
 
-`with_persistence()` is the fast path on MCPServer. When you are not on MCPServer, or
-you want to own the wiring yourself, construct a store and hand it to
-`StreamableHTTPSessionManager`. The backends are interchangeable; pick per
-[Choosing a backend](../README.md#backends--choosing-one).
+`with_persistence()` is the fast path on MCPServer. When you are not on MCPServer, or you want to own the wiring yourself, construct a store and hand it to `SessionScopedSessionManager`. The backends are interchangeable; pick per [Choosing a backend](../README.md#backends--choosing-one).
+
+`SessionScopedSessionManager` is the SDK's `StreamableHTTPSessionManager` with one change, and it takes the same arguments. **Do not hand a store to the SDK's manager directly.** The SDK names the streams it stores after JSON-RPC request ids, not sessions, so two sessions that both send a request with id `7` share a stream, and either one resuming it is replayed the other's events too. Clients number their requests from 0 or 1, so this happens without anyone trying. The scoped manager gives each session a view of the store that names its streams `<session_id>:<stream>` and replays a stream only to the session that owns it. `with_persistence()` and `ResumableSessionManager` already use it.
 
 ### SQLite
 
 ```python
 import aiosqlite
 from mcp.server.mcpserver import MCPServer
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp_persist import SQLiteEventStore
+from mcp_persist import SQLiteEventStore, SessionScopedSessionManager
 
 mcp = MCPServer(name="MyServer")
 
@@ -32,7 +30,7 @@ conn = await aiosqlite.connect("events.db")
 store = SQLiteEventStore(conn, ttl=3600)  # 1 hour TTL
 await store.initialize()
 
-session_manager = StreamableHTTPSessionManager(
+session_manager = SessionScopedSessionManager(
     app=mcp._lowlevel_server,  # the low-level Server that MCPServer wraps
     event_store=store,
 )
@@ -43,15 +41,14 @@ session_manager = StreamableHTTPSessionManager(
 ```python
 import redis.asyncio as aioredis
 from mcp.server.mcpserver import MCPServer
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp_persist import RedisEventStore
+from mcp_persist import RedisEventStore, SessionScopedSessionManager
 
 mcp = MCPServer(name="MyServer")
 
 redis_client = aioredis.from_url("redis://localhost:6379")
 store = RedisEventStore(redis_client, ttl=3600)  # 1 hour TTL
 
-session_manager = StreamableHTTPSessionManager(
+session_manager = SessionScopedSessionManager(
     app=mcp._lowlevel_server,  # the low-level Server that MCPServer wraps
     event_store=store,
 )
@@ -62,8 +59,7 @@ session_manager = StreamableHTTPSessionManager(
 ```python
 import asyncpg
 from mcp.server.mcpserver import MCPServer
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp_persist import PostgresEventStore
+from mcp_persist import PostgresEventStore, SessionScopedSessionManager
 
 mcp = MCPServer(name="MyServer")
 
@@ -71,7 +67,7 @@ pool = await asyncpg.create_pool("postgresql://localhost/mydb")
 store = PostgresEventStore(pool, ttl=3600)  # 1 hour TTL
 await store.initialize()
 
-session_manager = StreamableHTTPSessionManager(
+session_manager = SessionScopedSessionManager(
     app=mcp._lowlevel_server,  # the low-level Server that MCPServer wraps
     event_store=store,
 )
@@ -174,7 +170,7 @@ Redis data layout:
 ```
 
 - **Atomic monotonic IDs** via Redis `INCR`: collision-free across concurrent workers. The counter is never given a TTL (even when `ttl` is set), so IDs stay monotonic across idle periods; only the event and stream keys expire.
-- **Replay is O(log N + M)**: one `ZRANGEBYSCORE` range-scans the stream's sorted set, then each of the M matched events is fetched with its own `HGET`. That's one network round-trip per replayed event: fine for typical resume sizes, worth knowing for very long streams.
+- **Replay is O(log N + M)**: on a standalone Redis a server-side script reads the stream's sorted set and the matching payloads together, 1000 events per call, so replaying M events takes about M/1000 round trips and no single call holds the server for long. On Redis Cluster, or a server without scripting, it is one `ZRANGEBYSCORE` followed by one pipelined fetch of every payload.
 - **TTL support**: automatic expiry of event/stream keys to prevent unbounded memory growth
 - **Atomic writes**: each event's hash, sorted-set entry, and TTLs are written in a single transactional pipeline, so a mid-write crash can't orphan a hash or leave a key without its expiry
 - **Multi-tenant isolation** via configurable `key_prefix`
@@ -199,6 +195,8 @@ RedisEventStore(
 > probes for this on its first write and falls back to the pipeline path
 > automatically on Redis Cluster or any server without scripting, so behavior is
 > identical either way.
+
+> **Redis Cluster** is supported through redis-py's asyncio `RedisCluster` client, which needs **redis-py 4.4 or newer** (4.3's cluster client cannot pipeline; 4.2 has none). Pass the client to the store yourself, for example `RedisEventStore(RedisCluster.from_url(url), ttl=3600)`; a URL handed to `create()` or `MCP_PERSIST_URL` builds a standalone client. The event store, replay and the durable session registry all run on Cluster and are tested against a cluster-mode Redis in CI.
 
 - **TTL guidance:** Set `ttl` to at least 2× your session idle timeout. If you leave it as `None`, a warning is logged and events accumulate indefinitely.
 - **Stream bounds (`max_stream_length`):** Set a positive integer to cap the size of each stream's sorted set. The oldest event IDs beyond this limit are automatically trimmed on every write, preventing unbounded memory growth on long-lived streams.

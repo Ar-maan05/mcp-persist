@@ -51,7 +51,7 @@ async def redis_client():
             try:
                 await client.aclose()
             except AttributeError:
-                await client.close()
+                await client.close(close_connection_pool=True)
             raise RuntimeError(
                 f"MCP_TEST_REDIS_URL points at a database holding {existing} key(s). "
                 "This suite calls FLUSHDB around every test; refusing to wipe a "
@@ -73,7 +73,7 @@ async def redis_client():
         try:
             await client.aclose()
         except AttributeError:
-            await client.close()
+            await client.close(close_connection_pool=True)
 
 
 @pytest.fixture
@@ -491,7 +491,7 @@ async def test_replay_works_with_decode_responses_true():
         try:
             await client.aclose()
         except AttributeError:
-            await client.close()
+            await client.close(close_connection_pool=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

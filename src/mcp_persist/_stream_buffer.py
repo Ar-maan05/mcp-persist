@@ -28,6 +28,7 @@ from pydantic import TypeAdapter
 
 from mcp_persist._sse_parser import SSEFrame, SSEParser
 from mcp_persist.metrics import dispatch_proxy_replay
+from mcp_persist.session_scope import _UNKNOWN, _owning_stream
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +191,13 @@ class StreamBuffer:
                 # stream; a foreign cursor replays nothing and falls through to the
                 # live window, where the consumer still sees only its own events.
                 started = perf_counter()
-                owning_stream = await self.store.replay_events_after(cursor, _collect)
+                known = await _owning_stream(self.store, cursor)
+                if known is not _UNKNOWN and known != self.stream_id:
+                    # The store named the stream up front: a foreign cursor is
+                    # refused without reading the other stream at all.
+                    owning_stream = known
+                else:
+                    owning_stream = await self.store.replay_events_after(cursor, _collect)
                 blocked = owning_stream is not None and owning_stream != self.stream_id
                 if blocked:
                     logger.warning(

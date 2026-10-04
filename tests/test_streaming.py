@@ -46,7 +46,7 @@ async def redis_streaming_store():
         try:
             await client.aclose()
         except AttributeError:
-            await client.close()
+            await client.close(close_connection_pool=True)
 
 
 @pytest.fixture
@@ -156,7 +156,7 @@ async def test_redis_subscribe_requires_enable_streaming():
         try:
             await client.aclose()
         except AttributeError:
-            await client.close()
+            await client.close(close_connection_pool=True)
 
 
 @pytest.mark.anyio
@@ -168,7 +168,10 @@ async def test_redis_store_event_unaffected_when_streaming_disabled():
         event_id = await store.store_event("stream-A", _msg(1))
         assert event_id == "1"
     finally:
-        await client.aclose()
+        try:
+            await client.aclose()
+        except AttributeError:  # redis-py < 5.0
+            await client.close(close_connection_pool=True)
 
 
 # ── SQLite ────────────────────────────────────────────────────────────────────

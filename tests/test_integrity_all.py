@@ -97,7 +97,7 @@ async def test_redis_monotonicity_under_concurrency():
     try:
         await client.aclose()
     except AttributeError:
-        await client.close()
+        await client.close(close_connection_pool=True)
 
     assert len(all_ids) == total_writes
     assert len(set(all_ids)) == total_writes
