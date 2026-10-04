@@ -945,6 +945,67 @@ async def test_deleting_an_adopted_session_forgets_it(tmp_path: Path) -> None:
         assert record is not None and record.terminated
 
 
+async def _memory_registry() -> tuple[Any, Any, Any]:
+    import aiosqlite
+
+    conn = await aiosqlite.connect(":memory:")
+    store = SQLiteEventStore(conn, table_name="events", ttl=None)
+    await store.initialize()
+    registry = session_registry_for(store)
+    await registry.initialize()
+    return conn, store, registry
+
+
+async def test_a_session_that_idles_out_here_is_recorded_as_ended() -> None:
+    # From mcp 2.2, the only thing that hooks a locally created session's
+    # termination is the session table telling the manager which request created
+    # it. Without the hook, a session that idled out stayed live in the registry
+    # and adoptable on any other worker.
+    from mcp_persist.session_manager import ResumableSessionManager
+
+    conn, store, registry = await _memory_registry()
+    try:
+        manager = ResumableSessionManager(
+            app=_make_mcp()._lowlevel_server, event_store=store, registry=registry, session_idle_timeout=0.3
+        )
+        async with manager.run():
+            status, _, session_id = await _asgi_post(manager, _INIT_BODY, None, _user("alice"))
+            assert status == 200 and session_id
+            with anyio.fail_after(5):
+                while not ((record := await registry.get(session_id)) and record.terminated):
+                    await anyio.sleep(0.05)
+    finally:
+        await conn.close()
+
+
+async def test_concurrent_initializes_each_record_their_own_session() -> None:
+    from mcp_persist.session_manager import ResumableSessionManager
+
+    conn, store, registry = await _memory_registry()
+    try:
+        manager = ResumableSessionManager(app=_make_mcp()._lowlevel_server, event_store=store, registry=registry)
+        opened: dict[str, str] = {}
+        async with manager.run():
+
+            async def open_as(client_id: str) -> None:
+                status, _, session_id = await _asgi_post(manager, _INIT_BODY, None, _user(client_id))
+                assert status == 200 and session_id
+                opened[session_id] = client_id
+
+            async with anyio.create_task_group() as tg:
+                for i in range(40):
+                    tg.start_soon(open_as, f"client-{i}")
+
+            assert len(opened) == 40
+            for session_id, client_id in opened.items():
+                record = await registry.get(session_id)
+                assert record is not None and record.owner is not None
+                assert record.owner["client_id"] == client_id
+                assert getattr(manager._server_instances[session_id], "_mcp_persist_termination_hooked", False)
+    finally:
+        await conn.close()
+
+
 async def _tool_call_event_ids(client: httpx.AsyncClient, url: str, session_id: str, message: str) -> list[str]:
     """Call ``echo`` with JSON-RPC id 7 on ``session_id``; return the SSE event ids it got."""
     body = {
